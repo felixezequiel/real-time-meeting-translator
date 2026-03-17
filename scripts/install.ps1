@@ -222,8 +222,11 @@ function Install-PythonDeps {
     try { & $PythonExe -m pip install --upgrade pip 2>&1 | Out-Host } catch {}
 
     Write-Host "  Installing packages (this may take several minutes on first run)..." -ForegroundColor Gray
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $pipOutput = & $PythonExe -m pip install -r $requirementsFile 2>&1
     $pipExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $prevPref
 
     if ($pipExitCode -eq 0) {
         # Verify key packages
@@ -257,8 +260,11 @@ function Build-RustProject {
     Push-Location $ProjectRoot
     try {
         Write-Host "  Compiling (release mode)..." -ForegroundColor Gray
-        $buildOutput = & cargo build --release 2>&1
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & cargo build --release 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
         $buildExitCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevPref
 
         if ($buildExitCode -eq 0) {
             $binaryPath = Join-Path $ProjectRoot "target\release\meeting-translator.exe"
@@ -269,8 +275,7 @@ function Build-RustProject {
                 Write-Ok "Build completed"
             }
         } else {
-            Write-Fail "Build failed"
-            Write-Host $buildOutput -ForegroundColor Yellow
+            Write-Fail "Build failed (exit code: $buildExitCode)"
             exit 1
         }
     } finally {
@@ -285,15 +290,18 @@ function Test-RustProject {
 
     Push-Location $ProjectRoot
     try {
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         $testOutput = & cargo test --workspace 2>&1
         $testExitCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevPref
 
         if ($testExitCode -eq 0) {
             $passed = ($testOutput | Select-String "test result: ok" | Measure-Object).Count
             Write-Ok "All test suites passed ($passed suites)"
         } else {
             Write-Fail "Some tests failed"
-            Write-Host $testOutput -ForegroundColor Yellow
+            $testOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
         }
     } finally {
         Pop-Location
