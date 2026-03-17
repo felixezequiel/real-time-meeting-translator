@@ -13,6 +13,8 @@ pub struct PipelineConfig {
     pub chunk_duration_ms: u64,
     pub whisper_model: String,
     pub tts_speed: f32,
+    #[serde(default)]
+    pub input_device: Option<String>,
 }
 
 impl Default for PipelineConfig {
@@ -23,6 +25,7 @@ impl Default for PipelineConfig {
             chunk_duration_ms: DEFAULT_CHUNK_DURATION_MS,
             whisper_model: DEFAULT_WHISPER_MODEL.to_string(),
             tts_speed: DEFAULT_TTS_SPEED,
+            input_device: None,
         }
     }
 }

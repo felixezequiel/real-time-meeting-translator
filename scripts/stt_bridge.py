@@ -11,12 +11,17 @@ Requires: pip install faster-whisper numpy
 
 import json
 import sys
+import io
 import argparse
 import os
 import wave
 import struct
 import tempfile
 import numpy as np
+
+# Force UTF-8 on Windows pipes
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
 
 try:
     from faster_whisper import WhisperModel
@@ -25,16 +30,42 @@ except ImportError:
     HAS_WHISPER = False
 
 
+def add_cuda_dll_dirs():
+    """Add NVIDIA pip package DLL directories to search path."""
+    site_packages = os.path.join(
+        os.path.expanduser("~"), "AppData", "Roaming",
+        "Python", "Python312", "site-packages", "nvidia"
+    )
+    for subdir in ["cublas", "cudnn"]:
+        bin_dir = os.path.join(site_packages, subdir, "bin")
+        if os.path.isdir(bin_dir):
+            os.add_dll_directory(bin_dir)
+            os.environ["PATH"] = bin_dir + ";" + os.environ.get("PATH", "")
+
+
 def load_model(model_name):
     if not HAS_WHISPER:
         sys.stderr.write("WARNING: faster-whisper not installed\n")
         sys.stderr.flush()
         return None
 
-    sys.stderr.write(f"Loading Whisper model: {model_name}...\n")
+    # Try GPU first, fall back to CPU
+    add_cuda_dll_dirs()
+    try:
+        sys.stderr.write(f"Loading Whisper model: {model_name} on GPU...\n")
+        sys.stderr.flush()
+        model = WhisperModel(model_name, device="cuda", compute_type="float16")
+        sys.stderr.write("Whisper model loaded on GPU.\n")
+        sys.stderr.flush()
+        return model
+    except Exception as e:
+        sys.stderr.write(f"GPU not available ({e}), falling back to CPU...\n")
+        sys.stderr.flush()
+
+    sys.stderr.write(f"Loading Whisper model: {model_name} on CPU...\n")
     sys.stderr.flush()
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    sys.stderr.write("Whisper model loaded.\n")
+    sys.stderr.write("Whisper model loaded on CPU.\n")
     sys.stderr.flush()
     return model
 
@@ -56,27 +87,40 @@ def read_wav_samples(wav_path):
         return np.zeros(n_frames, dtype=np.float32), sample_rate
 
 
+LANGUAGE_PROMPTS = {
+    "pt": "Transcreva o seguinte áudio em português brasileiro.",
+    "en": "Transcribe the following audio in English.",
+}
+
+
 def transcribe(model, audio, language):
     if model is None:
         return "[whisper not available]"
 
-    # Limit to 6 seconds
-    max_samples = 16000 * 6
+    max_samples = 16000 * 10
     if len(audio) > max_samples:
         audio = audio[:max_samples]
+
+    initial_prompt = LANGUAGE_PROMPTS.get(language, "")
 
     segments, info = model.transcribe(
         audio,
         language=language,
-        beam_size=1,
-        best_of=1,
-        vad_filter=True,
+        beam_size=3,
+        best_of=2,
+        vad_filter=False,
         without_timestamps=True,
+        initial_prompt=initial_prompt,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.5,
+        log_prob_threshold=-0.8,
+        temperature=0.0,
     )
 
     text_parts = []
     for segment in segments:
-        text_parts.append(segment.text)
+        if segment.no_speech_prob < 0.7:
+            text_parts.append(segment.text)
 
     result = " ".join(text_parts).strip()
     return result.encode('utf-8', errors='replace').decode('utf-8')
@@ -116,7 +160,7 @@ def main():
                 continue
 
             text = transcribe(model, audio, language)
-            print(json.dumps({"text": text}, ensure_ascii=False), flush=True)
+            print(json.dumps({"text": text}, ensure_ascii=True), flush=True)
         except Exception as e:
             sys.stderr.write(f"STT error: {e}\n")
             sys.stderr.flush()

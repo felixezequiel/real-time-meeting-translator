@@ -83,6 +83,23 @@ pub fn get_default_output_device() -> Result<cpal::Device, DeviceError> {
         .ok_or(DeviceError::NoDevicesFound)
 }
 
+pub fn find_input_device_by_name(name_substring: &str) -> Result<cpal::Device, DeviceError> {
+    let host = cpal::default_host();
+    let devices = host
+        .input_devices()
+        .map_err(|e| DeviceError::HostError(e.to_string()))?;
+
+    for device in devices {
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "Unknown".to_string());
+        if device_name.to_lowercase().contains(&name_substring.to_lowercase()) {
+            return Ok(device);
+        }
+    }
+    Err(DeviceError::DeviceNotFound(name_substring.to_string()))
+}
+
 pub fn get_default_input_device() -> Result<cpal::Device, DeviceError> {
     let host = cpal::default_host();
     host.default_input_device()

@@ -13,11 +13,11 @@ use std::time::Instant;
 const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
-/// Number of consecutive silent chunks before we consider speech ended
-const SILENCE_CHUNKS_FOR_FLUSH: u32 = 2;
+/// Flush accumulated audio every N seconds during continuous speech
+const STREAMING_FLUSH_SECONDS: f32 = 1.0;
 
-/// Maximum accumulated audio before forced flush (seconds)
-const MAX_ACCUMULATION_SECONDS: f32 = 5.0;
+/// Minimum accumulated audio worth sending to STT (seconds)
+const MIN_FLUSH_SECONDS: f32 = 0.3;
 
 pub struct SpeakerPipeline {
     pub stt: WhisperStt,
@@ -55,7 +55,6 @@ impl SpeakerPipeline {
 
         let mut is_running = true;
         let mut accumulated_samples: Vec<f32> = Vec::new();
-        let mut consecutive_silence: u32 = 0;
         let mut is_speaking = false;
 
         loop {
@@ -84,17 +83,17 @@ impl SpeakerPipeline {
 
                     if has_speech {
                         accumulated_samples.extend_from_slice(&chunk.samples);
-                        consecutive_silence = 0;
+                        let accumulated_seconds = accumulated_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32;
 
                         if !is_speaking {
                             is_speaking = true;
                             tracing::info!("Speech started");
                         }
 
-                        // Force flush if accumulated too much audio
-                        if accumulated_seconds >= MAX_ACCUMULATION_SECONDS {
+                        // Streaming flush: send chunks every N seconds while speaking
+                        if accumulated_seconds >= STREAMING_FLUSH_SECONDS {
                             tracing::info!(
-                                "Flushing (max duration): {:.1}s of audio",
+                                "Streaming flush: {:.1}s of audio",
                                 accumulated_seconds
                             );
                             let samples_to_process = std::mem::take(&mut accumulated_samples);
@@ -107,32 +106,24 @@ impl SpeakerPipeline {
                                 metrics_tx.clone(),
                             );
                         }
-                    } else {
-                        if is_speaking {
-                            consecutive_silence += 1;
+                    } else if is_speaking {
+                        // Speech paused — flush immediately
+                        is_speaking = false;
 
-                            if consecutive_silence >= SILENCE_CHUNKS_FOR_FLUSH {
-                                let accumulated_seconds = accumulated_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32;
-                                tracing::info!(
-                                    "Speech ended — flushing {:.1}s of audio",
-                                    accumulated_seconds
-                                );
-
-                                let samples_to_process = std::mem::take(&mut accumulated_samples);
-                                is_speaking = false;
-                                consecutive_silence = 0;
-
-                                if !samples_to_process.is_empty() {
-                                    spawn_pipeline_task(
-                                        samples_to_process,
-                                        stt.clone(),
-                                        translator.clone(),
-                                        tts.clone(),
-                                        audio_output.clone(),
-                                        metrics_tx.clone(),
-                                    );
-                                }
-                            }
+                        if accumulated_seconds >= MIN_FLUSH_SECONDS {
+                            tracing::info!(
+                                "Speech paused — flushing {:.1}s of audio",
+                                accumulated_seconds
+                            );
+                            let samples_to_process = std::mem::take(&mut accumulated_samples);
+                            spawn_pipeline_task(
+                                samples_to_process,
+                                stt.clone(),
+                                translator.clone(),
+                                tts.clone(),
+                                audio_output.clone(),
+                                metrics_tx.clone(),
+                            );
                         }
                     }
                 }

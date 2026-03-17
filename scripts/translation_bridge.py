@@ -12,7 +12,12 @@ Requires: pip install transformers sentencepiece torch
 
 import json
 import sys
+import io
 from transformers import MarianMTModel, MarianTokenizer
+
+# Force UTF-8 on Windows pipes
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
 
 MODEL_MAP = {
     ("en", "pt"): "Helsinki-NLP/opus-mt-en-ROMANCE",
@@ -27,13 +32,18 @@ ROMANCE_TARGET_PREFIX = {
 
 
 def load_models():
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    sys.stderr.write(f"Translation device: {device}\n")
+    sys.stderr.flush()
+
     models = {}
     for (src, tgt), model_name in MODEL_MAP.items():
         sys.stderr.write(f"Loading model {model_name}...\n")
         sys.stderr.flush()
         tokenizer = MarianTokenizer.from_pretrained(model_name)
-        model = MarianMTModel.from_pretrained(model_name)
-        models[(src, tgt)] = (tokenizer, model)
+        model = MarianMTModel.from_pretrained(model_name).to(device)
+        models[(src, tgt)] = (tokenizer, model, device)
     return models
 
 
@@ -42,7 +52,7 @@ def translate(models, text, source_lang, target_lang):
     if key not in models:
         return f"[unsupported: {source_lang}->{target_lang}]"
 
-    tokenizer, model = models[key]
+    tokenizer, model, device = models[key]
 
     # For ROMANCE models, add target language prefix
     if target_lang in ROMANCE_TARGET_PREFIX and "ROMANCE" not in MODEL_MAP.get(key, ("", ""))[0]:
@@ -52,7 +62,8 @@ def translate(models, text, source_lang, target_lang):
         text = prefix + text
 
     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-    translated_tokens = model.generate(**inputs, max_length=512, num_beams=4)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    translated_tokens = model.generate(**inputs, max_length=512, num_beams=1)
     result = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
     return result
 

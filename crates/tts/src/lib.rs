@@ -8,6 +8,8 @@ use std::sync::Mutex;
 use thiserror::Error;
 use tracing;
 
+use std::io::Read as IoRead;
+
 const MONO_CHANNELS: u16 = 1;
 
 #[derive(Debug, Error)]
@@ -27,7 +29,7 @@ struct TtsRequest {
 
 #[derive(Deserialize)]
 struct TtsResponse {
-    samples: Vec<f32>,
+    audio_file: String,
     sample_rate: u32,
 }
 
@@ -89,14 +91,20 @@ impl PiperTts {
         let response: TtsResponse = serde_json::from_str(&response_line)
             .map_err(|e| TtsError::SynthesisFailed(format!("Invalid TTS response: {}", e)))?;
 
+        let samples = read_wav_samples(&response.audio_file)
+            .map_err(|e| TtsError::SynthesisFailed(format!("Failed to read TTS WAV: {}", e)))?;
+
+        // Clean up temp file
+        let _ = std::fs::remove_file(&response.audio_file);
+
         tracing::debug!(
             "TTS synthesized {} samples at {}Hz",
-            response.samples.len(),
+            samples.len(),
             response.sample_rate
         );
 
         Ok(AudioChunk::new(
-            response.samples,
+            samples,
             response.sample_rate,
             MONO_CHANNELS,
         ))
@@ -163,6 +171,30 @@ impl PipelineStage for PiperTts {
     }
 }
 
+fn read_wav_samples(path: &str) -> std::io::Result<Vec<f32>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+
+    if data.len() < 44 {
+        return Ok(vec![0.0; 100]);
+    }
+
+    // Skip 44-byte WAV header, read 16-bit PCM samples
+    let pcm_data = &data[44..];
+    let num_samples = pcm_data.len() / 2;
+    let mut samples = Vec::with_capacity(num_samples);
+
+    for i in 0..num_samples {
+        let lo = pcm_data[i * 2] as i16;
+        let hi = (pcm_data[i * 2 + 1] as i16) << 8;
+        let int16 = lo | hi;
+        samples.push(int16 as f32 / 32768.0);
+    }
+
+    Ok(samples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,9 +212,9 @@ mod tests {
 
     #[test]
     fn tts_response_deserializes_correctly() {
-        let json = r#"{"samples": [0.1, 0.2, 0.3], "sample_rate": 22050}"#;
+        let json = r#"{"audio_file": "/tmp/test.wav", "sample_rate": 22050}"#;
         let response: TtsResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.samples.len(), 3);
+        assert_eq!(response.audio_file, "/tmp/test.wav");
         assert_eq!(response.sample_rate, 22050);
     }
 

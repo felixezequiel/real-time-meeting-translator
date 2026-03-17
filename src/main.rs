@@ -71,8 +71,13 @@ async fn run_application(config: PipelineConfig) -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel(8);
     let (metrics_tx, mut metrics_rx) = mpsc::channel(64);
 
-    let input_device = device::get_default_input_device()
-        .map_err(|e| anyhow::anyhow!("No input device: {}", e))?;
+    let input_device = if let Some(ref device_name) = config.input_device {
+        device::find_input_device_by_name(device_name)
+            .map_err(|e| anyhow::anyhow!("Input device '{}' not found: {}", device_name, e))?
+    } else {
+        device::get_default_input_device()
+            .map_err(|e| anyhow::anyhow!("No input device: {}", e))?
+    };
     let input_name = cpal::traits::DeviceTrait::name(&input_device)
         .unwrap_or_else(|_| "Unknown".to_string());
     tracing::info!("Capture device: {}", input_name);
