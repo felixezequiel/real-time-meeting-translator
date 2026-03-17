@@ -100,7 +100,11 @@ function Install-Rust {
 
         # Check for updates
         Write-Host "  Checking for updates..." -ForegroundColor Gray
-        & rustup update stable 2>&1 | Out-Null
+        try {
+            $updateOutput = & rustup update stable 2>&1
+        } catch {
+            # rustup writes info to stderr, ignore errors
+        }
         $updatedVersion = (rustc --version) -replace "rustc ", ""
         if ($updatedVersion -ne $currentVersion) {
             Write-Ok "Updated to $updatedVersion"
@@ -113,7 +117,7 @@ function Install-Rust {
     $rustupExe = Join-Path $env:TEMP "rustup-init.exe"
 
     Invoke-WebRequest -Uri $rustupUrl -OutFile $rustupExe -UseBasicParsing
-    & $rustupExe -y --default-toolchain stable 2>&1 | Out-Null
+    try { & $rustupExe -y --default-toolchain stable 2>&1 | Out-Host } catch {}
 
     Refresh-Path
 
@@ -139,7 +143,7 @@ function Install-Python {
     }
 
     Write-Host "  Installing Python via winget..." -ForegroundColor Gray
-    winget install --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Null
+    try { winget install --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Host } catch {}
 
     Refresh-Path
 
@@ -215,7 +219,7 @@ function Install-PythonDeps {
     }
 
     Write-Host "  Upgrading pip..." -ForegroundColor Gray
-    & $PythonExe -m pip install --upgrade pip 2>&1 | Out-Null
+    try { & $PythonExe -m pip install --upgrade pip 2>&1 | Out-Host } catch {}
 
     Write-Host "  Installing packages (this may take several minutes on first run)..." -ForegroundColor Gray
     $pipOutput = & $PythonExe -m pip install -r $requirementsFile 2>&1

@@ -87,7 +87,7 @@ function Remove-PythonPackages {
     foreach ($pkg in $packages) {
         $check = & $pythonExe -m pip show $pkg 2>&1
         if ($LASTEXITCODE -eq 0) {
-            & $pythonExe -m pip uninstall $pkg -y 2>&1 | Out-Null
+            & $pythonExe -m pip uninstall $pkg -y 2>&1 | Out-Host
             Write-Ok "Removed $pkg"
         }
     }
@@ -166,7 +166,7 @@ function Remove-RustToolchain {
     }
 
     if (Confirm-Action "  Remove Rust toolchain? (This affects ALL Rust projects on this machine)") {
-        & rustup self uninstall -y 2>&1 | Out-Null
+        & rustup self uninstall -y 2>&1 | Out-Host
         Write-Ok "Rust toolchain removed"
     } else {
         Write-Skip "Rust toolchain kept"
