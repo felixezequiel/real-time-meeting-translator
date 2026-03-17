@@ -1,0 +1,5 @@
+speaker_source_language = "English"
+speaker_target_language = "Portuguese"
+chunk_duration_ms = 2000
+whisper_model = "base"
+tts_speed = 1.1
