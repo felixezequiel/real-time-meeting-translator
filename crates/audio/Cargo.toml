@@ -8,3 +8,6 @@ shared = { path = "../shared" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+anyhow = { workspace = true }
+cpal = "0.15"
+rubato = "0.16"

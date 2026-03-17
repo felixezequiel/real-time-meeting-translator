@@ -8,3 +8,4 @@ shared = { path = "../shared" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tray-icon = "0.19"

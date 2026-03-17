@@ -1,1 +1,5 @@
-// Audio capture (WASAPI) and output (VB-Cable) — T-02 and T-04
+pub mod capture;
+pub mod device;
+pub mod playback;
+pub mod resampler;
+pub mod vad;
