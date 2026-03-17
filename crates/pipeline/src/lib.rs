@@ -11,6 +11,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
+const WHISPER_SAMPLE_RATE: u32 = 16_000;
+
+/// Number of consecutive silent chunks before we consider speech ended
+const SILENCE_CHUNKS_FOR_FLUSH: u32 = 2;
+
+/// Maximum accumulated audio before forced flush (seconds)
+const MAX_ACCUMULATION_SECONDS: f32 = 5.0;
 
 pub struct SpeakerPipeline {
     pub stt: WhisperStt,
@@ -47,6 +54,9 @@ impl SpeakerPipeline {
         let vad = self.vad;
 
         let mut is_running = true;
+        let mut accumulated_samples: Vec<f32> = Vec::new();
+        let mut consecutive_silence: u32 = 0;
+        let mut is_speaking = false;
 
         loop {
             tokio::select! {
@@ -59,6 +69,8 @@ impl SpeakerPipeline {
                         PipelineCommand::Stop => {
                             tracing::info!("Pipeline stopped");
                             is_running = false;
+                            accumulated_samples.clear();
+                            is_speaking = false;
                         }
                     }
                 }
@@ -67,101 +79,62 @@ impl SpeakerPipeline {
                         continue;
                     }
 
-                    let rms = calculate_rms(&chunk.samples);
                     let has_speech = vad.contains_speech(&chunk.samples);
-                    tracing::info!(
-                        "Audio chunk: {} samples, RMS={:.6}, speech={}",
-                        chunk.samples.len(),
-                        rms,
-                        has_speech
-                    );
+                    let accumulated_seconds = accumulated_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32;
 
-                    if !has_speech {
-                        continue;
-                    }
+                    if has_speech {
+                        accumulated_samples.extend_from_slice(&chunk.samples);
+                        consecutive_silence = 0;
 
-                    let pipeline_start = Instant::now();
-                    let stt_ref = stt.clone();
-                    let translator_ref = translator.clone();
-                    let tts_ref = tts.clone();
-                    let output_tx = audio_output.clone();
-                    let metrics = metrics_tx.clone();
-
-                    tokio::spawn(async move {
-                        // STT
-                        let stt_start = Instant::now();
-                        let text_segment = match stt_ref.transcribe(&chunk) {
-                            Ok(segment) => segment,
-                            Err(e) => {
-                                tracing::warn!("STT failed: {}", e);
-                                return;
-                            }
-                        };
-                        let stt_duration = stt_start.elapsed();
-                        let _ = metrics.send(PipelineMetrics::new("stt".to_string(), stt_duration)).await;
-
-                        if text_segment.is_empty() {
-                            return;
+                        if !is_speaking {
+                            is_speaking = true;
+                            tracing::info!("Speech started");
                         }
 
-                        tracing::info!("STT: \"{}\"", text_segment.text);
+                        // Force flush if accumulated too much audio
+                        if accumulated_seconds >= MAX_ACCUMULATION_SECONDS {
+                            tracing::info!(
+                                "Flushing (max duration): {:.1}s of audio",
+                                accumulated_seconds
+                            );
+                            let samples_to_process = std::mem::take(&mut accumulated_samples);
+                            spawn_pipeline_task(
+                                samples_to_process,
+                                stt.clone(),
+                                translator.clone(),
+                                tts.clone(),
+                                audio_output.clone(),
+                                metrics_tx.clone(),
+                            );
+                        }
+                    } else {
+                        if is_speaking {
+                            consecutive_silence += 1;
 
-                        // Translation
-                        let translate_start = Instant::now();
-                        let translated = match translator_ref.translate(&text_segment) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                tracing::warn!("Translation failed: {}", e);
-                                return;
-                            }
-                        };
-                        let translate_duration = translate_start.elapsed();
-                        let _ = metrics.send(PipelineMetrics::new("translation".to_string(), translate_duration)).await;
+                            if consecutive_silence >= SILENCE_CHUNKS_FOR_FLUSH {
+                                let accumulated_seconds = accumulated_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32;
+                                tracing::info!(
+                                    "Speech ended — flushing {:.1}s of audio",
+                                    accumulated_seconds
+                                );
 
-                        tracing::info!("Translated: \"{}\"", translated.text);
+                                let samples_to_process = std::mem::take(&mut accumulated_samples);
+                                is_speaking = false;
+                                consecutive_silence = 0;
 
-                        // TTS
-                        let tts_start = Instant::now();
-                        let audio_out = match tts_ref.synthesize(&translated) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                tracing::warn!("TTS failed: {}", e);
-                                return;
-                            }
-                        };
-                        // Resample TTS output to match playback device sample rate
-                        let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
-                            match resampler::resample_to_target(
-                                &audio_out.samples,
-                                audio_out.sample_rate,
-                                PLAYBACK_SAMPLE_RATE,
-                            ) {
-                                Ok(resampled) => AudioChunk::new(resampled, PLAYBACK_SAMPLE_RATE, 1),
-                                Err(e) => {
-                                    tracing::warn!("Resample failed: {}, using original", e);
-                                    audio_out
+                                if !samples_to_process.is_empty() {
+                                    spawn_pipeline_task(
+                                        samples_to_process,
+                                        stt.clone(),
+                                        translator.clone(),
+                                        tts.clone(),
+                                        audio_output.clone(),
+                                        metrics_tx.clone(),
+                                    );
                                 }
                             }
-                        } else {
-                            audio_out
-                        };
-
-                        let tts_duration = tts_start.elapsed();
-                        let _ = metrics.send(PipelineMetrics::new("tts".to_string(), tts_duration)).await;
-
-                        let total_duration = pipeline_start.elapsed();
-                        let _ = metrics.send(PipelineMetrics::new("total".to_string(), total_duration)).await;
-
-                        tracing::info!(
-                            "Pipeline complete: {}ms (STT={}ms, Translate={}ms, TTS={}ms)",
-                            total_duration.as_millis(),
-                            stt_duration.as_millis(),
-                            translate_duration.as_millis(),
-                            tts_duration.as_millis()
-                        );
-
-                        let _ = output_tx.send(audio_out).await;
-                    });
+                        }
+                    }
                 }
                 else => break,
             }
@@ -171,10 +144,102 @@ impl SpeakerPipeline {
     }
 }
 
-fn calculate_rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum_of_squares: f32 = samples.iter().map(|s| s * s).sum();
-    (sum_of_squares / samples.len() as f32).sqrt()
+fn spawn_pipeline_task(
+    samples: Vec<f32>,
+    stt: Arc<WhisperStt>,
+    translator: Arc<OpusMtTranslator>,
+    tts: Arc<PiperTts>,
+    output_tx: mpsc::Sender<AudioChunk>,
+    metrics_tx: mpsc::Sender<PipelineMetrics>,
+) {
+    tokio::spawn(async move {
+        let pipeline_start = Instant::now();
+        let chunk = AudioChunk::new(samples, WHISPER_SAMPLE_RATE, 1);
+
+        // STT
+        let stt_start = Instant::now();
+        let text_segment = match stt.transcribe(&chunk) {
+            Ok(segment) => segment,
+            Err(e) => {
+                tracing::warn!("STT failed: {}", e);
+                return;
+            }
+        };
+        let stt_duration = stt_start.elapsed();
+        let _ = metrics_tx
+            .send(PipelineMetrics::new("stt".to_string(), stt_duration))
+            .await;
+
+        if text_segment.is_empty() {
+            return;
+        }
+
+        tracing::info!("STT: \"{}\"", text_segment.text);
+
+        // Translation
+        let translate_start = Instant::now();
+        let translated = match translator.translate(&text_segment) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Translation failed: {}", e);
+                return;
+            }
+        };
+        let translate_duration = translate_start.elapsed();
+        let _ = metrics_tx
+            .send(PipelineMetrics::new(
+                "translation".to_string(),
+                translate_duration,
+            ))
+            .await;
+
+        tracing::info!("Translated: \"{}\"", translated.text);
+
+        // TTS
+        let tts_start = Instant::now();
+        let audio_out = match tts.synthesize(&translated) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("TTS failed: {}", e);
+                return;
+            }
+        };
+
+        // Resample TTS output to match playback device sample rate
+        let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
+            match resampler::resample_to_target(
+                &audio_out.samples,
+                audio_out.sample_rate,
+                PLAYBACK_SAMPLE_RATE,
+            ) {
+                Ok(resampled) => AudioChunk::new(resampled, PLAYBACK_SAMPLE_RATE, 1),
+                Err(e) => {
+                    tracing::warn!("Resample failed: {}, using original", e);
+                    audio_out
+                }
+            }
+        } else {
+            audio_out
+        };
+
+        let tts_duration = tts_start.elapsed();
+        let _ = metrics_tx
+            .send(PipelineMetrics::new("tts".to_string(), tts_duration))
+            .await;
+
+        let total_duration = pipeline_start.elapsed();
+        let _ = metrics_tx
+            .send(PipelineMetrics::new("total".to_string(), total_duration))
+            .await;
+
+        tracing::info!(
+            "Pipeline complete: {}ms (STT={}ms, Translate={}ms, TTS={}ms)",
+            total_duration.as_millis(),
+            stt_duration.as_millis(),
+            translate_duration.as_millis(),
+            tts_duration.as_millis()
+        );
+
+        let _ = output_tx.send(audio_out).await;
+    });
 }

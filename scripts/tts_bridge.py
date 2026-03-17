@@ -50,7 +50,7 @@ def synthesize(speaker, stream, voice_map, text, language):
 
     stream.Open(TMP_WAV, 3)  # SSFMCreateForWrite
     speaker.AudioOutputStream = stream
-    speaker.Rate = 3  # Faster speech
+    speaker.Rate = 1  # Natural speed
     speaker.Speak(text, 0)
     stream.Close()
 
