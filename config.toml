@@ -1,5 +1,5 @@
-speaker_source_language = "English"
-speaker_target_language = "Portuguese"
+speaker_source_language = "Portuguese"
+speaker_target_language = "English"
 chunk_duration_ms = 2000
 whisper_model = "base"
 tts_speed = 1.1

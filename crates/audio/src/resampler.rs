@@ -55,6 +55,43 @@ pub fn resample_to_16khz_mono(
     Ok(output)
 }
 
+pub fn resample_to_target(
+    samples: &[f32],
+    source_rate: u32,
+    target_rate: u32,
+) -> Result<Vec<f32>, ResampleError> {
+    if source_rate == target_rate {
+        return Ok(samples.to_vec());
+    }
+
+    let chunk_size = 1024;
+    let mut resampler = FftFixedIn::<f32>::new(
+        source_rate as usize,
+        target_rate as usize,
+        chunk_size,
+        2,
+        1,
+    )
+    .map_err(|e| ResampleError::CreationFailed(e.to_string()))?;
+
+    let mut output = Vec::new();
+    let mut position = 0;
+    let frames_needed = resampler.input_frames_next();
+
+    while position + frames_needed <= samples.len() {
+        let input_chunk = &samples[position..position + frames_needed];
+        let result = resampler
+            .process(&[input_chunk.to_vec()], None)
+            .map_err(|e| ResampleError::ProcessingFailed(e.to_string()))?;
+        if let Some(channel) = result.first() {
+            output.extend_from_slice(channel);
+        }
+        position += frames_needed;
+    }
+
+    Ok(output)
+}
+
 fn downmix_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     let channel_count = channels as usize;
     samples

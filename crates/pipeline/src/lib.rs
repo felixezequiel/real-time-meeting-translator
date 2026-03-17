@@ -1,3 +1,4 @@
+use audio::resampler;
 use audio::vad::EnergyVad;
 use shared::{AudioChunk, PipelineCommand, PipelineMetrics};
 use stt::WhisperStt;
@@ -8,6 +9,8 @@ use tts::PiperTts;
 
 use std::sync::Arc;
 use std::time::Instant;
+
+const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
 
 pub struct SpeakerPipeline {
     pub stt: WhisperStt,
@@ -64,8 +67,16 @@ impl SpeakerPipeline {
                         continue;
                     }
 
-                    if !vad.contains_speech(&chunk.samples) {
-                        tracing::trace!("VAD: silence detected, skipping chunk");
+                    let rms = calculate_rms(&chunk.samples);
+                    let has_speech = vad.contains_speech(&chunk.samples);
+                    tracing::info!(
+                        "Audio chunk: {} samples, RMS={:.6}, speech={}",
+                        chunk.samples.len(),
+                        rms,
+                        has_speech
+                    );
+
+                    if !has_speech {
                         continue;
                     }
 
@@ -90,9 +101,10 @@ impl SpeakerPipeline {
                         let _ = metrics.send(PipelineMetrics::new("stt".to_string(), stt_duration)).await;
 
                         if text_segment.is_empty() {
-                            tracing::trace!("STT returned empty text, skipping");
                             return;
                         }
+
+                        tracing::info!("STT: \"{}\"", text_segment.text);
 
                         // Translation
                         let translate_start = Instant::now();
@@ -106,6 +118,8 @@ impl SpeakerPipeline {
                         let translate_duration = translate_start.elapsed();
                         let _ = metrics.send(PipelineMetrics::new("translation".to_string(), translate_duration)).await;
 
+                        tracing::info!("Translated: \"{}\"", translated.text);
+
                         // TTS
                         let tts_start = Instant::now();
                         let audio_out = match tts_ref.synthesize(&translated) {
@@ -115,6 +129,23 @@ impl SpeakerPipeline {
                                 return;
                             }
                         };
+                        // Resample TTS output to match playback device sample rate
+                        let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
+                            match resampler::resample_to_target(
+                                &audio_out.samples,
+                                audio_out.sample_rate,
+                                PLAYBACK_SAMPLE_RATE,
+                            ) {
+                                Ok(resampled) => AudioChunk::new(resampled, PLAYBACK_SAMPLE_RATE, 1),
+                                Err(e) => {
+                                    tracing::warn!("Resample failed: {}, using original", e);
+                                    audio_out
+                                }
+                            }
+                        } else {
+                            audio_out
+                        };
+
                         let tts_duration = tts_start.elapsed();
                         let _ = metrics.send(PipelineMetrics::new("tts".to_string(), tts_duration)).await;
 
@@ -138,4 +169,12 @@ impl SpeakerPipeline {
 
         tracing::info!("Pipeline loop ended");
     }
+}
+
+fn calculate_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_of_squares: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_of_squares / samples.len() as f32).sqrt()
 }

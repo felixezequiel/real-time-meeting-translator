@@ -2,7 +2,7 @@
 /// Uses RMS (Root Mean Square) threshold to detect speech vs silence.
 /// Simple and zero-dependency — upgrade path to Silero VAD via ONNX later.
 
-const DEFAULT_RMS_THRESHOLD: f32 = 0.01;
+const DEFAULT_RMS_THRESHOLD: f32 = 0.00005;
 const DEFAULT_MIN_SPEECH_DURATION_MS: u64 = 250;
 const SAMPLE_RATE_16KHZ: f32 = 16_000.0;
 

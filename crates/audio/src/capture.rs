@@ -9,6 +9,7 @@ use crate::resampler;
 
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const MONO_CHANNELS: u16 = 1;
+const INPUT_GAIN: f32 = 15.0;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -75,7 +76,8 @@ impl AudioCapture {
             SampleFormat::F32 => {
                 let data_callback = move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mut buf = buffer_clone.lock().unwrap();
-                    buf.extend_from_slice(data);
+                    let amplified: Vec<f32> = data.iter().map(|&s| (s * INPUT_GAIN).clamp(-1.0, 1.0)).collect();
+                    buf.extend_from_slice(&amplified);
 
                     if buf.len() >= samples_per_chunk {
                         let chunk_samples: Vec<f32> = buf.drain(..samples_per_chunk).collect();

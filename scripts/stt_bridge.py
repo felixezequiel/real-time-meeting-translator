@@ -77,6 +77,8 @@ def main():
             language = request.get("language", "en")
 
             text = transcribe(model, samples, sample_rate, language)
+            # Clean any non-printable characters that break UTF-8
+            text = text.encode('utf-8', errors='replace').decode('utf-8')
             response = {"text": text}
             print(json.dumps(response, ensure_ascii=False), flush=True)
         except Exception as e:
