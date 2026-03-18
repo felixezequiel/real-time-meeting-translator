@@ -41,7 +41,7 @@ impl AudioCapture {
 
     pub fn start(
         &self,
-        sender: mpsc::Sender<AudioChunk>,
+        sender: mpsc::UnboundedSender<AudioChunk>,
     ) -> Result<cpal::Stream, CaptureError> {
         let config = self
             .device
@@ -90,7 +90,7 @@ impl AudioCapture {
                         };
 
                         let chunk = AudioChunk::new(resampled, WHISPER_SAMPLE_RATE, MONO_CHANNELS);
-                        let _ = sender.try_send(chunk);
+                        let _ = sender.send(chunk);
                     }
                 };
 
@@ -116,7 +116,7 @@ impl AudioCapture {
                         };
 
                         let chunk = AudioChunk::new(resampled, WHISPER_SAMPLE_RATE, MONO_CHANNELS);
-                        let _ = sender.try_send(chunk);
+                        let _ = sender.send(chunk);
                     }
                 };
 

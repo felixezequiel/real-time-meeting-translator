@@ -23,17 +23,23 @@ import numpy as np
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
 
-TMP_WAV = os.path.join(tempfile.gettempdir(), "tts_out.wav")
+# Each TTS process gets a unique temp file to avoid race conditions
+# when two TTS instances run concurrently (speaker pipeline + mic pipeline).
+TMP_WAV = os.path.join(tempfile.gettempdir(), f"tts_out_{os.getpid()}.wav")
 
 PIPER_VOICE_MAP = {
     "en-us": "en_US-ryan-medium",
-    "pt-br": "en_US-ryan-medium",  # fallback to English voice for now
+    "pt-br": "pt_BR-faber-medium",
 }
 
 PIPER_VOICE_URLS = {
     "en_US-ryan-medium": [
         "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx",
         "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx.json",
+    ],
+    "pt_BR-faber-medium": [
+        "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx",
+        "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json",
     ],
 }
 

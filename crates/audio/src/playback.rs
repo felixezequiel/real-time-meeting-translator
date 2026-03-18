@@ -28,7 +28,7 @@ impl AudioPlayback {
 
     pub fn start(
         &self,
-        mut receiver: mpsc::Receiver<AudioChunk>,
+        mut receiver: mpsc::UnboundedReceiver<AudioChunk>,
     ) -> Result<cpal::Stream, PlaybackError> {
         let config = self
             .device

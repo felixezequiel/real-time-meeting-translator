@@ -27,6 +27,10 @@ struct SttRequest {
 #[derive(Deserialize)]
 struct SttResponse {
     text: String,
+    /// ISO-639-1 code detected by Whisper (e.g. "en", "pt").
+    /// Present in all responses from the updated bridge; may be absent in legacy responses.
+    #[serde(default)]
+    language: Option<String>,
 }
 
 pub struct WhisperStt {
@@ -98,7 +102,27 @@ impl WhisperStt {
             .map_err(|e| SttError::TranscriptionFailed(format!("{}: {}", e, response_line.trim())))?;
 
         let trimmed = response.text.trim().to_string();
-        Ok(TextSegment::new(trimmed, self.language))
+
+        // Use the language Whisper actually detected, not just what we expected.
+        // This is critical for the feedback-loop guard: if TTS output (target language)
+        // leaks back into the loopback capture, the pipeline can reject it because the
+        // detected language won't match the expected source language.
+        let detected_language = parse_language_code(response.language.as_deref(), self.language);
+
+        Ok(TextSegment::new(trimmed, detected_language))
+    }
+}
+
+/// Map a Whisper ISO-639-1 language code to our `Language` enum.
+/// Falls back to `expected` when the code is absent or unrecognised so that
+/// audio in languages we do not model (Spanish, French, …) is treated as if it
+/// were in the expected source language and will still be picked up downstream.
+/// The pipeline's language-guard then decides whether to process or drop it.
+fn parse_language_code(code: Option<&str>, expected: Language) -> Language {
+    match code {
+        Some("en") | Some("english") => Language::English,
+        Some("pt") | Some("portuguese") => Language::Portuguese,
+        _ => expected,
     }
 }
 

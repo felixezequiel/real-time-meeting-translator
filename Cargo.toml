@@ -45,3 +45,6 @@ toml = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 cpal = "0.15"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }

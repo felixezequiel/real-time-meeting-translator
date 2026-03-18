@@ -42,7 +42,11 @@ def load_models():
         sys.stderr.write(f"Loading model {model_name}...\n")
         sys.stderr.flush()
         tokenizer = MarianTokenizer.from_pretrained(model_name)
-        model = MarianMTModel.from_pretrained(model_name).to(device)
+        model = MarianMTModel.from_pretrained(model_name)
+        if device == "cuda":
+            model = model.half()   # fp16 — ~40% faster on GPU
+        model = model.to(device)
+        model.eval()
         models[(src, tgt)] = (tokenizer, model, device)
     return models
 

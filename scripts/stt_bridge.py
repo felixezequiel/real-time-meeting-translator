@@ -87,43 +87,79 @@ def read_wav_samples(wav_path):
         return np.zeros(n_frames, dtype=np.float32), sample_rate
 
 
-LANGUAGE_PROMPTS = {
-    "pt": "Transcreva o seguinte áudio em português brasileiro.",
-    "en": "Transcribe the following audio in English.",
-}
+def is_repetitive(text):
+    """Detect hallucinated repetitive patterns like 'i'r un i'r un i'r un...'"""
+    words = text.split()
+    if len(words) < 6:
+        return False
+
+    # Check if any short phrase (1-3 words) repeats more than 4 times
+    for pattern_len in range(1, 4):
+        pattern = " ".join(words[:pattern_len])
+        if len(pattern) < 2:
+            continue
+        count = text.count(pattern)
+        if count > 4:
+            return True
+
+    # Check if unique words are less than 20% of total (very repetitive)
+    unique = set(w.lower().strip(".,!?'\"") for w in words)
+    if len(words) > 10 and len(unique) / len(words) < 0.2:
+        return True
+
+    return False
 
 
-def transcribe(model, audio, language):
+def transcribe(model, audio):
+    """
+    Transcribes audio and auto-detects the spoken language.
+
+    Returns (text, detected_language_code).
+    Auto-detection is essential to prevent the feedback loop: when our TTS output
+    (e.g. Portuguese) leaks back into the loopback capture, Whisper detects it as
+    Portuguese so the pipeline's language guard can drop it instead of re-translating.
+
+    Note: we intentionally do NOT pass `initial_prompt` — it causes Whisper to
+    hallucinate the prompt text ("Transcribe the following audio in English.") when
+    the audio is silent or in the wrong language.
+    """
     if model is None:
-        return "[whisper not available]"
+        return "[whisper not available]", "unknown"
 
     max_samples = 16000 * 10
     if len(audio) > max_samples:
         audio = audio[:max_samples]
 
-    initial_prompt = LANGUAGE_PROMPTS.get(language, "")
-
     segments, info = model.transcribe(
         audio,
-        language=language,
-        beam_size=3,
-        best_of=2,
-        vad_filter=False,
+        beam_size=1,
+        vad_filter=True,
+        vad_parameters=dict(
+            min_silence_duration_ms=250,
+            speech_pad_ms=200,
+        ),
         without_timestamps=True,
-        initial_prompt=initial_prompt,
         condition_on_previous_text=False,
-        no_speech_threshold=0.5,
-        log_prob_threshold=-0.8,
+        no_speech_threshold=0.7,
+        log_prob_threshold=-1.0,
+        compression_ratio_threshold=2.0,   # Skip segments with repetitive output
+        repetition_penalty=1.3,            # Penalize repeated tokens to prevent loops
         temperature=0.0,
     )
 
     text_parts = []
     for segment in segments:
-        if segment.no_speech_prob < 0.7:
-            text_parts.append(segment.text)
+        text_parts.append(segment.text)
 
     result = " ".join(text_parts).strip()
-    return result.encode('utf-8', errors='replace').decode('utf-8')
+
+    # Detect and discard hallucinated repetitive patterns
+    if result and is_repetitive(result):
+        sys.stderr.write(f"Hallucination detected, discarding: {result[:80]}...\n")
+        sys.stderr.flush()
+        result = ""
+    detected_language = info.language if info else "unknown"
+    return result.encode('utf-8', errors='replace').decode('utf-8'), detected_language
 
 
 def main():
@@ -143,7 +179,6 @@ def main():
 
             if "audio_file" in request:
                 audio_path = request["audio_file"]
-                language = request.get("language", "pt")
                 audio, sample_rate = read_wav_samples(audio_path)
                 # Clean up temp file
                 try:
@@ -154,13 +189,12 @@ def main():
                 # Legacy JSON array mode
                 samples = request["samples"]
                 audio = np.array(samples, dtype=np.float32)
-                language = request.get("language", "pt")
             else:
-                print(json.dumps({"text": ""}), flush=True)
+                print(json.dumps({"text": "", "language": "unknown"}), flush=True)
                 continue
 
-            text = transcribe(model, audio, language)
-            print(json.dumps({"text": text}, ensure_ascii=True), flush=True)
+            text, detected_language = transcribe(model, audio)
+            print(json.dumps({"text": text, "language": detected_language}, ensure_ascii=True), flush=True)
         except Exception as e:
             sys.stderr.write(f"STT error: {e}\n")
             sys.stderr.flush()

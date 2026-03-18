@@ -1,6 +1,5 @@
 use audio::resampler;
-use audio::vad::EnergyVad;
-use shared::{AudioChunk, PipelineCommand, PipelineMetrics};
+use shared::{AudioChunk, Language, PipelineCommand, PipelineMetrics, TextSegment};
 use stt::WhisperStt;
 use tokio::sync::mpsc;
 use tracing;
@@ -13,120 +12,145 @@ use std::time::Instant;
 const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
-/// Flush accumulated audio every N seconds during continuous speech
-const STREAMING_FLUSH_SECONDS: f32 = 1.0;
+/// Force-flush the sentence buffer after this many words without punctuation.
+const MAX_WORDS_BEFORE_FORCE_FLUSH: usize = 40;
 
-/// Minimum accumulated audio worth sending to STT (seconds)
-const MIN_FLUSH_SECONDS: f32 = 0.3;
-
+/// Pipeline modelled after a human simultaneous interpreter.
+///
+/// Architecture (3 stages, pipelined):
+///
+/// ```text
+/// [Audio capture] ──→ [STT workers]  ──→ [Sentence buffer] ──→ [Translate+TTS worker] ──→ [Playback]
+///   (parallel)         (parallel)          (ordered)              (sequential, ordered)
+/// ```
+///
+/// - **STT** runs in parallel (spawn_blocking) — doesn't block audio capture.
+/// - **Sentence buffer** accumulates text until a complete thought is detected.
+/// - **Translate+TTS** runs in a SINGLE sequential worker — guarantees playback order.
 pub struct SpeakerPipeline {
-    pub stt: WhisperStt,
-    pub translator: OpusMtTranslator,
-    pub tts: PiperTts,
-    pub vad: EnergyVad,
+    pub stt: Arc<WhisperStt>,
+    pub translator: Arc<OpusMtTranslator>,
+    pub tts: Arc<PiperTts>,
+    pub source_language: Language,
+    pub flush_interval_seconds: f32,
 }
 
 impl SpeakerPipeline {
     pub fn new(
-        stt: WhisperStt,
-        translator: OpusMtTranslator,
-        tts: PiperTts,
-        vad: EnergyVad,
+        stt: Arc<WhisperStt>,
+        translator: Arc<OpusMtTranslator>,
+        tts: Arc<PiperTts>,
+        source_language: Language,
+        flush_interval_seconds: f32,
     ) -> Self {
-        Self {
-            stt,
-            translator,
-            tts,
-            vad,
-        }
+        Self { stt, translator, tts, source_language, flush_interval_seconds }
     }
 
     pub async fn run(
         self,
-        mut audio_input: mpsc::Receiver<AudioChunk>,
-        audio_output: mpsc::Sender<AudioChunk>,
+        mut audio_input: mpsc::UnboundedReceiver<AudioChunk>,
+        audio_output: mpsc::UnboundedSender<AudioChunk>,
         mut command_rx: mpsc::Receiver<PipelineCommand>,
-        metrics_tx: mpsc::Sender<PipelineMetrics>,
+        _metrics_tx: mpsc::Sender<PipelineMetrics>,
     ) {
-        let stt = Arc::new(self.stt);
-        let translator = Arc::new(self.translator);
-        let tts = Arc::new(self.tts);
-        let vad = self.vad;
+        let stt = self.stt;
+        let translator = self.translator;
+        let tts = self.tts;
+        let source_language = self.source_language;
+        let flush_interval = self.flush_interval_seconds;
+        let flush_sample_count = (WHISPER_SAMPLE_RATE as f32 * flush_interval) as usize;
 
-        let mut is_running = true;
+        let mut is_running = false;
         let mut accumulated_samples: Vec<f32> = Vec::new();
-        let mut is_speaking = false;
+        let mut sentence_buffer = String::new();
+
+        // STT results arrive here (from parallel spawn_blocking tasks)
+        let (stt_tx, mut stt_rx) = mpsc::unbounded_channel::<SttResult>();
+
+        // Sentences go to the sequential translate+TTS worker (guarantees order)
+        let (sentence_tx, sentence_rx) = mpsc::unbounded_channel::<String>();
+        start_translate_worker(sentence_rx, translator.clone(), tts.clone(), audio_output.clone());
 
         loop {
             tokio::select! {
                 Some(command) = command_rx.recv() => {
                     match command {
                         PipelineCommand::Start => {
-                            tracing::info!("Pipeline started");
+                            tracing::info!("Pipeline started (source={}, flush={:.1}s)",
+                                source_language.display_name(), flush_interval);
                             is_running = true;
                         }
                         PipelineCommand::Stop => {
                             tracing::info!("Pipeline stopped");
                             is_running = false;
                             accumulated_samples.clear();
-                            is_speaking = false;
+                            sentence_buffer.clear();
                         }
                     }
                 }
+
+                // ── Receive audio, accumulate, dispatch to STT ────────────
                 Some(chunk) = audio_input.recv() => {
-                    if !is_running {
+                    if !is_running { continue; }
+
+                    accumulated_samples.extend_from_slice(&chunk.samples);
+
+                    if accumulated_samples.len() >= flush_sample_count {
+                        let samples = std::mem::take(&mut accumulated_samples);
+                        let stt_clone = stt.clone();
+                        let tx = stt_tx.clone();
+                        let expected_lang = source_language;
+
+                        tokio::task::spawn_blocking(move || {
+                            let start = Instant::now();
+                            let chunk = AudioChunk::new(samples, WHISPER_SAMPLE_RATE, 1);
+                            match stt_clone.transcribe(&chunk) {
+                                Ok(seg) if !seg.is_empty() => {
+                                    let _ = tx.send(SttResult {
+                                        text: seg.text,
+                                        detected_language: seg.language,
+                                        expected_language: expected_lang,
+                                        stt_duration: start.elapsed(),
+                                    });
+                                }
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!("STT failed: {}", e),
+                            }
+                        });
+                    }
+                }
+
+                // ── Receive STT text, detect sentences ────────────────────
+                Some(result) = stt_rx.recv() => {
+                    tracing::info!("STT ({:?}, {}ms): \"{}\"",
+                        result.detected_language,
+                        result.stt_duration.as_millis(),
+                        result.text);
+
+                    if result.detected_language != result.expected_language {
+                        tracing::info!("Language guard: dropping (detected={:?}, expected={:?})",
+                            result.detected_language, result.expected_language);
                         continue;
                     }
 
-                    let has_speech = vad.contains_speech(&chunk.samples);
-                    let accumulated_seconds = accumulated_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32;
+                    if !sentence_buffer.is_empty() { sentence_buffer.push(' '); }
+                    sentence_buffer.push_str(&result.text);
 
-                    if has_speech {
-                        accumulated_samples.extend_from_slice(&chunk.samples);
-                        let accumulated_seconds = accumulated_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32;
-
-                        if !is_speaking {
-                            is_speaking = true;
-                            tracing::info!("Speech started");
-                        }
-
-                        // Streaming flush: send chunks every N seconds while speaking
-                        if accumulated_seconds >= STREAMING_FLUSH_SECONDS {
-                            tracing::info!(
-                                "Streaming flush: {:.1}s of audio",
-                                accumulated_seconds
-                            );
-                            let samples_to_process = std::mem::take(&mut accumulated_samples);
-                            spawn_pipeline_task(
-                                samples_to_process,
-                                stt.clone(),
-                                translator.clone(),
-                                tts.clone(),
-                                audio_output.clone(),
-                                metrics_tx.clone(),
-                            );
-                        }
-                    } else if is_speaking {
-                        // Speech paused — flush immediately
-                        is_speaking = false;
-
-                        if accumulated_seconds >= MIN_FLUSH_SECONDS {
-                            tracing::info!(
-                                "Speech paused — flushing {:.1}s of audio",
-                                accumulated_seconds
-                            );
-                            let samples_to_process = std::mem::take(&mut accumulated_samples);
-                            spawn_pipeline_task(
-                                samples_to_process,
-                                stt.clone(),
-                                translator.clone(),
-                                tts.clone(),
-                                audio_output.clone(),
-                                metrics_tx.clone(),
-                            );
+                    // Extract complete sentences and send to the ordered worker
+                    if let Some((sentences, remainder)) = extract_complete_sentences(&sentence_buffer) {
+                        sentence_buffer = remainder;
+                        tracing::info!("→ Sentence: \"{}\"", sentences);
+                        let _ = sentence_tx.send(sentences);
+                    } else {
+                        let word_count = sentence_buffer.split_whitespace().count();
+                        if word_count >= MAX_WORDS_BEFORE_FORCE_FLUSH {
+                            let text = std::mem::take(&mut sentence_buffer);
+                            tracing::info!("→ Force flush ({} words): \"{}\"", word_count, &text[..text.len().min(80)]);
+                            let _ = sentence_tx.send(text);
                         }
                     }
                 }
+
                 else => break,
             }
         }
@@ -135,102 +159,118 @@ impl SpeakerPipeline {
     }
 }
 
-fn spawn_pipeline_task(
-    samples: Vec<f32>,
-    stt: Arc<WhisperStt>,
+// ─── Sequential translate + TTS worker ───────────────────────────────────────
+
+/// Spawns a single worker task that processes sentences **one at a time, in order**.
+/// This guarantees that playback order matches the original speech order.
+fn start_translate_worker(
+    mut sentence_rx: mpsc::UnboundedReceiver<String>,
     translator: Arc<OpusMtTranslator>,
     tts: Arc<PiperTts>,
-    output_tx: mpsc::Sender<AudioChunk>,
-    metrics_tx: mpsc::Sender<PipelineMetrics>,
+    audio_tx: mpsc::UnboundedSender<AudioChunk>,
 ) {
     tokio::spawn(async move {
-        let pipeline_start = Instant::now();
-        let chunk = AudioChunk::new(samples, WHISPER_SAMPLE_RATE, 1);
+        while let Some(text) = sentence_rx.recv().await {
+            let translator = translator.clone();
+            let tts = tts.clone();
 
-        // STT
-        let stt_start = Instant::now();
-        let text_segment = match stt.transcribe(&chunk) {
-            Ok(segment) => segment,
-            Err(e) => {
-                tracing::warn!("STT failed: {}", e);
-                return;
-            }
-        };
-        let stt_duration = stt_start.elapsed();
-        let _ = metrics_tx
-            .send(PipelineMetrics::new("stt".to_string(), stt_duration))
-            .await;
+            // Run blocking translate+TTS on a dedicated thread, then send audio.
+            // We AWAIT the result before processing the next sentence — this is
+            // what guarantees the order.
+            let result = tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
 
-        if text_segment.is_empty() {
-            return;
-        }
+                let segment = TextSegment::new(text, Language::English);
 
-        tracing::info!("STT: \"{}\"", text_segment.text);
+                let translated = match translator.translate(&segment) {
+                    Ok(t) => t,
+                    Err(e) => { tracing::warn!("Translation failed: {}", e); return None; }
+                };
+                let translate_ms = start.elapsed().as_millis();
 
-        // Translation
-        let translate_start = Instant::now();
-        let translated = match translator.translate(&text_segment) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("Translation failed: {}", e);
-                return;
-            }
-        };
-        let translate_duration = translate_start.elapsed();
-        let _ = metrics_tx
-            .send(PipelineMetrics::new(
-                "translation".to_string(),
-                translate_duration,
-            ))
-            .await;
+                tracing::info!("Translated: \"{}\"", translated.text);
 
-        tracing::info!("Translated: \"{}\"", translated.text);
+                let tts_start = Instant::now();
+                let audio_out = match tts.synthesize(&translated) {
+                    Ok(a) => a,
+                    Err(e) => { tracing::warn!("TTS failed: {}", e); return None; }
+                };
+                let tts_ms = tts_start.elapsed().as_millis();
 
-        // TTS
-        let tts_start = Instant::now();
-        let audio_out = match tts.synthesize(&translated) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!("TTS failed: {}", e);
-                return;
-            }
-        };
-
-        // Resample TTS output to match playback device sample rate
-        let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
-            match resampler::resample_to_target(
-                &audio_out.samples,
-                audio_out.sample_rate,
-                PLAYBACK_SAMPLE_RATE,
-            ) {
-                Ok(resampled) => AudioChunk::new(resampled, PLAYBACK_SAMPLE_RATE, 1),
-                Err(e) => {
-                    tracing::warn!("Resample failed: {}, using original", e);
+                let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
+                    resampler::resample_to_target(
+                        &audio_out.samples, audio_out.sample_rate, PLAYBACK_SAMPLE_RATE,
+                    )
+                    .map(|r| AudioChunk::new(r, PLAYBACK_SAMPLE_RATE, 1))
+                    .unwrap_or(audio_out)
+                } else {
                     audio_out
-                }
+                };
+
+                let total_ms = start.elapsed().as_millis();
+                tracing::info!("Translate+TTS: {}ms (T={}ms, TTS={}ms)", total_ms, translate_ms, tts_ms);
+
+                Some(audio_out)
+            })
+            .await;
+
+            if let Ok(Some(audio)) = result {
+                let _ = audio_tx.send(audio);
             }
-        } else {
-            audio_out
-        };
-
-        let tts_duration = tts_start.elapsed();
-        let _ = metrics_tx
-            .send(PipelineMetrics::new("tts".to_string(), tts_duration))
-            .await;
-
-        let total_duration = pipeline_start.elapsed();
-        let _ = metrics_tx
-            .send(PipelineMetrics::new("total".to_string(), total_duration))
-            .await;
-
-        tracing::info!(
-            "Pipeline complete: {}ms (STT={}ms, Translate={}ms, TTS={}ms)",
-            total_duration.as_millis(),
-            stt_duration.as_millis(),
-            translate_duration.as_millis(),
-            tts_duration.as_millis()
-        );
-
-        let _ = output_tx.send(audio_out).await;
+        }
     });
+}
+
+// ─── Internal types ──────────────────────────────────────────────────────────
+
+struct SttResult {
+    text: String,
+    detected_language: Language,
+    expected_language: Language,
+    stt_duration: std::time::Duration,
+}
+
+// ─── Sentence detection ──────────────────────────────────────────────────────
+
+fn extract_complete_sentences(text: &str) -> Option<(String, String)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() { return None; }
+
+    let mut last_boundary = None;
+    for (i, c) in trimmed.char_indices() {
+        if c == '.' || c == '!' || c == '?' {
+            last_boundary = Some(i);
+        }
+    }
+
+    let pos = last_boundary?;
+    let end = pos + 1;
+    let sentences = trimmed[..end].trim().to_string();
+    let remainder = trimmed[end..].trim().to_string();
+
+    if sentences.is_empty() { None } else { Some((sentences, remainder)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_sentences_finds_period() {
+        let (s, r) = extract_complete_sentences("Hello world. How are").unwrap();
+        assert_eq!(s, "Hello world.");
+        assert_eq!(r, "How are");
+    }
+
+    #[test]
+    fn extract_sentences_multiple() {
+        let (s, r) = extract_complete_sentences("First. Second! Third").unwrap();
+        assert_eq!(s, "First. Second!");
+        assert_eq!(r, "Third");
+    }
+
+    #[test]
+    fn extract_sentences_no_boundary() {
+        assert!(extract_complete_sentences("Hello world").is_none());
+    }
 }
