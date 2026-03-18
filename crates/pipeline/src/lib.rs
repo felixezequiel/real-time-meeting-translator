@@ -12,6 +12,12 @@ use std::time::Instant;
 const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
+/// Minimum RMS energy to send audio to STT. Below this, the chunk is
+/// silence or very quiet noise — sending it to Whisper would only produce
+/// hallucinations. This is NOT a VAD — it's just a "is there any signal?"
+/// check. Cost: one pass over the samples (~0ms).
+const MIN_RMS_FOR_STT: f32 = 0.005;
+
 /// Force-flush the sentence buffer after this many words without punctuation.
 const MAX_WORDS_BEFORE_FORCE_FLUSH: usize = 15;
 
@@ -100,6 +106,26 @@ impl SpeakerPipeline {
 
                     if accumulated_samples.len() >= flush_sample_count {
                         let samples = std::mem::take(&mut accumulated_samples);
+
+                        // Quick energy check — skip STT if audio is silence/noise.
+                        // Much cheaper than running Whisper on empty audio.
+                        let rms = (samples.iter().map(|s| s * s).sum::<f32>()
+                            / samples.len().max(1) as f32)
+                            .sqrt();
+                        if rms < MIN_RMS_FOR_STT {
+                            // Still need to send empty result to keep sequence flowing
+                            let seq = next_seq;
+                            next_seq += 1;
+                            let _ = stt_tx.send(SttResult {
+                                seq,
+                                text: String::new(),
+                                detected_language: source_language,
+                                expected_language: source_language,
+                                stt_duration: std::time::Duration::ZERO,
+                            });
+                            continue;
+                        }
+
                         let stt_clone = stt.clone();
                         let tx = stt_tx.clone();
                         let expected_lang = source_language;

@@ -59,7 +59,7 @@ impl WhisperStt {
 
         // Anti-hallucination settings
         params.set_temperature(0.0);
-        params.set_no_speech_thold(0.6);
+        params.set_no_speech_thold(0.5);
         // Limit output length — prevents infinite repetition loops.
         // 2 seconds of audio ≈ 30-50 tokens max for normal speech.
         params.set_n_max_text_ctx(128);
@@ -84,7 +84,7 @@ impl WhisperStt {
         for i in 0..num_segments {
             if let Some(segment) = state.get_segment(i) {
                 // Skip segments where Whisper thinks there's no speech
-                if segment.no_speech_probability() > 0.7 {
+                if segment.no_speech_probability() > 0.5 {
                     continue;
                 }
                 if let Ok(text) = segment.to_str_lossy() {
