@@ -18,21 +18,25 @@ const WHISPER_SAMPLE_RATE: u32 = 16_000;
 /// check. Cost: one pass over the samples (~0ms).
 const MIN_RMS_FOR_STT: f32 = 0.005;
 
-/// Force-flush the sentence buffer after this many words without punctuation.
-const MAX_WORDS_BEFORE_FORCE_FLUSH: usize = 15;
+/// Maximum concurrent translate+TTS tasks in flight. Limits GPU/CPU pressure
+/// while still allowing pipeline overlap between chunks.
+const MAX_CONCURRENT_TRANSLATE: usize = 3;
 
 /// Pipeline modelled after a human simultaneous interpreter.
 ///
-/// Architecture (3 stages, pipelined):
+/// Architecture (3 stages, fully pipelined):
 ///
 /// ```text
-/// [Audio capture] ──→ [STT workers]  ──→ [Sentence buffer] ──→ [Translate+TTS worker] ──→ [Playback]
-///   (parallel)         (parallel)          (ordered)              (sequential, ordered)
+/// [Audio capture] ──→ [STT workers] ──→ [Concurrent Translate+TTS] ──→ [Ordered Playback]
+///   (parallel)         (parallel)         (up to 3 in flight)           (reorder buffer)
 /// ```
 ///
 /// - **STT** runs in parallel (spawn_blocking) — doesn't block audio capture.
-/// - **Sentence buffer** accumulates text until a complete thought is detected.
-/// - **Translate+TTS** runs in a SINGLE sequential worker — guarantees playback order.
+/// - **Translate+TTS** runs concurrently (up to 3 tasks) — while chunk N is
+///   being synthesized, chunk N+1 is already translating. A reorder buffer
+///   guarantees playback matches original speech order.
+/// - **No sentence buffer** — each STT chunk is forwarded immediately to
+///   translation. This eliminates 2-4s of accumulation delay.
 pub struct SpeakerPipeline {
     pub stt: Arc<WhisperStt>,
     pub translator: Arc<OpusMtTranslator>,
@@ -68,17 +72,17 @@ impl SpeakerPipeline {
 
         let mut is_running = false;
         let mut accumulated_samples: Vec<f32> = Vec::new();
-        let mut sentence_buffer = String::new();
         let mut next_seq: u64 = 0;          // next sequence number to assign
         let mut expected_seq: u64 = 0;       // next sequence number we expect to receive
         let mut pending: std::collections::BTreeMap<u64, SttResult> = std::collections::BTreeMap::new();
+        let mut translate_seq: u64 = 0;      // sequence number for translate worker
 
         // STT results arrive here (from parallel spawn_blocking tasks)
         let (stt_tx, mut stt_rx) = mpsc::unbounded_channel::<SttResult>();
 
-        // Sentences go to the sequential translate+TTS worker (guarantees order)
-        let (sentence_tx, sentence_rx) = mpsc::unbounded_channel::<String>();
-        start_translate_worker(sentence_rx, translator.clone(), tts.clone(), audio_output.clone());
+        // Text chunks go to the concurrent translate+TTS worker (with ordered delivery)
+        let (text_tx, text_rx) = mpsc::unbounded_channel::<(u64, String)>();
+        start_translate_worker(text_rx, translator.clone(), tts.clone(), audio_output.clone());
 
         loop {
             tokio::select! {
@@ -93,7 +97,6 @@ impl SpeakerPipeline {
                             tracing::info!("Pipeline stopped");
                             is_running = false;
                             accumulated_samples.clear();
-                            sentence_buffer.clear();
                         }
                     }
                 }
@@ -108,12 +111,10 @@ impl SpeakerPipeline {
                         let samples = std::mem::take(&mut accumulated_samples);
 
                         // Quick energy check — skip STT if audio is silence/noise.
-                        // Much cheaper than running Whisper on empty audio.
                         let rms = (samples.iter().map(|s| s * s).sum::<f32>()
                             / samples.len().max(1) as f32)
                             .sqrt();
                         if rms < MIN_RMS_FOR_STT {
-                            // Still need to send empty result to keep sequence flowing
                             let seq = next_seq;
                             next_seq += 1;
                             let _ = stt_tx.send(SttResult {
@@ -137,8 +138,6 @@ impl SpeakerPipeline {
                             let chunk = AudioChunk::new(samples, WHISPER_SAMPLE_RATE, 1);
                             match stt_clone.transcribe(&chunk) {
                                 Ok(seg) => {
-                                    // Always send a result (even empty) so the reorder
-                                    // buffer doesn't stall waiting for a missing sequence.
                                     let _ = tx.send(SttResult {
                                         seq,
                                         text: if seg.is_empty() { String::new() } else { seg.text },
@@ -149,7 +148,6 @@ impl SpeakerPipeline {
                                 }
                                 Err(e) => {
                                     tracing::warn!("STT failed: {}", e);
-                                    // Send empty result to keep sequence flowing
                                     let _ = tx.send(SttResult {
                                         seq,
                                         text: String::new(),
@@ -163,15 +161,13 @@ impl SpeakerPipeline {
                     }
                 }
 
-                // ── Receive STT text, reorder, detect sentences ───────────
+                // ── Receive STT text, reorder, forward immediately ────────
                 Some(result) = stt_rx.recv() => {
-                    // Insert into reorder buffer keyed by sequence number
                     pending.insert(result.seq, result);
 
-                    // Drain all consecutive results starting from expected_seq.
-                    // This guarantees sentence_buffer receives text in the same
-                    // order the audio was captured, even if STT tasks finish
-                    // out of order.
+                    // Drain consecutive results in order and forward each
+                    // non-empty chunk directly to translation — no sentence
+                    // accumulation, no waiting for punctuation.
                     while let Some(r) = pending.remove(&expected_seq) {
                         expected_seq += 1;
 
@@ -186,22 +182,9 @@ impl SpeakerPipeline {
                             continue;
                         }
 
-                        if !sentence_buffer.is_empty() { sentence_buffer.push(' '); }
-                        sentence_buffer.push_str(&r.text);
-                    }
-
-                    // Check for complete sentences
-                    if let Some((sentences, remainder)) = extract_complete_sentences(&sentence_buffer) {
-                        sentence_buffer = remainder;
-                        tracing::info!("→ \"{}\"", sentences);
-                        let _ = sentence_tx.send(sentences);
-                    } else {
-                        let word_count = sentence_buffer.split_whitespace().count();
-                        if word_count >= MAX_WORDS_BEFORE_FORCE_FLUSH {
-                            let text = std::mem::take(&mut sentence_buffer);
-                            tracing::info!("→ flush: \"{}\"", &text[..text.len().min(80)]);
-                            let _ = sentence_tx.send(text);
-                        }
+                        let seq = translate_seq;
+                        translate_seq += 1;
+                        let _ = text_tx.send((seq, r.text));
                     }
                 }
 
@@ -213,58 +196,91 @@ impl SpeakerPipeline {
     }
 }
 
-// ─── Sequential translate + TTS worker ───────────────────────────────────────
+// ─── Concurrent translate + TTS worker with ordered delivery ─────────────────
 
-/// Spawns a single worker task that processes sentences **one at a time, in order**.
-/// This guarantees that playback order matches the original speech order.
+/// Spawns a worker that processes text chunks **concurrently** (up to
+/// `MAX_CONCURRENT_TRANSLATE` in flight) but delivers audio to playback
+/// **in sequence order** via a reorder buffer.
+///
+/// This means while chunk N is being synthesized by TTS, chunk N+1 can
+/// already be translating — eliminating the sequential bottleneck.
 fn start_translate_worker(
-    mut sentence_rx: mpsc::UnboundedReceiver<String>,
+    mut text_rx: mpsc::UnboundedReceiver<(u64, String)>,
     translator: Arc<OpusMtTranslator>,
     tts: Arc<PiperTts>,
     audio_tx: mpsc::UnboundedSender<AudioChunk>,
 ) {
     tokio::spawn(async move {
-        while let Some(text) = sentence_rx.recv().await {
-            let translator = translator.clone();
-            let tts = tts.clone();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSLATE));
+        let (result_tx, mut result_rx) =
+            mpsc::unbounded_channel::<(u64, Option<AudioChunk>)>();
 
-            // Run blocking translate+TTS on a dedicated thread, then send audio.
-            // We AWAIT the result before processing the next sentence — this is
-            // what guarantees the order.
-            let result = tokio::task::spawn_blocking(move || {
-                let start = Instant::now();
+        let mut expected_seq: u64 = 0;
+        let mut pending: std::collections::BTreeMap<u64, Option<AudioChunk>> =
+            std::collections::BTreeMap::new();
 
-                let segment = TextSegment::new(text, Language::English);
+        loop {
+            tokio::select! {
+                // ── Accept new text and spawn translate+TTS task ──────────
+                Some((seq, text)) = text_rx.recv() => {
+                    let translator = translator.clone();
+                    let tts = tts.clone();
+                    let tx = result_tx.clone();
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
 
-                let translated = match translator.translate(&segment) {
-                    Ok(t) => t,
-                    Err(e) => { tracing::warn!("Translation failed: {}", e); return None; }
-                };
-                let translate_ms = start.elapsed().as_millis();
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit; // released on drop
+                        let start = Instant::now();
 
-                tracing::info!("← \"{}\" ({}ms)", translated.text, translate_ms);
+                        let segment = TextSegment::new(text, Language::English);
 
-                let audio_out = match tts.synthesize(&translated) {
-                    Ok(a) => a,
-                    Err(e) => { tracing::warn!("TTS failed: {}", e); return None; }
-                };
+                        let translated = match translator.translate(&segment) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::warn!("Translation failed: {}", e);
+                                let _ = tx.send((seq, None));
+                                return;
+                            }
+                        };
+                        let translate_ms = start.elapsed().as_millis();
+                        tracing::info!("← \"{}\" ({}ms)", translated.text, translate_ms);
 
-                let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
-                    resampler::resample_to_target(
-                        &audio_out.samples, audio_out.sample_rate, PLAYBACK_SAMPLE_RATE,
-                    )
-                    .map(|r| AudioChunk::new(r, PLAYBACK_SAMPLE_RATE, 1))
-                    .unwrap_or(audio_out)
-                } else {
-                    audio_out
-                };
+                        let audio_out = match tts.synthesize(&translated) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!("TTS failed: {}", e);
+                                let _ = tx.send((seq, None));
+                                return;
+                            }
+                        };
 
-                Some(audio_out)
-            })
-            .await;
+                        let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
+                            resampler::resample_to_target(
+                                &audio_out.samples, audio_out.sample_rate, PLAYBACK_SAMPLE_RATE,
+                            )
+                            .map(|r| AudioChunk::new(r, PLAYBACK_SAMPLE_RATE, 1))
+                            .unwrap_or(audio_out)
+                        } else {
+                            audio_out
+                        };
 
-            if let Ok(Some(audio)) = result {
-                let _ = audio_tx.send(audio);
+                        let _ = tx.send((seq, Some(audio_out)));
+                    });
+                }
+
+                // ── Collect results and deliver in order ─────────────────
+                Some((seq, audio)) = result_rx.recv() => {
+                    pending.insert(seq, audio);
+
+                    while let Some(audio) = pending.remove(&expected_seq) {
+                        expected_seq += 1;
+                        if let Some(chunk) = audio {
+                            let _ = audio_tx.send(chunk);
+                        }
+                    }
+                }
+
+                else => break,
             }
         }
     });
@@ -280,47 +296,17 @@ struct SttResult {
     stt_duration: std::time::Duration,
 }
 
-// ─── Sentence detection ──────────────────────────────────────────────────────
-
-fn extract_complete_sentences(text: &str) -> Option<(String, String)> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() { return None; }
-
-    let mut last_boundary = None;
-    for (i, c) in trimmed.char_indices() {
-        if c == '.' || c == '!' || c == '?' {
-            last_boundary = Some(i);
-        }
-    }
-
-    let pos = last_boundary?;
-    let end = pos + 1;
-    let sentences = trimmed[..end].trim().to_string();
-    let remainder = trimmed[end..].trim().to_string();
-
-    if sentences.is_empty() { None } else { Some((sentences, remainder)) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn extract_sentences_finds_period() {
-        let (s, r) = extract_complete_sentences("Hello world. How are").unwrap();
-        assert_eq!(s, "Hello world.");
-        assert_eq!(r, "How are");
+    fn max_concurrent_translate_is_positive() {
+        assert!(MAX_CONCURRENT_TRANSLATE > 0);
     }
 
     #[test]
-    fn extract_sentences_multiple() {
-        let (s, r) = extract_complete_sentences("First. Second! Third").unwrap();
-        assert_eq!(s, "First. Second!");
-        assert_eq!(r, "Third");
-    }
-
-    #[test]
-    fn extract_sentences_no_boundary() {
-        assert!(extract_complete_sentences("Hello world").is_none());
+    fn min_rms_threshold_is_positive() {
+        assert!(MIN_RMS_FOR_STT > 0.0);
     }
 }

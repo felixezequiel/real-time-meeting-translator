@@ -283,9 +283,9 @@ async fn start_pipelines(
         .start(spk_out_rx)
         .map_err(|e| anyhow::anyhow!("Speaker playback failed: {}", e))?;
 
-    // Loopback pipeline: 2s flush — balance between context and latency
+    // Loopback pipeline: 1s flush — fast forwarding to translation
     let speaker_pipeline = SpeakerPipeline::new(
-        spk_stt, spk_trans, spk_tts, spk_source_lang, 2.0,
+        spk_stt, spk_trans, spk_tts, spk_source_lang, 1.0,
     );
     tokio::spawn(async move {
         speaker_pipeline.run(spk_audio_rx, spk_out_tx, spk_cmd_rx, spk_metrics_tx).await;
@@ -325,9 +325,9 @@ async fn start_pipelines(
         .start(mic_out_rx)
         .map_err(|e| anyhow::anyhow!("Mic playback failed: {}", e))?;
 
-    // Mic pipeline: 1.5s flush — conversation needs fast response
+    // Mic pipeline: 1s flush — match speaker pipeline for consistency
     let mic_pipeline = SpeakerPipeline::new(
-        mic_stt, mic_trans, mic_tts, mic_source_lang, 1.5,
+        mic_stt, mic_trans, mic_tts, mic_source_lang, 1.0,
     );
     tokio::spawn(async move {
         mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
