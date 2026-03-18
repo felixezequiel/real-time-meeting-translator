@@ -6,7 +6,8 @@ use tracing;
 use translation::OpusMtTranslator;
 use tts::PiperTts;
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
@@ -16,7 +17,7 @@ const WHISPER_SAMPLE_RATE: u32 = 16_000;
 /// silence or very quiet noise — sending it to Whisper would only produce
 /// hallucinations. This is NOT a VAD — it's just a "is there any signal?"
 /// check. Cost: one pass over the samples (~0ms).
-const MIN_RMS_FOR_STT: f32 = 0.005;
+const MIN_RMS_FOR_STT: f32 = 0.003;
 
 /// Maximum concurrent translate+TTS tasks in flight. Limits GPU/CPU pressure
 /// while still allowing pipeline overlap between chunks.
@@ -24,11 +25,23 @@ const MAX_CONCURRENT_TRANSLATE: usize = 3;
 
 /// Minimum word count before sending accumulated text to translation.
 /// Gives the translator enough context for coherent output.
-const MIN_WORDS_FOR_TRANSLATE: usize = 8;
+const MIN_WORDS_FOR_TRANSLATE: usize = 5;
 
 /// Maximum time (in seconds) to hold accumulated text before force-flushing,
 /// even if we haven't reached MIN_WORDS_FOR_TRANSLATE or punctuation.
-const MAX_HOLD_SECONDS: f32 = 3.0;
+const MAX_HOLD_SECONDS: f32 = 2.0;
+
+/// How long (seconds) to keep recent translations for echo detection.
+/// STT feedback typically appears within 2-4 seconds of TTS playback.
+const ECHO_WINDOW_SECONDS: f32 = 8.0;
+
+/// Word overlap threshold (0.0–1.0) above which STT text is considered
+/// an echo of a recent translation and should be discarded.
+const ECHO_SIMILARITY_THRESHOLD: f32 = 0.4;
+
+/// Shared buffer of recent translation outputs, used to detect when
+/// the loopback captures our own TTS audio (feedback loop).
+type EchoBuffer = Arc<Mutex<VecDeque<(Instant, Vec<String>)>>>;
 
 /// Pipeline modelled after a human simultaneous interpreter.
 ///
@@ -46,6 +59,7 @@ const MAX_HOLD_SECONDS: f32 = 3.0;
 /// - **Smart accumulator** — text is held until punctuation, 8+ words, or
 ///   3s timeout. Balances translation coherence with low latency.
 pub struct SpeakerPipeline {
+    pub name: String,
     pub stt: Arc<WhisperStt>,
     pub translator: Arc<OpusMtTranslator>,
     pub tts: Arc<PiperTts>,
@@ -55,13 +69,14 @@ pub struct SpeakerPipeline {
 
 impl SpeakerPipeline {
     pub fn new(
+        name: impl Into<String>,
         stt: Arc<WhisperStt>,
         translator: Arc<OpusMtTranslator>,
         tts: Arc<PiperTts>,
         source_language: Language,
         flush_interval_seconds: f32,
     ) -> Self {
-        Self { stt, translator, tts, source_language, flush_interval_seconds }
+        Self { name: name.into(), stt, translator, tts, source_language, flush_interval_seconds }
     }
 
     pub async fn run(
@@ -71,6 +86,7 @@ impl SpeakerPipeline {
         mut command_rx: mpsc::Receiver<PipelineCommand>,
         _metrics_tx: mpsc::Sender<PipelineMetrics>,
     ) {
+        let pipeline_name = self.name;
         let stt = self.stt;
         let translator = self.translator;
         let tts = self.tts;
@@ -90,9 +106,12 @@ impl SpeakerPipeline {
         // STT results arrive here (from parallel spawn_blocking tasks)
         let (stt_tx, mut stt_rx) = mpsc::unbounded_channel::<SttResult>();
 
+        // Recent translations for echo detection (shared with translate worker)
+        let echo_buffer: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
+
         // Text chunks go to the concurrent translate+TTS worker (with ordered delivery)
         let (text_tx, text_rx) = mpsc::unbounded_channel::<(u64, String)>();
-        start_translate_worker(text_rx, translator.clone(), tts.clone(), audio_output.clone());
+        start_translate_worker(text_rx, translator.clone(), tts.clone(), audio_output.clone(), echo_buffer.clone());
 
         loop {
             tokio::select! {
@@ -122,7 +141,9 @@ impl SpeakerPipeline {
                     if accumulated_samples.len() >= flush_sample_count {
                         let samples = std::mem::take(&mut accumulated_samples);
 
-                        // Quick energy check — skip STT if audio is silence/noise.
+                        // Energy gate — skip STT if audio is silence/noise.
+                        // Without this, Whisper hallucinates on near-silence
+                        // (e.g. mic picking up headphone bleed → "e" every chunk).
                         let rms = (samples.iter().map(|s| s * s).sum::<f32>()
                             / samples.len().max(1) as f32)
                             .sqrt();
@@ -148,7 +169,7 @@ impl SpeakerPipeline {
                         tokio::task::spawn_blocking(move || {
                             let start = Instant::now();
                             let chunk = AudioChunk::new(samples, WHISPER_SAMPLE_RATE, 1);
-                            match stt_clone.transcribe(&chunk) {
+                            match stt_clone.transcribe(&chunk, expected_lang) {
                                 Ok(seg) => {
                                     let _ = tx.send(SttResult {
                                         seq,
@@ -194,13 +215,23 @@ impl SpeakerPipeline {
                             continue;
                         }
 
-                        tracing::info!("STT [{}]: \"{}\" ({:?}, {}ms)",
-                            r.seq, r.text, r.detected_language, r.stt_duration.as_millis());
+                        tracing::info!("[{}] STT [{}]: \"{}\" ({:?}, {}ms)",
+                            pipeline_name, r.seq, r.text, r.detected_language, r.stt_duration.as_millis());
+
+                        // Echo detection: if this STT text closely matches a recent
+                        // translation output, it's our own TTS being recaptured.
+                        if is_echo(&r.text, &echo_buffer) {
+                            tracing::info!("[{}] Echo detected, dropping: \"{}\"",
+                                pipeline_name, &r.text[..r.text.len().min(60)]);
+                            continue;
+                        }
 
                         if r.detected_language != r.expected_language {
-                            tracing::debug!("Lang guard: drop ({:?}≠{:?})",
-                                r.detected_language, r.expected_language);
-                            continue;
+                            tracing::warn!("Lang mismatch ({:?}≠{:?}), sending anyway: \"{}\"",
+                                r.detected_language, r.expected_language,
+                                &r.text[..r.text.len().min(60)]);
+                            // Don't drop — let the translator handle it.
+                            // Dropping causes gaps in continuous speech.
                         }
 
                         // Append to accumulator
@@ -212,8 +243,8 @@ impl SpeakerPipeline {
 
                         // Decide whether to flush the accumulator:
                         // 1. Punctuation → send immediately (complete thought)
-                        // 2. >= 8 words  → send (enough context for good translation)
-                        // 3. >= 3s held  → force flush (delay cap)
+                        // 2. >= 5 words  → send (enough context for good translation)
+                        // 3. >= 2s held  → force flush (delay cap)
                         let has_punctuation = ends_with_punctuation(&accumulator);
                         let word_count = accumulator.split_whitespace().count();
                         let held_too_long = accumulator_start
@@ -259,6 +290,7 @@ fn start_translate_worker(
     translator: Arc<OpusMtTranslator>,
     tts: Arc<PiperTts>,
     audio_tx: mpsc::UnboundedSender<AudioChunk>,
+    echo_buffer: EchoBuffer,
 ) {
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSLATE));
@@ -278,6 +310,7 @@ fn start_translate_worker(
                     let tx = result_tx.clone();
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
 
+                    let echo_buf = echo_buffer.clone();
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit; // released on drop
                         let start = Instant::now();
@@ -306,6 +339,9 @@ fn start_translate_worker(
                         }
 
                         tracing::info!("← \"{}\" ({}ms)", translated.text, translate_ms);
+
+                        // Record translation for echo detection
+                        record_translation(&echo_buf, &translated.text);
 
                         let audio_out = match tts.synthesize(&translated) {
                             Ok(a) => a,
@@ -391,6 +427,92 @@ fn is_translation_degenerate(input: &str, output: &str) -> bool {
     false
 }
 
+// ─── Echo detection (TTS feedback loop filter) ──────────────────────────────
+
+/// Normalize text for comparison: lowercase, strip accents and punctuation.
+/// Uses ASCII-only chars so "petrolífera" and "petrolifera" match.
+fn normalize_for_echo(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter_map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        Some(c)
+                    } else if c.is_alphanumeric() {
+                        // Map accented chars to ASCII approximations
+                        Some(strip_diacritic(c))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Best-effort ASCII approximation for common Portuguese/Romance diacritics.
+fn strip_diacritic(c: char) -> char {
+    match c {
+        'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' => 'u',
+        'ç' => 'c',
+        'ñ' => 'n',
+        _ => c,
+    }
+}
+
+/// Record a translation output in the echo buffer for later comparison.
+fn record_translation(echo_buffer: &EchoBuffer, translated_text: &str) {
+    let words = normalize_for_echo(translated_text);
+    if words.is_empty() {
+        return;
+    }
+    let mut buf = echo_buffer.lock().unwrap();
+    buf.push_back((Instant::now(), words));
+    // Evict old entries
+    let cutoff = Instant::now() - std::time::Duration::from_secs_f32(ECHO_WINDOW_SECONDS);
+    while buf.front().map_or(false, |(t, _)| *t < cutoff) {
+        buf.pop_front();
+    }
+}
+
+/// Check if STT text matches any recent translation (echo detection).
+fn is_echo(stt_text: &str, echo_buffer: &EchoBuffer) -> bool {
+    let stt_words = normalize_for_echo(stt_text);
+    if stt_words.is_empty() {
+        return false;
+    }
+
+    let buf = echo_buffer.lock().unwrap();
+    let cutoff = Instant::now() - std::time::Duration::from_secs_f32(ECHO_WINDOW_SECONDS);
+
+    for (timestamp, translation_words) in buf.iter() {
+        if *timestamp < cutoff {
+            continue;
+        }
+        let overlap = word_overlap_ratio(&stt_words, translation_words);
+        if overlap >= ECHO_SIMILARITY_THRESHOLD {
+            return true;
+        }
+    }
+    false
+}
+
+/// Fraction of words in `a` that also appear in `b` (order-independent).
+fn word_overlap_ratio(a: &[String], b: &[String]) -> f32 {
+    if a.is_empty() {
+        return 0.0;
+    }
+    let b_set: std::collections::HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    let matches = a.iter().filter(|w| b_set.contains(w.as_str())).count();
+    matches as f32 / a.len() as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,7 +549,7 @@ mod tests {
 
     #[test]
     fn min_words_is_reasonable() {
-        assert!(MIN_WORDS_FOR_TRANSLATE >= 4);
+        assert!(MIN_WORDS_FOR_TRANSLATE >= 3);
         assert!(MIN_WORDS_FOR_TRANSLATE <= 15);
     }
 
@@ -464,5 +586,50 @@ mod tests {
         let input = "This is a relatively long sentence with many words";
         let output = "Esta é uma frase relativamente longa com muitas palavras";
         assert!(!is_translation_degenerate(input, output));
+    }
+
+    // ── Echo detection tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn echo_detected_when_stt_matches_recent_translation() {
+        let buf: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
+        record_translation(&buf, "plataforma petrolífera");
+        // STT captures garbled version of our TTS
+        assert!(is_echo("platforma petrolifera", &buf));
+    }
+
+    #[test]
+    fn echo_detected_with_partial_match() {
+        let buf: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
+        record_translation(&buf, "6 de Julho de 1990 1988");
+        // STT captures a subset
+        assert!(is_echo("6 de Julho de 1990 1988", &buf));
+    }
+
+    #[test]
+    fn no_echo_for_unrelated_text() {
+        let buf: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
+        record_translation(&buf, "plataforma petrolífera");
+        assert!(!is_echo("The Piper Alpha oil rig", &buf));
+    }
+
+    #[test]
+    fn no_echo_when_buffer_empty() {
+        let buf: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
+        assert!(!is_echo("anything here", &buf));
+    }
+
+    #[test]
+    fn word_overlap_exact_match() {
+        let a = normalize_for_echo("plataforma petrolifera");
+        let b = normalize_for_echo("plataforma petrolífera");
+        assert!(word_overlap_ratio(&a, &b) >= 0.5);
+    }
+
+    #[test]
+    fn word_overlap_no_match() {
+        let a = normalize_for_echo("hello world");
+        let b = normalize_for_echo("plataforma petrolifera");
+        assert_eq!(word_overlap_ratio(&a, &b), 0.0);
     }
 }

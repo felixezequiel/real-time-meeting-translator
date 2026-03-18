@@ -26,19 +26,19 @@ pub struct WhisperStt {
     /// The state holds GPU memory and is reused across calls.
     /// The WhisperContext is kept alive inside the state via Arc.
     state: Option<Mutex<WhisperState>>,
-    language: Language,
 }
 
 impl WhisperStt {
-    pub fn new(_bridge_script_path: PathBuf, model_path: PathBuf, language: Language) -> Self {
+    pub fn new(_bridge_script_path: PathBuf, model_path: PathBuf, _language: Language) -> Self {
         Self {
             model_path,
             state: None,
-            language,
         }
     }
 
-    pub fn transcribe(&self, chunk: &AudioChunk) -> Result<TextSegment, SttError> {
+    /// Transcribe audio in the given language. The language is passed per-call
+    /// so it can change at runtime when the user switches languages in the UI.
+    pub fn transcribe(&self, chunk: &AudioChunk, language: Language) -> Result<TextSegment, SttError> {
         let state_mutex = self.state.as_ref().ok_or(SttError::NotInitialized)?;
         let mut state = state_mutex
             .lock()
@@ -46,8 +46,9 @@ impl WhisperStt {
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-        // Auto-detect language for feedback-loop guard
-        params.set_language(None);
+        // Force expected language — prevents Whisper from hallucinating in
+        // the wrong language (e.g. generating Portuguese on English audio).
+        params.set_language(Some(language.whisper_code()));
         params.set_translate(false);
         params.set_no_timestamps(true);
         params.set_single_segment(false);
@@ -75,7 +76,7 @@ impl WhisperStt {
         let mut text_parts = Vec::new();
         for i in 0..num_segments {
             if let Some(segment) = state.get_segment(i) {
-                if segment.no_speech_probability() > 0.5 {
+                if segment.no_speech_probability() > 0.7 {
                     continue;
                 }
                 if let Ok(text) = segment.to_str_lossy() {
@@ -97,23 +98,15 @@ impl WhisperStt {
             Some("pt") => Language::Portuguese,
             Some("en") => Language::English,
             Some(other) => {
-                // Fallback: try text heuristic, but only if it has a strong opinion.
-                // If heuristic can't decide, reject the segment entirely.
-                let heuristic = detect_language_from_text_heuristic(&full_text, self.language);
-                let heuristic_is_confident = {
-                    let lower = full_text.to_lowercase();
-                    let words: Vec<&str> = lower.split_whitespace().collect();
-                    words.len() >= 3 && heuristic != self.language
-                };
-                if heuristic_is_confident {
-                    heuristic
-                } else {
-                    tracing::debug!("Whisper detected '{}' — rejecting segment: \"{}\"",
-                        other, &full_text[..full_text.len().min(60)]);
-                    return Ok(TextSegment::new(String::new(), self.language));
-                }
+                // Whisper detected a language other than en/pt.
+                // Use text heuristic as fallback — if it recognizes en/pt, trust it.
+                // Otherwise assume expected language instead of dropping the segment.
+                let heuristic = detect_language_from_text_heuristic(&full_text, language);
+                tracing::debug!("Whisper detected '{}', heuristic={:?} — text: \"{}\"",
+                    other, heuristic, &full_text[..full_text.len().min(60)]);
+                heuristic
             }
-            None => detect_language_from_text_heuristic(&full_text, self.language),
+            None => detect_language_from_text_heuristic(&full_text, language),
         };
 
         if is_repetitive(&full_text) {

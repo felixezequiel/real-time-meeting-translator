@@ -1,3 +1,4 @@
+pub mod audio_switch;
 pub mod capture;
 pub mod denoise;
 pub mod device;

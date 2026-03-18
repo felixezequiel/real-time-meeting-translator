@@ -1,20 +1,20 @@
 use anyhow::Result;
 use shared::{Language, PipelineCommand, PipelineConfig, PipelineStage, TranslationDirection};
-// std::sync::atomic no longer needed — TTS gate removed in favour of
-// language-detection guard only (no audio is ever dropped now).
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use audio::audio_switch;
 use audio::capture::AudioCapture;
 use audio::device;
 use audio::loopback::LoopbackCapture;
 use audio::playback::AudioPlayback;
-// VAD removed from the pipeline — Whisper's internal Silero VAD handles silence
 use pipeline::SpeakerPipeline;
 use stt::WhisperStt;
 use translation::OpusMtTranslator;
 use tts::PiperTts;
 use ui::{TrayAction, TrayUi};
+
+const VIRTUAL_CABLE_NAME: &str = "CABLE Input";
 
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -68,6 +68,10 @@ struct ActivePipelines {
     _speaker_capture: cpal::Stream,
     /// Keeps the speaker TTS playback alive
     _speaker_playback: cpal::Stream,
+    /// Passthrough: forwards raw loopback audio to headphones so the user
+    /// can hear the original meeting audio (needed because system default
+    /// is redirected to VB-Cable while active).
+    _speaker_passthrough: Option<cpal::Stream>,
     /// Keeps the mic capture alive
     _mic_capture: cpal::Stream,
     /// Keeps the mic TTS playback alive
@@ -102,6 +106,8 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
     let mut tray = TrayUi::new()
         .map_err(|e| anyhow::anyhow!("Tray UI failed: {}", e))?;
 
+    let audio_switch_script = scripts_dir.join("audio_switch.ps1");
+
     // ── Start both pipelines ───────────────────────────────────────────────────
     let mut pipelines = start_pipelines(&config, &models).await?;
     // Pipelines start paused; user presses Start via tray to activate
@@ -109,14 +115,49 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
 
     // ── Main event loop ────────────────────────────────────────────────────────
     let mut is_active = false;
+    // Saved default device name — restored when the user presses Stop or quits.
+    let mut saved_default_device: Option<String> = None;
 
     loop {
         if let Some(action) = tray.process_events() {
             match action {
                 TrayAction::Command(cmd) => {
-                    is_active = matches!(cmd, PipelineCommand::Start);
-                    tray.set_active(is_active);
-                    pipelines.send_command(cmd).await;
+                    match cmd {
+                        PipelineCommand::Start => {
+                            // Switch system default to VB-Cable so meetings output there.
+                            // Loopback captures from CABLE (meeting audio only),
+                            // TTS plays to user's headphones (no feedback loop).
+                            match audio_switch::set_default_output_device(
+                                &audio_switch_script, VIRTUAL_CABLE_NAME,
+                            ) {
+                                Ok(previous) => {
+                                    tracing::info!(
+                                        "Switched default output: \"{}\" → \"{}\"",
+                                        previous, VIRTUAL_CABLE_NAME,
+                                    );
+                                    saved_default_device = Some(previous);
+                                    // Loopback now captures from CABLE (only meeting audio)
+                                    config.loopback_device = Some(VIRTUAL_CABLE_NAME.to_string());
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Could not switch audio device: {}. \
+                                        Falling back to shared device (may cause echo).", e);
+                                }
+                            }
+                            // Recreate pipelines with the new device routing
+                            pipelines = restart_pipelines(pipelines, &config, &models, false).await?;
+                            is_active = true;
+                            tray.set_active(true);
+                            pipelines.send_command(PipelineCommand::Start).await;
+                        }
+                        PipelineCommand::Stop => {
+                            is_active = false;
+                            tray.set_active(false);
+                            pipelines.send_command(PipelineCommand::Stop).await;
+                            // Restore original default output device
+                            restore_default_device(&audio_switch_script, &mut saved_default_device);
+                        }
+                    }
                 }
 
                 TrayAction::OpenSettings => {
@@ -148,8 +189,8 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                 }
 
                 TrayAction::SetHeadphonesDevice(name) => {
-                    // Loopback always captures from the same device the user hears through.
-                    config.loopback_device = Some(name.clone());
+                    // Headphones = where user hears TTS + passthrough audio.
+                    // Loopback device is managed automatically (CABLE when active).
                     config.headphones_device = Some(name);
                     save_config(&config);
                     pipelines = restart_pipelines(pipelines, &config, &models, is_active).await?;
@@ -163,6 +204,8 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
 
                 TrayAction::Quit => {
                     tracing::info!("Shutting down…");
+                    // Restore original default before exiting
+                    restore_default_device(&audio_switch_script, &mut saved_default_device);
                     break;
                 }
             }
@@ -201,12 +244,12 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
     let whisper_model: std::path::PathBuf = config.whisper_model.clone().into();
 
     // ── STT: two concurrent processes (both auto-detect language) ────────────
-    tracing::info!("Initializing STT process A…");
-    let mut stt_a = WhisperStt::new(stt_script.clone(), whisper_model.clone(), Language::English);
+    tracing::info!("Initializing STT process A (speaker: {})…", config.speaker_source_language.display_name());
+    let mut stt_a = WhisperStt::new(stt_script.clone(), whisper_model.clone(), config.speaker_source_language);
     stt_a.initialize().await?;
 
-    tracing::info!("Initializing STT process B…");
-    let mut stt_b = WhisperStt::new(stt_script, whisper_model, Language::English);
+    tracing::info!("Initializing STT process B (mic: {})…", config.mic_source_language.display_name());
+    let mut stt_b = WhisperStt::new(stt_script, whisper_model, config.mic_source_language);
     stt_b.initialize().await?;
 
     // ── Translators: always load BOTH directions ────────────────────────────
@@ -268,24 +311,66 @@ async fn start_pipelines(
         .unwrap_or_else(|_| "Unknown".to_string());
     tracing::info!("Speaker loopback from: {}", loopback_name);
 
-    let loopback = LoopbackCapture::new(loopback_device, config.chunk_duration_ms);
-    let speaker_capture = loopback
-        .start(spk_audio_tx)
-        .map_err(|e| anyhow::anyhow!("Loopback capture failed: {}", e))?;
-
     let headphones_device = resolve_output_device(config.headphones_device.as_deref(), "headphones")?;
     let headphones_name = cpal::traits::DeviceTrait::name(&headphones_device)
         .unwrap_or_else(|_| "Unknown".to_string());
     tracing::info!("Speaker TTS output to: {}", headphones_name);
+
+    // When loopback is on VB-Cable (different from headphones), create a passthrough
+    // that forwards raw meeting audio to headphones so the user can hear it.
+    let loopback_is_cable = config.loopback_device.as_deref()
+        .map(|d| d.to_lowercase().contains("cable"))
+        .unwrap_or(false);
+
+    let (speaker_capture, passthrough_stream) = if loopback_is_cable {
+        // Broadcast: loopback audio (16kHz mono) → pipeline + passthrough to headphones.
+        // The passthrough needs upsampling to 48kHz for headphone playback.
+        let (broadcast_tx, mut broadcast_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
+        let (passthrough_tx, passthrough_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
+        let pipeline_tx = spk_audio_tx;
+        let passthrough_sample_rate: u32 = 48_000;
+        tokio::spawn(async move {
+            while let Some(chunk) = broadcast_rx.recv().await {
+                // Upsample 16kHz → 48kHz for headphone playback
+                if let Ok(upsampled) = audio::resampler::resample_mono(
+                    &chunk.samples, chunk.sample_rate, passthrough_sample_rate,
+                ) {
+                    let _ = passthrough_tx.send(shared::AudioChunk::new(
+                        upsampled, passthrough_sample_rate, 1,
+                    ));
+                }
+                let _ = pipeline_tx.send(chunk);
+            }
+        });
+
+        let passthrough_device = resolve_output_device(config.headphones_device.as_deref(), "passthrough")?;
+        let passthrough_playback = AudioPlayback::new(passthrough_device);
+        let passthrough_stream = passthrough_playback
+            .start(passthrough_rx)
+            .map_err(|e| anyhow::anyhow!("Passthrough playback failed: {}", e))?;
+
+        let loopback = LoopbackCapture::new(loopback_device, config.chunk_duration_ms);
+        let capture = loopback
+            .start(broadcast_tx)
+            .map_err(|e| anyhow::anyhow!("Loopback capture failed: {}", e))?;
+
+        tracing::info!("Passthrough active: meeting audio → headphones");
+        (capture, Some(passthrough_stream))
+    } else {
+        let loopback = LoopbackCapture::new(loopback_device, config.chunk_duration_ms);
+        let capture = loopback
+            .start(spk_audio_tx)
+            .map_err(|e| anyhow::anyhow!("Loopback capture failed: {}", e))?;
+        (capture, None)
+    };
 
     let spk_playback = AudioPlayback::new(headphones_device);
     let speaker_playback = spk_playback
         .start(spk_out_rx)
         .map_err(|e| anyhow::anyhow!("Speaker playback failed: {}", e))?;
 
-    // Loopback pipeline: 1.5s flush — enough context for accurate STT
     let speaker_pipeline = SpeakerPipeline::new(
-        spk_stt, spk_trans, spk_tts, spk_source_lang, 1.5,
+        "Speaker", spk_stt, spk_trans, spk_tts, spk_source_lang, 1.5,
     );
     tokio::spawn(async move {
         speaker_pipeline.run(spk_audio_rx, spk_out_tx, spk_cmd_rx, spk_metrics_tx).await;
@@ -327,7 +412,7 @@ async fn start_pipelines(
 
     // Mic pipeline: 1.5s flush — match speaker pipeline
     let mic_pipeline = SpeakerPipeline::new(
-        mic_stt, mic_trans, mic_tts, mic_source_lang, 1.5,
+        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, 1.5,
     );
     tokio::spawn(async move {
         mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
@@ -343,6 +428,7 @@ async fn start_pipelines(
     Ok(ActivePipelines {
         _speaker_capture: speaker_capture,
         _speaker_playback: speaker_playback,
+        _speaker_passthrough: passthrough_stream,
         _mic_capture: mic_capture,
         _mic_playback: mic_playback,
         speaker_cmd_tx: spk_cmd_tx,
@@ -431,6 +517,18 @@ fn list_input_device_names() -> Vec<String> {
         .into_iter()
         .map(|d| d.name)
         .collect()
+}
+
+// ─── Audio device switching ──────────────────────────────────────────────────
+
+/// Restore the Windows default output device to what the user had before.
+fn restore_default_device(script_path: &std::path::Path, saved: &mut Option<String>) {
+    if let Some(device_name) = saved.take() {
+        match audio_switch::set_default_output_device(script_path, &device_name) {
+            Ok(_) => tracing::info!("Restored default output: \"{}\"", device_name),
+            Err(e) => tracing::warn!("Failed to restore default output: {}", e),
+        }
+    }
 }
 
 // ─── Config I/O ───────────────────────────────────────────────────────────────
