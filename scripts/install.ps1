@@ -5,10 +5,17 @@
 
 .DESCRIPTION
     This script checks and installs:
+    - Visual Studio Build Tools (MSVC C++ compiler)
+    - CMake (for building native dependencies)
+    - LLVM/Clang (for bindgen FFI generation)
+    - CUDA Toolkit (for GPU-accelerated Whisper inference)
     - Rust toolchain (via rustup)
     - Python 3.12+ (via winget)
     - VB-Cable virtual audio driver
     - Python packages (faster-whisper, transformers, piper-tts, etc.)
+    - Whisper GGML model download
+    - Auto-generates .cargo/config.toml with correct MSVC paths
+    - Creates default config.toml if not present
     - Builds the Rust project
     - Optionally launches the application
 
@@ -23,6 +30,7 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $ScriptsDir = Join-Path $ProjectRoot "scripts"
 $ModelsDir = Join-Path $ProjectRoot "models"
+$CargoDir = Join-Path $ProjectRoot ".cargo"
 
 # --- Helpers ---
 
@@ -78,7 +86,8 @@ function Refresh-Path {
         "$env:USERPROFILE\.cargo\bin",
         "$env:LOCALAPPDATA\Microsoft\WinGet\Links",
         "C:\Program Files\CMake\bin",
-        "C:\Program Files\LLVM\bin"
+        "C:\Program Files\LLVM\bin",
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
     )
     foreach ($p in $extraPaths) {
         if ((Test-Path $p) -and ($env:Path -notlike "*$p*")) {
@@ -87,7 +96,200 @@ function Refresh-Path {
     }
 }
 
+# --- Find MSVC paths dynamically ---
+
+function Find-MsvcIncludePath {
+    $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vsWhere)) {
+        # Fallback: search common locations
+        $vsWhere = "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe"
+    }
+
+    $vsPath = $null
+    if (Test-Path $vsWhere) {
+        $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    }
+
+    if (-not $vsPath) {
+        # Search BuildTools locations
+        $buildToolsPaths = @(
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise"
+        )
+        foreach ($p in $buildToolsPaths) {
+            if (Test-Path "$p\VC\Tools\MSVC") {
+                $vsPath = $p
+                break
+            }
+        }
+    }
+
+    if (-not $vsPath) { return $null }
+
+    # Find latest MSVC version
+    $msvcBase = Join-Path $vsPath "VC\Tools\MSVC"
+    if (-not (Test-Path $msvcBase)) { return $null }
+    $latestMsvc = Get-ChildItem $msvcBase -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    if (-not $latestMsvc) { return $null }
+
+    $msvcInclude = Join-Path $latestMsvc.FullName "include"
+    if (-not (Test-Path $msvcInclude)) { return $null }
+
+    return $msvcInclude
+}
+
+function Find-UcrtIncludePath {
+    $kitsBase = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+    if (-not (Test-Path $kitsBase)) { return $null }
+
+    $latestKit = Get-ChildItem $kitsBase -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    if (-not $latestKit) { return $null }
+
+    $ucrtInclude = Join-Path $latestKit.FullName "ucrt"
+    if (-not (Test-Path $ucrtInclude)) { return $null }
+
+    return $ucrtInclude
+}
+
 # --- Installation Steps ---
+
+function Install-VSBuildTools {
+    Write-Step "Visual Studio Build Tools (MSVC C++ Compiler)"
+
+    $msvcInclude = Find-MsvcIncludePath
+    if ($msvcInclude) {
+        Write-Ok "MSVC already installed: $msvcInclude"
+        return
+    }
+
+    Write-Host "  Installing Visual Studio Build Tools via winget..." -ForegroundColor Gray
+    Write-Host "  (This may take 5-10 minutes)" -ForegroundColor Gray
+
+    try {
+        winget install --id Microsoft.VisualStudio.2022.BuildTools `
+            --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" `
+            --accept-package-agreements --accept-source-agreements 2>&1 | Out-Host
+    } catch {
+        Write-Host "  winget reported an error (this is often non-fatal)" -ForegroundColor Yellow
+    }
+
+    Refresh-Path
+
+    $msvcInclude = Find-MsvcIncludePath
+    if ($msvcInclude) {
+        Write-Ok "MSVC Build Tools installed: $msvcInclude"
+    } else {
+        Write-Fail "MSVC Build Tools installation could not be verified"
+        Write-Host "  Install manually: https://visualstudio.microsoft.com/visual-cpp-build-tools/" -ForegroundColor Yellow
+        Write-Host "  Select 'Desktop development with C++' workload" -ForegroundColor Yellow
+    }
+}
+
+function Install-CMake {
+    Write-Step "CMake"
+
+    Refresh-Path
+
+    if (Test-Command "cmake") {
+        $version = (cmake --version | Select-Object -First 1) -replace "cmake version ", ""
+        Write-Ok "CMake already installed: $version"
+        return
+    }
+
+    Write-Host "  Installing CMake via winget..." -ForegroundColor Gray
+    try {
+        winget install --id Kitware.CMake --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Host
+    } catch {}
+
+    Refresh-Path
+
+    if (Test-Command "cmake") {
+        $version = (cmake --version | Select-Object -First 1) -replace "cmake version ", ""
+        Write-Ok "CMake installed: $version"
+    } else {
+        Write-Fail "CMake installation failed. Install manually from https://cmake.org/download/"
+    }
+}
+
+function Install-LLVM {
+    Write-Step "LLVM/Clang (for bindgen)"
+
+    Refresh-Path
+
+    if (Test-Command "clang") {
+        $version = (clang --version | Select-Object -First 1)
+        Write-Ok "LLVM already installed: $version"
+        return
+    }
+
+    # Check if LLVM exists but not in PATH
+    if (Test-Path "C:\Program Files\LLVM\bin\clang.exe") {
+        Write-Ok "LLVM found at C:\Program Files\LLVM\bin"
+        return
+    }
+
+    Write-Host "  Installing LLVM via winget..." -ForegroundColor Gray
+    try {
+        winget install --id LLVM.LLVM --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Host
+    } catch {}
+
+    Refresh-Path
+
+    if ((Test-Command "clang") -or (Test-Path "C:\Program Files\LLVM\bin\clang.exe")) {
+        Write-Ok "LLVM installed"
+    } else {
+        Write-Fail "LLVM installation failed. Install manually from https://releases.llvm.org/"
+    }
+}
+
+function Install-CUDA {
+    Write-Step "CUDA Toolkit (GPU Acceleration)"
+
+    # Check if CUDA is already available
+    if (Test-Command "nvcc") {
+        $version = (nvcc --version | Select-String "release") -replace ".*release ", "" -replace ",.*", ""
+        Write-Ok "CUDA already installed: $version"
+        return
+    }
+
+    # Check common install paths
+    $cudaPaths = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue
+    if ($cudaPaths) {
+        $latest = $cudaPaths | Sort-Object Name -Descending | Select-Object -First 1
+        Write-Ok "CUDA found at: $($latest.FullName)"
+        $env:Path = "$($latest.FullName)\bin;$env:Path"
+        return
+    }
+
+    # Check if NVIDIA GPU is present
+    $nvidiaGpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "*NVIDIA*" }
+
+    if (-not $nvidiaGpu) {
+        Write-Skip "No NVIDIA GPU detected — CUDA not needed (will use CPU for STT)"
+        return
+    }
+
+    Write-Host "  NVIDIA GPU detected: $($nvidiaGpu.Name)" -ForegroundColor Gray
+    Write-Host "  Installing CUDA Toolkit via winget..." -ForegroundColor Gray
+    Write-Host "  (This may take 10-15 minutes)" -ForegroundColor Gray
+
+    try {
+        winget install --id Nvidia.CUDA --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Host
+    } catch {}
+
+    Refresh-Path
+
+    if (Test-Command "nvcc") {
+        $version = (nvcc --version | Select-String "release") -replace ".*release ", "" -replace ",.*", ""
+        Write-Ok "CUDA installed: $version"
+    } else {
+        Write-Skip "CUDA installation could not be verified. Install manually from https://developer.nvidia.com/cuda-downloads"
+        Write-Host "  The app will still work using CPU (slower STT)." -ForegroundColor Yellow
+    }
+}
 
 function Install-Rust {
     Write-Step "Rust Toolchain"
@@ -98,13 +300,10 @@ function Install-Rust {
         $currentVersion = (rustc --version) -replace "rustc ", ""
         Write-Ok "Rust already installed: $currentVersion"
 
-        # Check for updates
         Write-Host "  Checking for updates..." -ForegroundColor Gray
         try {
             $updateOutput = & rustup update stable 2>&1
-        } catch {
-            # rustup writes info to stderr, ignore errors
-        }
+        } catch {}
         $updatedVersion = (rustc --version) -replace "rustc ", ""
         if ($updatedVersion -ne $currentVersion) {
             Write-Ok "Updated to $updatedVersion"
@@ -183,10 +382,9 @@ function Install-VBCable {
         $setupExe = Get-ChildItem -Path $vbCableDir -Filter "VBCABLE_Setup_x64.exe" -Recurse | Select-Object -First 1
 
         if ($setupExe) {
-            Write-Host "  Installing VB-Cable driver (requires admin)..." -ForegroundColor Gray
+            Write-Host "  Installing VB-Cable driver..." -ForegroundColor Gray
             Start-Process -FilePath $setupExe.FullName -ArgumentList "/i" -Wait -Verb RunAs 2>$null
 
-            # Verify installation
             Start-Sleep -Seconds 3
             $vbCableDevice = Get-PnpDevice -FriendlyName "*VB-Audio*" -ErrorAction SilentlyContinue
             if ($vbCableDevice) {
@@ -229,7 +427,6 @@ function Install-PythonDeps {
     $ErrorActionPreference = $prevPref
 
     if ($pipExitCode -eq 0) {
-        # Verify key packages
         $packages = @("faster_whisper", "transformers", "torch")
         $allOk = $true
         foreach ($pkg in $packages) {
@@ -252,6 +449,107 @@ function Install-PythonDeps {
     }
 }
 
+function Install-WhisperModel {
+    Write-Step "Whisper GGML Model"
+
+    if (-not (Test-Path $ModelsDir)) {
+        New-Item -Path $ModelsDir -ItemType Directory -Force | Out-Null
+    }
+
+    $modelName = "small"
+    $modelFile = Join-Path $ModelsDir "ggml-$modelName.bin"
+
+    if (Test-Path $modelFile) {
+        $size = [math]::Round((Get-Item $modelFile).Length / 1MB, 1)
+        Write-Ok "Model already downloaded: ggml-$modelName.bin (${size}MB)"
+        return
+    }
+
+    $modelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$modelName.bin"
+
+    Write-Host "  Downloading ggml-$modelName.bin (~466MB)..." -ForegroundColor Gray
+    Write-Host "  From: $modelUrl" -ForegroundColor Gray
+
+    try {
+        Invoke-WebRequest -Uri $modelUrl -OutFile $modelFile -UseBasicParsing
+
+        if (Test-Path $modelFile) {
+            $size = [math]::Round((Get-Item $modelFile).Length / 1MB, 1)
+            Write-Ok "Model downloaded: ggml-$modelName.bin (${size}MB)"
+        } else {
+            Write-Fail "Download completed but file not found"
+        }
+    } catch {
+        Write-Fail "Failed to download model: $_"
+        Write-Host "  Download manually from: $modelUrl" -ForegroundColor Yellow
+        Write-Host "  Place the file at: $modelFile" -ForegroundColor Yellow
+    }
+}
+
+function Configure-CargoConfig {
+    Write-Step "Cargo Build Configuration (.cargo/config.toml)"
+
+    $msvcInclude = Find-MsvcIncludePath
+    $ucrtInclude = Find-UcrtIncludePath
+
+    if (-not $msvcInclude) {
+        Write-Skip "MSVC include path not found — skipping .cargo/config.toml generation"
+        return
+    }
+
+    if (-not $ucrtInclude) {
+        Write-Skip "UCRT include path not found — skipping .cargo/config.toml generation"
+        return
+    }
+
+    # Normalize paths for TOML (forward slashes)
+    $msvcIncludeEscaped = $msvcInclude -replace '\\', '/'
+    $ucrtIncludeEscaped = $ucrtInclude -replace '\\', '/'
+
+    # Detect CMake generator
+    $cmakeGenerator = "Visual Studio 17 2022"
+
+    if (-not (Test-Path $CargoDir)) {
+        New-Item -Path $CargoDir -ItemType Directory -Force | Out-Null
+    }
+
+    $configPath = Join-Path $CargoDir "config.toml"
+    $configContent = @"
+[env]
+BINDGEN_EXTRA_CLANG_ARGS = "-I`"$msvcIncludeEscaped`" -I`"$ucrtIncludeEscaped`""
+CMAKE_GENERATOR = "$cmakeGenerator"
+"@
+
+    Set-Content -Path $configPath -Value $configContent -Encoding UTF8
+
+    Write-Ok "Generated .cargo/config.toml"
+    Write-Host "  MSVC: $msvcInclude" -ForegroundColor Gray
+    Write-Host "  UCRT: $ucrtInclude" -ForegroundColor Gray
+}
+
+function Configure-DefaultConfig {
+    Write-Step "Application Configuration (config.toml)"
+
+    $configPath = Join-Path $ProjectRoot "config.toml"
+    if (Test-Path $configPath) {
+        Write-Ok "config.toml already exists"
+        return
+    }
+
+    $defaultConfig = @"
+speaker_source_language = "English"
+speaker_target_language = "Portuguese"
+mic_source_language = "Portuguese"
+mic_target_language = "English"
+chunk_duration_ms = 500
+whisper_model = "small"
+tts_speed = 1.1
+"@
+
+    Set-Content -Path $configPath -Value $defaultConfig -Encoding UTF8
+    Write-Ok "Created default config.toml"
+}
+
 function Build-RustProject {
     Write-Step "Building Rust Project"
 
@@ -260,6 +558,7 @@ function Build-RustProject {
     Push-Location $ProjectRoot
     try {
         Write-Host "  Compiling (release mode)..." -ForegroundColor Gray
+        Write-Host "  (First build may take 5-10 minutes)" -ForegroundColor Gray
         $prevPref = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         & cargo build --release 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
@@ -320,8 +619,8 @@ function Show-Summary {
     Write-Host "    cd $ProjectRoot" -ForegroundColor Gray
     Write-Host "    cargo run --release" -ForegroundColor Gray
     Write-Host ""
-    Write-Host "  First run will download ML models (~1GB)." -ForegroundColor Yellow
-    Write-Host "  Subsequent runs will be much faster." -ForegroundColor Yellow
+    Write-Host "  The app runs in the system tray." -ForegroundColor Yellow
+    Write-Host "  Right-click the tray icon to Start/Stop." -ForegroundColor Yellow
     Write-Host ""
 
     if ($LaunchApp) {
@@ -345,26 +644,30 @@ Write-Host ""
 Write-Host "  Project: $ProjectRoot" -ForegroundColor Gray
 Write-Host ""
 
-# Check admin
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Host "  WARNING: Not running as Administrator." -ForegroundColor Yellow
-    Write-Host "  VB-Cable installation requires admin privileges." -ForegroundColor Yellow
-    Write-Host "  Other dependencies will still be installed." -ForegroundColor Yellow
-    Write-Host ""
-}
+# 1. Build toolchain (MSVC, CMake, LLVM)
+Install-VSBuildTools
+Install-CMake
+Install-LLVM
 
+# 2. GPU support
+Install-CUDA
+
+# 3. Language runtimes
 Install-Rust
 $pythonExe = Install-Python
 
-if ($isAdmin) {
-    Install-VBCable
-} else {
-    Write-Step "VB-Cable Virtual Audio Driver"
-    Write-Skip "Skipped (requires Administrator). Run again as admin or install from https://vb-audio.com/Cable/"
-}
+# 4. Audio driver
+Install-VBCable
 
+# 5. Dependencies
 Install-PythonDeps -PythonExe $pythonExe
+Install-WhisperModel
+
+# 6. Configuration
+Configure-CargoConfig
+Configure-DefaultConfig
+
+# 7. Build and test
 Build-RustProject
 Test-RustProject
 

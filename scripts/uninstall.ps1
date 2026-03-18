@@ -7,11 +7,13 @@
     This script removes:
     - Python packages (faster-whisper, transformers, piper-tts, torch, etc.)
     - Downloaded ML models (models/ directory)
+    - Whisper GGML models
     - Rust build artifacts (target/ directory)
-    - Optionally: VB-Cable, Rust toolchain, Python
+    - Generated .cargo/config.toml
+    - Optionally: VB-Cable, CUDA, LLVM, CMake, Rust toolchain
 
 .NOTES
-    Run as Administrator for full cleanup (VB-Cable removal).
+    Run as Administrator for full cleanup.
     Usage: .\scripts\uninstall.ps1
 #>
 
@@ -22,6 +24,7 @@ $ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Pa
 $ScriptsDir = Join-Path $ProjectRoot "scripts"
 $ModelsDir = Join-Path $ProjectRoot "models"
 $TargetDir = Join-Path $ProjectRoot "target"
+$CargoDir = Join-Path $ProjectRoot ".cargo"
 
 # --- Helpers ---
 
@@ -131,14 +134,27 @@ function Remove-BuildArtifacts {
     }
 }
 
+function Remove-CargoConfig {
+    Write-Step "Cargo Build Configuration"
+
+    $configPath = Join-Path $CargoDir "config.toml"
+    if (Test-Path $configPath) {
+        Remove-Item $configPath -Force
+        Write-Ok "Removed .cargo/config.toml"
+
+        # Remove .cargo dir if empty
+        $remaining = Get-ChildItem $CargoDir -ErrorAction SilentlyContinue
+        if (-not $remaining) {
+            Remove-Item $CargoDir -Force
+            Write-Ok "Removed empty .cargo/ directory"
+        }
+    } else {
+        Write-Skip "No .cargo/config.toml found"
+    }
+}
+
 function Remove-VBCable {
     Write-Step "VB-Cable Virtual Audio Driver"
-
-    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) {
-        Write-Skip "Requires Administrator. Run again as admin to remove VB-Cable."
-        return
-    }
 
     $vbCableDevice = Get-PnpDevice -FriendlyName "*VB-Audio*" -ErrorAction SilentlyContinue
     if (-not $vbCableDevice) {
@@ -147,13 +163,75 @@ function Remove-VBCable {
     }
 
     if (Confirm-Action "  Remove VB-Cable virtual audio driver?") {
-        # VB-Cable doesn't have a silent uninstaller, guide the user
         Write-Host "  VB-Cable must be removed via Device Manager or Control Panel." -ForegroundColor Yellow
         Write-Host "  Opening Device Manager..." -ForegroundColor Gray
         Start-Process "devmgmt.msc"
         Write-Host "  Look for 'VB-Audio Virtual Cable' under Sound devices and uninstall it." -ForegroundColor Yellow
     } else {
         Write-Skip "VB-Cable kept"
+    }
+}
+
+function Remove-CUDA {
+    Write-Step "CUDA Toolkit"
+
+    $cudaPaths = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue
+    if (-not $cudaPaths) {
+        Write-Skip "CUDA not installed"
+        return
+    }
+
+    $latest = $cudaPaths | Sort-Object Name -Descending | Select-Object -First 1
+    if (Confirm-Action "  Remove CUDA Toolkit ($($latest.Name))? (This affects ALL CUDA apps)") {
+        try {
+            winget uninstall --id Nvidia.CUDA 2>&1 | Out-Host
+            Write-Ok "CUDA uninstall initiated"
+        } catch {
+            Write-Host "  Use Windows Settings > Apps to uninstall CUDA manually" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Skip "CUDA kept"
+    }
+}
+
+function Remove-LLVM {
+    Write-Step "LLVM/Clang"
+
+    if (-not (Test-Path "C:\Program Files\LLVM")) {
+        Write-Skip "LLVM not installed"
+        return
+    }
+
+    if (Confirm-Action "  Remove LLVM/Clang? (This affects ALL projects using bindgen/clang)") {
+        try {
+            winget uninstall --id LLVM.LLVM 2>&1 | Out-Host
+            Write-Ok "LLVM uninstall initiated"
+        } catch {
+            Write-Host "  Use Windows Settings > Apps to uninstall LLVM manually" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Skip "LLVM kept"
+    }
+}
+
+function Remove-CMake {
+    Write-Step "CMake"
+
+    $hasCMake = Get-Command "cmake" -ErrorAction SilentlyContinue
+    if (-not $hasCMake) {
+        Write-Skip "CMake not installed"
+        return
+    }
+
+    if (Confirm-Action "  Remove CMake? (This affects ALL projects using CMake)") {
+        try {
+            winget uninstall --id Kitware.CMake 2>&1 | Out-Host
+            Write-Ok "CMake uninstall initiated"
+        } catch {
+            Write-Host "  Use Windows Settings > Apps to uninstall CMake manually" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Skip "CMake kept"
     }
 }
 
@@ -190,18 +268,22 @@ if (-not (Confirm-Action "Continue with uninstall?")) {
     exit 0
 }
 
-# Always safe to remove
+# Always safe to remove (project-local)
 Remove-PythonPackages
 Remove-MLModels
 Remove-BuildArtifacts
+Remove-CargoConfig
 
 # Ask before removing system-level components
 Write-Host ""
-if (Confirm-Action "Also remove system-level dependencies (VB-Cable, Rust)?") {
+if (Confirm-Action "Also remove system-level dependencies (VB-Cable, CUDA, LLVM, CMake, Rust)?") {
     Remove-VBCable
+    Remove-CUDA
+    Remove-LLVM
+    Remove-CMake
     Remove-RustToolchain
 } else {
-    Write-Skip "System-level dependencies kept (VB-Cable, Rust)"
+    Write-Skip "System-level dependencies kept"
 }
 
 Write-Host "`n" -NoNewline
@@ -209,5 +291,5 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host "  Uninstall Complete!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "  To reinstall: .\scripts\install.ps1" -ForegroundColor Gray
+Write-Host "  To reinstall: powershell -ExecutionPolicy Bypass -File scripts\install.ps1" -ForegroundColor Gray
 Write-Host ""
