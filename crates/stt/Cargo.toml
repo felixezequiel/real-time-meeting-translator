@@ -12,4 +12,8 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-whisper-rs = { version = "0.16", features = ["cuda"] }
+whisper-rs = "0.16"
+
+[features]
+default = []
+cuda = ["whisper-rs/cuda"]

@@ -46,5 +46,9 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 cpal = "0.15"
 
+[features]
+default = ["cuda"]
+cuda = ["stt/cuda"]
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }

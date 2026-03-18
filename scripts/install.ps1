@@ -608,13 +608,24 @@ function Build-RustProject {
 
     Refresh-Path
 
+    # Detect if CUDA is available to decide build features
+    $hasCuda = (Test-Command "nvcc") -or
+        (Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+    if ($hasCuda) {
+        Write-Host "  CUDA detected — building with GPU acceleration" -ForegroundColor Green
+        $cargoArgs = @("build", "--release")
+    } else {
+        Write-Host "  No CUDA — building CPU-only (STT will be slower)" -ForegroundColor Yellow
+        $cargoArgs = @("build", "--release", "--no-default-features")
+    }
+
     Push-Location $ProjectRoot
     try {
         Write-Host "  Compiling (release mode)..." -ForegroundColor Gray
         Write-Host "  (First build may take 5-10 minutes)" -ForegroundColor Gray
         $prevPref = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
-        & cargo build --release 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+        & cargo @cargoArgs 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
         $buildExitCode = $LASTEXITCODE
         $ErrorActionPreference = $prevPref
 
