@@ -22,6 +22,14 @@ const MIN_RMS_FOR_STT: f32 = 0.005;
 /// while still allowing pipeline overlap between chunks.
 const MAX_CONCURRENT_TRANSLATE: usize = 3;
 
+/// Minimum word count before sending accumulated text to translation.
+/// Gives the translator enough context for coherent output.
+const MIN_WORDS_FOR_TRANSLATE: usize = 8;
+
+/// Maximum time (in seconds) to hold accumulated text before force-flushing,
+/// even if we haven't reached MIN_WORDS_FOR_TRANSLATE or punctuation.
+const MAX_HOLD_SECONDS: f32 = 3.0;
+
 /// Pipeline modelled after a human simultaneous interpreter.
 ///
 /// Architecture (3 stages, fully pipelined):
@@ -35,8 +43,8 @@ const MAX_CONCURRENT_TRANSLATE: usize = 3;
 /// - **Translate+TTS** runs concurrently (up to 3 tasks) — while chunk N is
 ///   being synthesized, chunk N+1 is already translating. A reorder buffer
 ///   guarantees playback matches original speech order.
-/// - **No sentence buffer** — each STT chunk is forwarded immediately to
-///   translation. This eliminates 2-4s of accumulation delay.
+/// - **Smart accumulator** — text is held until punctuation, 8+ words, or
+///   3s timeout. Balances translation coherence with low latency.
 pub struct SpeakerPipeline {
     pub stt: Arc<WhisperStt>,
     pub translator: Arc<OpusMtTranslator>,
@@ -76,6 +84,8 @@ impl SpeakerPipeline {
         let mut expected_seq: u64 = 0;       // next sequence number we expect to receive
         let mut pending: std::collections::BTreeMap<u64, SttResult> = std::collections::BTreeMap::new();
         let mut translate_seq: u64 = 0;      // sequence number for translate worker
+        let mut accumulator = String::new();       // text accumulator for translation context
+        let mut accumulator_start: Option<Instant> = None; // when accumulation began
 
         // STT results arrive here (from parallel spawn_blocking tasks)
         let (stt_tx, mut stt_rx) = mpsc::unbounded_channel::<SttResult>();
@@ -97,6 +107,8 @@ impl SpeakerPipeline {
                             tracing::info!("Pipeline stopped");
                             is_running = false;
                             accumulated_samples.clear();
+                            accumulator.clear();
+                            accumulator_start = None;
                         }
                     }
                 }
@@ -161,17 +173,26 @@ impl SpeakerPipeline {
                     }
                 }
 
-                // ── Receive STT text, reorder, forward immediately ────────
+                // ── Receive STT text, reorder, smart accumulator ──────────
                 Some(result) = stt_rx.recv() => {
                     pending.insert(result.seq, result);
 
-                    // Drain consecutive results in order and forward each
-                    // non-empty chunk directly to translation — no sentence
-                    // accumulation, no waiting for punctuation.
                     while let Some(r) = pending.remove(&expected_seq) {
                         expected_seq += 1;
 
-                        if r.text.is_empty() { continue; }
+                        if r.text.is_empty() {
+                            // Silence — flush accumulator if it has text
+                            // (speaker paused, send what we have).
+                            if !accumulator.is_empty() {
+                                let text = std::mem::take(&mut accumulator);
+                                accumulator_start = None;
+                                tracing::info!("→ flush (silence): \"{}\"", &text[..text.len().min(80)]);
+                                let seq = translate_seq;
+                                translate_seq += 1;
+                                let _ = text_tx.send((seq, text));
+                            }
+                            continue;
+                        }
 
                         tracing::info!("STT [{}]: \"{}\" ({:?}, {}ms)",
                             r.seq, r.text, r.detected_language, r.stt_duration.as_millis());
@@ -182,9 +203,38 @@ impl SpeakerPipeline {
                             continue;
                         }
 
-                        let seq = translate_seq;
-                        translate_seq += 1;
-                        let _ = text_tx.send((seq, r.text));
+                        // Append to accumulator
+                        if !accumulator.is_empty() { accumulator.push(' '); }
+                        accumulator.push_str(&r.text);
+                        if accumulator_start.is_none() {
+                            accumulator_start = Some(Instant::now());
+                        }
+
+                        // Decide whether to flush the accumulator:
+                        // 1. Punctuation → send immediately (complete thought)
+                        // 2. >= 8 words  → send (enough context for good translation)
+                        // 3. >= 3s held  → force flush (delay cap)
+                        let has_punctuation = ends_with_punctuation(&accumulator);
+                        let word_count = accumulator.split_whitespace().count();
+                        let held_too_long = accumulator_start
+                            .map(|t| t.elapsed().as_secs_f32() >= MAX_HOLD_SECONDS)
+                            .unwrap_or(false);
+
+                        let should_flush = has_punctuation
+                            || word_count >= MIN_WORDS_FOR_TRANSLATE
+                            || held_too_long;
+
+                        if should_flush {
+                            let text = std::mem::take(&mut accumulator);
+                            accumulator_start = None;
+                            let reason = if has_punctuation { "punctuation" }
+                                else if word_count >= MIN_WORDS_FOR_TRANSLATE { "word count" }
+                                else { "timeout" };
+                            tracing::info!("→ flush ({}): \"{}\"", reason, &text[..text.len().min(80)]);
+                            let seq = translate_seq;
+                            translate_seq += 1;
+                            let _ = text_tx.send((seq, text));
+                        }
                     }
                 }
 
@@ -232,7 +282,7 @@ fn start_translate_worker(
                         let _permit = permit; // released on drop
                         let start = Instant::now();
 
-                        let segment = TextSegment::new(text, Language::English);
+                        let segment = TextSegment::new(text.clone(), Language::English);
 
                         let translated = match translator.translate(&segment) {
                             Ok(t) => t,
@@ -243,6 +293,18 @@ fn start_translate_worker(
                             }
                         };
                         let translate_ms = start.elapsed().as_millis();
+
+                        // Guard: reject degenerate translation output.
+                        // Opus-MT can loop on garbage input, producing thousands
+                        // of repeated words.
+                        if is_translation_degenerate(&text, &translated.text) {
+                            tracing::warn!("Translation degenerate, dropping: \"{}\" → \"{}\"",
+                                &text[..text.len().min(60)],
+                                &translated.text[..translated.text.len().min(60)]);
+                            let _ = tx.send((seq, None));
+                            return;
+                        }
+
                         tracing::info!("← \"{}\" ({}ms)", translated.text, translate_ms);
 
                         let audio_out = match tts.synthesize(&translated) {
@@ -296,17 +358,111 @@ struct SttResult {
     stt_duration: std::time::Duration,
 }
 
+// ─── Punctuation detection ───────────────────────────────────────────────────
+
+/// Returns true if the trimmed text ends with sentence-ending punctuation.
+fn ends_with_punctuation(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?')
+}
+
+// ─── Translation quality guard ──────────────────────────────────────────────
+
+/// Detects degenerate translation output (repetition loops, excessive length).
+/// Opus-MT can enter infinite-loop-like generation on garbage or ambiguous input.
+fn is_translation_degenerate(input: &str, output: &str) -> bool {
+    // Output way too long relative to input — likely a loop
+    let input_words = input.split_whitespace().count().max(1);
+    let output_words = output.split_whitespace().count();
+    if output_words > input_words * 4 && output_words > 20 {
+        return true;
+    }
+
+    // Repetitive output: same word/phrase repeated many times
+    let words: Vec<&str> = output.split_whitespace().collect();
+    if words.len() >= 6 {
+        let unique: std::collections::HashSet<&str> = words.iter().copied().collect();
+        let ratio = unique.len() as f32 / words.len() as f32;
+        if ratio < 0.25 {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn max_concurrent_translate_is_positive() {
-        assert!(MAX_CONCURRENT_TRANSLATE > 0);
+    fn ends_with_period() {
+        assert!(ends_with_punctuation("Hello world."));
     }
 
     #[test]
-    fn min_rms_threshold_is_positive() {
-        assert!(MIN_RMS_FOR_STT > 0.0);
+    fn ends_with_exclamation() {
+        assert!(ends_with_punctuation("Stop!"));
+    }
+
+    #[test]
+    fn ends_with_question() {
+        assert!(ends_with_punctuation("How are you?"));
+    }
+
+    #[test]
+    fn no_punctuation() {
+        assert!(!ends_with_punctuation("Hello world"));
+    }
+
+    #[test]
+    fn trailing_whitespace_still_detected() {
+        assert!(ends_with_punctuation("Hello world.  "));
+    }
+
+    #[test]
+    fn empty_string() {
+        assert!(!ends_with_punctuation(""));
+    }
+
+    #[test]
+    fn min_words_is_reasonable() {
+        assert!(MIN_WORDS_FOR_TRANSLATE >= 4);
+        assert!(MIN_WORDS_FOR_TRANSLATE <= 15);
+    }
+
+    #[test]
+    fn max_hold_seconds_caps_delay() {
+        assert!(MAX_HOLD_SECONDS >= 1.0);
+        assert!(MAX_HOLD_SECONDS <= 5.0);
+    }
+
+    #[test]
+    fn normal_translation_is_not_degenerate() {
+        assert!(!is_translation_degenerate(
+            "Hello world, how are you?",
+            "Olá mundo, como vai você?",
+        ));
+    }
+
+    #[test]
+    fn repetitive_translation_is_degenerate() {
+        let input = "No, no, no";
+        let output = "Não, não, não, não, não, não, não, não, não, não, não, não, não, não, não, não, não, não, não, não, não, não, não";
+        assert!(is_translation_degenerate(input, output));
+    }
+
+    #[test]
+    fn excessively_long_translation_is_degenerate() {
+        let input = "Hello";
+        let output = (0..30).map(|_| "word").collect::<Vec<_>>().join(" ");
+        assert!(is_translation_degenerate(input, &output));
+    }
+
+    #[test]
+    fn proportional_translation_is_not_degenerate() {
+        let input = "This is a relatively long sentence with many words";
+        let output = "Esta é uma frase relativamente longa com muitas palavras";
+        assert!(!is_translation_degenerate(input, output));
     }
 }

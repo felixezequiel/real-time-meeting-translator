@@ -89,12 +89,31 @@ impl WhisperStt {
 
         let full_text = text_parts.join(" ").trim().to_string();
 
-        // Language detection
+        // Language detection — only accept English or Portuguese.
+        // If Whisper detects any other language (German, Welsh, etc.),
+        // the audio is either garbage or a hallucination — drop it.
         let lang_id = state.full_lang_id_from_state();
         let detected_lang = match whisper_rs::get_lang_str(lang_id) {
             Some("pt") => Language::Portuguese,
             Some("en") => Language::English,
-            _ => detect_language_from_text_heuristic(&full_text, self.language),
+            Some(other) => {
+                // Fallback: try text heuristic, but only if it has a strong opinion.
+                // If heuristic can't decide, reject the segment entirely.
+                let heuristic = detect_language_from_text_heuristic(&full_text, self.language);
+                let heuristic_is_confident = {
+                    let lower = full_text.to_lowercase();
+                    let words: Vec<&str> = lower.split_whitespace().collect();
+                    words.len() >= 3 && heuristic != self.language
+                };
+                if heuristic_is_confident {
+                    heuristic
+                } else {
+                    tracing::debug!("Whisper detected '{}' — rejecting segment: \"{}\"",
+                        other, &full_text[..full_text.len().min(60)]);
+                    return Ok(TextSegment::new(String::new(), self.language));
+                }
+            }
+            None => detect_language_from_text_heuristic(&full_text, self.language),
         };
 
         if is_repetitive(&full_text) {
