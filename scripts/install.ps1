@@ -292,13 +292,23 @@ function Install-CUDA {
 }
 
 function Install-Rust {
-    Write-Step "Rust Toolchain"
+    Write-Step "Rust Toolchain (MSVC)"
 
     Refresh-Path
 
     if (Test-Command "rustc") {
         $currentVersion = (rustc --version) -replace "rustc ", ""
         Write-Ok "Rust already installed: $currentVersion"
+
+        # Ensure MSVC target is the default (not GNU — GNU causes dlltool.exe errors)
+        $defaultHost = & rustup show | Select-String "Default host"
+        if ($defaultHost -and $defaultHost -notlike "*msvc*") {
+            Write-Host "  Switching default toolchain to MSVC..." -ForegroundColor Gray
+            & rustup default stable-x86_64-pc-windows-msvc 2>&1 | Out-Host
+            Write-Ok "Switched to MSVC toolchain"
+        } else {
+            Write-Ok "MSVC toolchain is default"
+        }
 
         Write-Host "  Checking for updates..." -ForegroundColor Gray
         try {
@@ -311,20 +321,22 @@ function Install-Rust {
         return
     }
 
-    Write-Host "  Installing Rust via rustup..." -ForegroundColor Gray
+    Write-Host "  Installing Rust via rustup (MSVC toolchain)..." -ForegroundColor Gray
     $rustupUrl = "https://win.rustup.rs/x86_64"
     $rustupExe = Join-Path $env:TEMP "rustup-init.exe"
 
     Invoke-WebRequest -Uri $rustupUrl -OutFile $rustupExe -UseBasicParsing
-    try { & $rustupExe -y --default-toolchain stable 2>&1 | Out-Host } catch {}
+    # Force MSVC host to avoid dlltool.exe dependency from GNU toolchain
+    try { & $rustupExe -y --default-toolchain stable --default-host x86_64-pc-windows-msvc 2>&1 | Out-Host } catch {}
 
     Refresh-Path
 
     if (Test-Command "rustc") {
         $version = rustc --version
-        Write-Ok "Rust installed: $version"
+        Write-Ok "Rust installed: $version (MSVC)"
     } else {
         Write-Fail "Rust installation failed. Please install manually from https://rustup.rs"
+        Write-Host "  IMPORTANT: Select the MSVC toolchain during installation, NOT GNU" -ForegroundColor Yellow
         exit 1
     }
 }
