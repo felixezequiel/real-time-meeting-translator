@@ -10,6 +10,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing;
 
+use crate::denoise;
 use crate::resampler;
 
 /// Type alias: unbounded sender never drops audio.
@@ -127,14 +128,25 @@ fn flush_chunks(
         let chunk_samples: Vec<f32> = buf.drain(..samples_per_chunk).collect();
 
         let resampled = if sample_rate != WHISPER_SAMPLE_RATE || channels != MONO_CHANNELS {
-            resampler::resample_to_16khz_mono(&chunk_samples, sample_rate, channels)
-                .unwrap_or_default()
+            // Downmix to mono first, then denoise at 48kHz, then resample to 16kHz.
+            // RNNoise removes background music/noise before Whisper sees the audio.
+            let mut mono = if channels > 1 {
+                denoise::stereo_to_mono(&chunk_samples)
+            } else {
+                chunk_samples
+            };
+            denoise::denoise_48khz_mono(&mut mono);
+            resampler::resample_mono(
+                &mono,
+                sample_rate,
+                WHISPER_SAMPLE_RATE,
+            )
+            .unwrap_or_default()
         } else {
             chunk_samples
         };
 
         let chunk = AudioChunk::new(resampled, WHISPER_SAMPLE_RATE, MONO_CHANNELS);
-        // Unbounded send — NEVER drops audio
         let _ = sender.send(chunk);
     }
 }
@@ -145,7 +157,7 @@ mod tests {
 
     #[test]
     fn flush_chunks_does_nothing_when_buffer_is_too_small() {
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = mpsc::unbounded_channel();
         let mut buf = vec![0.0f32; 100];
         let samples_per_chunk = 1000;
         flush_chunks(&mut buf, samples_per_chunk, 16_000, 1, &tx);
@@ -154,7 +166,7 @@ mod tests {
 
     #[test]
     fn flush_chunks_drains_complete_chunk() {
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let samples_per_chunk = 400; // 400 samples at 16kHz mono = 25ms
         let mut buf = vec![0.0f32; 400];
         flush_chunks(&mut buf, samples_per_chunk, 16_000, 1, &tx);

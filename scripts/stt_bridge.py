@@ -77,12 +77,11 @@ def read_wav_samples(wav_path):
         sample_width = w.getsampwidth()
         raw_data = w.readframes(n_frames)
 
+    # Batch conversion with numpy — no Python per-sample loop
     if sample_width == 2:
-        int16_samples = struct.unpack(f"<{n_frames}h", raw_data)
-        return np.array([s / 32768.0 for s in int16_samples], dtype=np.float32), sample_rate
+        return np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0, sample_rate
     elif sample_width == 4:
-        int32_samples = struct.unpack(f"<{n_frames}i", raw_data)
-        return np.array([s / 2147483648.0 for s in int32_samples], dtype=np.float32), sample_rate
+        return np.frombuffer(raw_data, dtype=np.int32).astype(np.float32) / 2147483648.0, sample_rate
     else:
         return np.zeros(n_frames, dtype=np.float32), sample_rate
 

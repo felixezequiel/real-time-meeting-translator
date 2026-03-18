@@ -11,3 +11,4 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 cpal = "0.15"
 rubato = "0.16"
+nnnoiseless = { version = "0.5", default-features = false }

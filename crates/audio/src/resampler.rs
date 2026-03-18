@@ -92,6 +92,15 @@ pub fn resample_to_target(
     Ok(output)
 }
 
+/// Resample mono audio between arbitrary sample rates.
+pub fn resample_mono(
+    samples: &[f32],
+    source_rate: u32,
+    target_rate: u32,
+) -> Result<Vec<f32>, ResampleError> {
+    resample_to_target(samples, source_rate, target_rate)
+}
+
 fn downmix_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     let channel_count = channels as usize;
     samples

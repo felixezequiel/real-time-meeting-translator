@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod denoise;
 pub mod device;
 pub mod loopback;
 pub mod playback;

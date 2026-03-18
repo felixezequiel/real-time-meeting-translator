@@ -220,14 +220,15 @@ def main():
             if samples is None:
                 samples, sample_rate = [0.0] * 100, 22050
 
-            # Write to temp WAV file for efficient transfer
+            # Write WAV with batch numpy conversion (was per-sample Python loop)
+            samples_np = np.array(samples, dtype=np.float32)
+            samples_np = np.clip(samples_np, -1.0, 1.0)
+            int16_data = (samples_np * 32767).astype(np.int16)
             with wave.open(TMP_WAV, 'wb') as w:
                 w.setnchannels(1)
                 w.setsampwidth(2)
                 w.setframerate(sample_rate)
-                for s in samples:
-                    clamped = max(-1.0, min(1.0, s))
-                    w.writeframes(struct.pack('<h', int(clamped * 32767)))
+                w.writeframes(int16_data.tobytes())
 
             response = {"audio_file": TMP_WAV, "sample_rate": sample_rate}
             print(json.dumps(response, ensure_ascii=True), flush=True)

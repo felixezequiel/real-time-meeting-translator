@@ -79,7 +79,7 @@ impl AudioCapture {
                     let amplified: Vec<f32> = data.iter().map(|&s| (s * INPUT_GAIN).clamp(-1.0, 1.0)).collect();
                     buf.extend_from_slice(&amplified);
 
-                    if buf.len() >= samples_per_chunk {
+                    while buf.len() >= samples_per_chunk {
                         let chunk_samples: Vec<f32> = buf.drain(..samples_per_chunk).collect();
 
                         let resampled = if sample_rate != WHISPER_SAMPLE_RATE || channels != MONO_CHANNELS {
@@ -105,7 +105,7 @@ impl AudioCapture {
                     let mut buf = buffer_clone.lock().unwrap();
                     buf.extend_from_slice(&float_data);
 
-                    if buf.len() >= samples_per_chunk {
+                    while buf.len() >= samples_per_chunk {
                         let chunk_samples: Vec<f32> = buf.drain(..samples_per_chunk).collect();
 
                         let resampled = if sample_rate != WHISPER_SAMPLE_RATE || channels != MONO_CHANNELS {

@@ -13,7 +13,7 @@ const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
 /// Force-flush the sentence buffer after this many words without punctuation.
-const MAX_WORDS_BEFORE_FORCE_FLUSH: usize = 40;
+const MAX_WORDS_BEFORE_FORCE_FLUSH: usize = 15;
 
 /// Pipeline modelled after a human simultaneous interpreter.
 ///
@@ -63,6 +63,9 @@ impl SpeakerPipeline {
         let mut is_running = false;
         let mut accumulated_samples: Vec<f32> = Vec::new();
         let mut sentence_buffer = String::new();
+        let mut next_seq: u64 = 0;          // next sequence number to assign
+        let mut expected_seq: u64 = 0;       // next sequence number we expect to receive
+        let mut pending: std::collections::BTreeMap<u64, SttResult> = std::collections::BTreeMap::new();
 
         // STT results arrive here (from parallel spawn_blocking tasks)
         let (stt_tx, mut stt_rx) = mpsc::unbounded_channel::<SttResult>();
@@ -100,43 +103,68 @@ impl SpeakerPipeline {
                         let stt_clone = stt.clone();
                         let tx = stt_tx.clone();
                         let expected_lang = source_language;
+                        let seq = next_seq;
+                        next_seq += 1;
 
                         tokio::task::spawn_blocking(move || {
                             let start = Instant::now();
                             let chunk = AudioChunk::new(samples, WHISPER_SAMPLE_RATE, 1);
                             match stt_clone.transcribe(&chunk) {
-                                Ok(seg) if !seg.is_empty() => {
+                                Ok(seg) => {
+                                    // Always send a result (even empty) so the reorder
+                                    // buffer doesn't stall waiting for a missing sequence.
                                     let _ = tx.send(SttResult {
-                                        text: seg.text,
+                                        seq,
+                                        text: if seg.is_empty() { String::new() } else { seg.text },
                                         detected_language: seg.language,
                                         expected_language: expected_lang,
                                         stt_duration: start.elapsed(),
                                     });
                                 }
-                                Ok(_) => {}
-                                Err(e) => tracing::warn!("STT failed: {}", e),
+                                Err(e) => {
+                                    tracing::warn!("STT failed: {}", e);
+                                    // Send empty result to keep sequence flowing
+                                    let _ = tx.send(SttResult {
+                                        seq,
+                                        text: String::new(),
+                                        detected_language: expected_lang,
+                                        expected_language: expected_lang,
+                                        stt_duration: start.elapsed(),
+                                    });
+                                }
                             }
                         });
                     }
                 }
 
-                // ── Receive STT text, detect sentences ────────────────────
+                // ── Receive STT text, reorder, detect sentences ───────────
                 Some(result) = stt_rx.recv() => {
-                    tracing::info!("STT ({:?}, {}ms): \"{}\"",
-                        result.detected_language,
-                        result.stt_duration.as_millis(),
-                        result.text);
+                    // Insert into reorder buffer keyed by sequence number
+                    pending.insert(result.seq, result);
 
-                    if result.detected_language != result.expected_language {
-                        tracing::info!("Language guard: dropping (detected={:?}, expected={:?})",
-                            result.detected_language, result.expected_language);
-                        continue;
+                    // Drain all consecutive results starting from expected_seq.
+                    // This guarantees sentence_buffer receives text in the same
+                    // order the audio was captured, even if STT tasks finish
+                    // out of order.
+                    while let Some(r) = pending.remove(&expected_seq) {
+                        expected_seq += 1;
+
+                        if r.text.is_empty() { continue; }
+
+                        tracing::info!("STT [{}] ({:?}, {}ms): \"{}\"",
+                            r.seq, r.detected_language, r.stt_duration.as_millis(), r.text);
+
+                        if r.detected_language != r.expected_language {
+                            tracing::info!("Language guard: dropping (detected={:?}, expected={:?})",
+                                r.detected_language, r.expected_language);
+                            continue;
+                        }
+
+                        if !sentence_buffer.is_empty() { sentence_buffer.push(' '); }
+                        sentence_buffer.push_str(&r.text);
                     }
 
-                    if !sentence_buffer.is_empty() { sentence_buffer.push(' '); }
-                    sentence_buffer.push_str(&result.text);
-
-                    // Extract complete sentences and send to the ordered worker
+                    // Check for complete sentences
                     if let Some((sentences, remainder)) = extract_complete_sentences(&sentence_buffer) {
                         sentence_buffer = remainder;
                         tracing::info!("→ Sentence: \"{}\"", sentences);
@@ -145,7 +173,8 @@ impl SpeakerPipeline {
                         let word_count = sentence_buffer.split_whitespace().count();
                         if word_count >= MAX_WORDS_BEFORE_FORCE_FLUSH {
                             let text = std::mem::take(&mut sentence_buffer);
-                            tracing::info!("→ Force flush ({} words): \"{}\"", word_count, &text[..text.len().min(80)]);
+                            tracing::info!("→ Force flush ({} words): \"{}\"",
+                                word_count, &text[..text.len().min(80)]);
                             let _ = sentence_tx.send(text);
                         }
                     }
@@ -224,6 +253,7 @@ fn start_translate_worker(
 // ─── Internal types ──────────────────────────────────────────────────────────
 
 struct SttResult {
+    seq: u64,
     text: String,
     detected_language: Language,
     expected_language: Language,
