@@ -24,7 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            "meeting_translator=info,pipeline=info,stt=info,translation=info,tts=info,audio=info",
+            "meeting_translator=info,pipeline=info,stt=warn,translation=warn,tts=warn,audio=warn",
         )
         .init();
 

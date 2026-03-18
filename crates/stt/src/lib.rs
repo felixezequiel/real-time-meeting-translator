@@ -45,10 +45,7 @@ impl WhisperStt {
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-        // Auto-detect language — do NOT force it.
-        // This is critical for the feedback-loop guard: if TTS output leaks back
-        // into the loopback, Whisper detects it as the target language and the
-        // pipeline drops it.
+        // Auto-detect language for feedback-loop guard
         params.set_language(None);
         params.set_translate(false);
         params.set_no_timestamps(true);
@@ -59,10 +56,17 @@ impl WhisperStt {
         params.set_print_timestamps(false);
         params.set_suppress_blank(true);
         params.set_suppress_nst(true);
-        // Temperature 0 = greedy decoding (fastest)
+
+        // Anti-hallucination settings
         params.set_temperature(0.0);
-        // No speech detection threshold
         params.set_no_speech_thold(0.6);
+        // Limit output length — prevents infinite repetition loops.
+        // 2 seconds of audio ≈ 30-50 tokens max for normal speech.
+        params.set_n_max_text_ctx(128);
+        // Entropy threshold: segments with very low entropy (repetitive) are dropped
+        params.set_entropy_thold(2.4);
+        // Log probability threshold: low-confidence outputs are dropped
+        params.set_logprob_thold(-1.0);
 
         // Run inference — this is the only blocking call, no file I/O
         let mut state = ctx
@@ -79,6 +83,10 @@ impl WhisperStt {
         let mut text_parts = Vec::new();
         for i in 0..num_segments {
             if let Some(segment) = state.get_segment(i) {
+                // Skip segments where Whisper thinks there's no speech
+                if segment.no_speech_probability() > 0.7 {
+                    continue;
+                }
                 if let Ok(text) = segment.to_str_lossy() {
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
@@ -147,26 +155,41 @@ fn detect_language_from_text_heuristic(text: &str, expected: Language) -> Langua
     }
 }
 
-/// Detect repetitive hallucination patterns like "i'r un i'r un..."
+/// Detect repetitive hallucination patterns.
+/// Catches: "i'r un i'r un...", "you you you you", "♪ ♪ ♪", etc.
 fn is_repetitive(text: &str) -> bool {
     let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() < 6 {
+    if words.len() < 4 {
         return false;
     }
 
-    // Check if any short phrase repeats more than 4 times
-    for pattern_len in 1..4 {
-        let pattern: String = words[..pattern_len].join(" ");
-        if pattern.len() < 2 { continue; }
-        let count = text.matches(&pattern).count();
-        if count > 4 { return true; }
+    // Check if any single word repeats more than 3 times
+    for word in &words[..1.min(words.len())] {
+        if word.len() >= 2 && text.matches(word).count() > 3 {
+            return true;
+        }
     }
 
-    // Check if unique words are less than 20% of total
+    // Check if any short phrase (1-3 words) repeats more than 3 times
+    for pattern_len in 1..4.min(words.len()) {
+        let pattern: String = words[..pattern_len].join(" ");
+        if pattern.len() < 2 { continue; }
+        if text.matches(&pattern).count() > 3 { return true; }
+    }
+
+    // Check if unique words are less than 30% of total (very repetitive)
     let unique: std::collections::HashSet<String> = words.iter()
         .map(|w| w.to_lowercase().trim_matches(|c: char| !c.is_alphabetic()).to_string())
+        .filter(|w| !w.is_empty())
         .collect();
-    if words.len() > 10 && (unique.len() as f32 / words.len() as f32) < 0.2 {
+    if words.len() > 6 && (unique.len() as f32 / words.len() as f32) < 0.3 {
+        return true;
+    }
+
+    // Check for non-speech characters (music notes, symbols)
+    let non_alpha_ratio = text.chars().filter(|c| !c.is_alphanumeric() && !c.is_whitespace() && *c != '.' && *c != ',' && *c != '!' && *c != '?' && *c != '\'').count() as f32
+        / text.len().max(1) as f32;
+    if non_alpha_ratio > 0.3 {
         return true;
     }
 

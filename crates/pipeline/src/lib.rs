@@ -151,11 +151,11 @@ impl SpeakerPipeline {
 
                         if r.text.is_empty() { continue; }
 
-                        tracing::info!("STT [{}] ({:?}, {}ms): \"{}\"",
-                            r.seq, r.detected_language, r.stt_duration.as_millis(), r.text);
+                        tracing::info!("STT [{}]: \"{}\" ({:?}, {}ms)",
+                            r.seq, r.text, r.detected_language, r.stt_duration.as_millis());
 
                         if r.detected_language != r.expected_language {
-                            tracing::info!("Language guard: dropping (detected={:?}, expected={:?})",
+                            tracing::debug!("Lang guard: drop ({:?}≠{:?})",
                                 r.detected_language, r.expected_language);
                             continue;
                         }
@@ -167,14 +167,13 @@ impl SpeakerPipeline {
                     // Check for complete sentences
                     if let Some((sentences, remainder)) = extract_complete_sentences(&sentence_buffer) {
                         sentence_buffer = remainder;
-                        tracing::info!("→ Sentence: \"{}\"", sentences);
+                        tracing::info!("→ \"{}\"", sentences);
                         let _ = sentence_tx.send(sentences);
                     } else {
                         let word_count = sentence_buffer.split_whitespace().count();
                         if word_count >= MAX_WORDS_BEFORE_FORCE_FLUSH {
                             let text = std::mem::take(&mut sentence_buffer);
-                            tracing::info!("→ Force flush ({} words): \"{}\"",
-                                word_count, &text[..text.len().min(80)]);
+                            tracing::info!("→ flush: \"{}\"", &text[..text.len().min(80)]);
                             let _ = sentence_tx.send(text);
                         }
                     }
@@ -217,14 +216,12 @@ fn start_translate_worker(
                 };
                 let translate_ms = start.elapsed().as_millis();
 
-                tracing::info!("Translated: \"{}\"", translated.text);
+                tracing::info!("← \"{}\" ({}ms)", translated.text, translate_ms);
 
-                let tts_start = Instant::now();
                 let audio_out = match tts.synthesize(&translated) {
                     Ok(a) => a,
                     Err(e) => { tracing::warn!("TTS failed: {}", e); return None; }
                 };
-                let tts_ms = tts_start.elapsed().as_millis();
 
                 let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
                     resampler::resample_to_target(
@@ -235,9 +232,6 @@ fn start_translate_worker(
                 } else {
                     audio_out
                 };
-
-                let total_ms = start.elapsed().as_millis();
-                tracing::info!("Translate+TTS: {}ms (T={}ms, TTS={}ms)", total_ms, translate_ms, tts_ms);
 
                 Some(audio_out)
             })
