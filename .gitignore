@@ -4,3 +4,5 @@ models/
 __pycache__/
 *.pyc
 .env
+.cargo/config.toml
+config.toml

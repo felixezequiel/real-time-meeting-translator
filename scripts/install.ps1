@@ -501,6 +501,29 @@ function Install-WhisperModel {
 function Configure-CargoConfig {
     Write-Step "Cargo Build Configuration (.cargo/config.toml)"
 
+    $configPath = Join-Path $CargoDir "config.toml"
+
+    # If config already exists, validate it before overwriting
+    if (Test-Path $configPath) {
+        Write-Host "  Existing .cargo/config.toml found, validating..." -ForegroundColor Gray
+        Push-Location $ProjectRoot
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $checkOutput = & cargo check --message-format short 2>&1 | Select-Object -First 5
+        $checkExit = $LASTEXITCODE
+        $ErrorActionPreference = $prevPref
+        Pop-Location
+
+        # If cargo can at least parse the config (even if build fails for other reasons),
+        # the config is fine — don't overwrite it
+        $configBroken = $checkOutput | Select-String "could not parse TOML configuration"
+        if (-not $configBroken) {
+            Write-Ok ".cargo/config.toml is valid — keeping existing"
+            return
+        }
+        Write-Host "  Existing config is broken, regenerating..." -ForegroundColor Yellow
+    }
+
     $msvcInclude = Find-MsvcIncludePath
     $ucrtInclude = Find-UcrtIncludePath
 
@@ -515,8 +538,8 @@ function Configure-CargoConfig {
     }
 
     # Normalize paths for TOML (forward slashes)
-    $msvcIncludeEscaped = $msvcInclude -replace '\\', '/'
-    $ucrtIncludeEscaped = $ucrtInclude -replace '\\', '/'
+    $msvcPath = $msvcInclude -replace '\\', '/'
+    $ucrtPath = $ucrtInclude -replace '\\', '/'
 
     # Detect CMake generator
     $cmakeGenerator = "Visual Studio 17 2022"
@@ -525,18 +548,36 @@ function Configure-CargoConfig {
         New-Item -Path $CargoDir -ItemType Directory -Force | Out-Null
     }
 
-    $configPath = Join-Path $CargoDir "config.toml"
-    $configContent = @"
-[env]
-BINDGEN_EXTRA_CLANG_ARGS = "-I`"$msvcIncludeEscaped`" -I`"$ucrtIncludeEscaped`""
-CMAKE_GENERATOR = "$cmakeGenerator"
-"@
+    # Build TOML content line by line to ensure correct escaping.
+    # TOML requires \" for literal quotes inside double-quoted strings.
+    $bindgenArgs = "-I\""$msvcPath\"" -I\""$ucrtPath\"""
+    $lines = @(
+        "[env]",
+        "BINDGEN_EXTRA_CLANG_ARGS = ""$bindgenArgs""",
+        "CMAKE_GENERATOR = ""$cmakeGenerator"""
+    )
 
-    Set-Content -Path $configPath -Value $configContent -Encoding UTF8
+    Set-Content -Path $configPath -Value ($lines -join "`n") -Encoding UTF8 -NoNewline
 
-    Write-Ok "Generated .cargo/config.toml"
-    Write-Host "  MSVC: $msvcInclude" -ForegroundColor Gray
-    Write-Host "  UCRT: $ucrtInclude" -ForegroundColor Gray
+    # Verify the generated config is valid TOML
+    Push-Location $ProjectRoot
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $verifyOutput = & cargo check --message-format short 2>&1 | Select-Object -First 5
+    $ErrorActionPreference = $prevPref
+    Pop-Location
+
+    $stillBroken = $verifyOutput | Select-String "could not parse TOML configuration"
+    if ($stillBroken) {
+        Write-Fail "Generated .cargo/config.toml is invalid"
+        Write-Host "  Content:" -ForegroundColor Yellow
+        Get-Content $configPath | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
+        Write-Host "  You may need to edit it manually." -ForegroundColor Yellow
+    } else {
+        Write-Ok "Generated .cargo/config.toml"
+        Write-Host "  MSVC: $msvcInclude" -ForegroundColor Gray
+        Write-Host "  UCRT: $ucrtInclude" -ForegroundColor Gray
+    }
 }
 
 function Configure-DefaultConfig {
