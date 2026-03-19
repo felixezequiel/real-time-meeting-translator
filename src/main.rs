@@ -1,5 +1,6 @@
 use anyhow::Result;
 use shared::{Language, PipelineCommand, PipelineConfig, PipelineStage, TranslationDirection};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -292,6 +293,10 @@ async fn start_pipelines(
     config: &PipelineConfig,
     models: &LoadedModels,
 ) -> Result<ActivePipelines> {
+    // Shared echo buffer: both pipelines write translations and check STT
+    // against it. Prevents mic TTS from being re-translated by the speaker pipeline.
+    let echo_buffer = pipeline::new_echo_buffer();
+
     let spk_source_lang = config.speaker_source_language;
     let (spk_trans, spk_tts) = models_for_source(spk_source_lang, models);
     let spk_stt = Arc::clone(&models.stt_a);
@@ -322,24 +327,34 @@ async fn start_pipelines(
         .map(|d| d.to_lowercase().contains("cable"))
         .unwrap_or(false);
 
+    // Flag: set by mic TTS playback while it has audio in its buffer.
+    // The passthrough checks this to avoid forwarding mic TTS back to headphones.
+    let mic_tts_playing = Arc::new(AtomicBool::new(false));
+
     let (speaker_capture, passthrough_stream) = if loopback_is_cable {
         // Broadcast: loopback audio (16kHz mono) → pipeline + passthrough to headphones.
         // The passthrough needs upsampling to 48kHz for headphone playback.
+        // Passthrough is suppressed while mic TTS is playing (prevents self-hearing).
         let (broadcast_tx, mut broadcast_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
         let (passthrough_tx, passthrough_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
         let pipeline_tx = spk_audio_tx;
         let passthrough_sample_rate: u32 = 48_000;
+        let mic_playing = Arc::clone(&mic_tts_playing);
         tokio::spawn(async move {
             while let Some(chunk) = broadcast_rx.recv().await {
-                // Upsample 16kHz → 48kHz for headphone playback
-                if let Ok(upsampled) = audio::resampler::resample_mono(
-                    &chunk.samples, chunk.sample_rate, passthrough_sample_rate,
-                ) {
-                    let _ = passthrough_tx.send(shared::AudioChunk::new(
-                        upsampled, passthrough_sample_rate, 1,
-                    ));
+                // Always forward to pipeline — the shared echo buffer will
+                // detect and discard any mic TTS that gets recaptured.
+                let _ = pipeline_tx.send(chunk.clone());
+                // Only passthrough to headphones if mic TTS is not playing.
+                if !mic_playing.load(Ordering::Acquire) {
+                    if let Ok(upsampled) = audio::resampler::resample_mono(
+                        &chunk.samples, chunk.sample_rate, passthrough_sample_rate,
+                    ) {
+                        let _ = passthrough_tx.send(shared::AudioChunk::new(
+                            upsampled, passthrough_sample_rate, 1,
+                        ));
+                    }
                 }
-                let _ = pipeline_tx.send(chunk);
             }
         });
 
@@ -370,7 +385,7 @@ async fn start_pipelines(
         .map_err(|e| anyhow::anyhow!("Speaker playback failed: {}", e))?;
 
     let speaker_pipeline = SpeakerPipeline::new(
-        "Speaker", spk_stt, spk_trans, spk_tts, spk_source_lang, 1.5,
+        "Speaker", spk_stt, spk_trans, spk_tts, spk_source_lang, 1.5, echo_buffer.clone(),
     );
     tokio::spawn(async move {
         speaker_pipeline.run(spk_audio_rx, spk_out_tx, spk_cmd_rx, spk_metrics_tx).await;
@@ -405,14 +420,14 @@ async fn start_pipelines(
         .unwrap_or_else(|_| "Unknown".to_string());
     tracing::info!("Mic TTS output to: {}", virtual_mic_name);
 
-    let mic_playback_node = AudioPlayback::new(virtual_mic_device);
+    let mic_playback_node = AudioPlayback::with_playing_flag(virtual_mic_device, mic_tts_playing);
     let mic_playback = mic_playback_node
         .start(mic_out_rx)
         .map_err(|e| anyhow::anyhow!("Mic playback failed: {}", e))?;
 
     // Mic pipeline: 1.5s flush — match speaker pipeline
     let mic_pipeline = SpeakerPipeline::new(
-        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, 1.5,
+        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, 1.5, echo_buffer,
     );
     tokio::spawn(async move {
         mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;

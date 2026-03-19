@@ -41,7 +41,13 @@ const ECHO_SIMILARITY_THRESHOLD: f32 = 0.4;
 
 /// Shared buffer of recent translation outputs, used to detect when
 /// the loopback captures our own TTS audio (feedback loop).
-type EchoBuffer = Arc<Mutex<VecDeque<(Instant, Vec<String>)>>>;
+/// Both pipelines share one buffer so cross-pipeline echo is also detected.
+pub type EchoBuffer = Arc<Mutex<VecDeque<(Instant, Vec<String>)>>>;
+
+/// Create a new shared echo buffer for cross-pipeline echo detection.
+pub fn new_echo_buffer() -> EchoBuffer {
+    Arc::new(Mutex::new(VecDeque::new()))
+}
 
 /// Pipeline modelled after a human simultaneous interpreter.
 ///
@@ -65,6 +71,10 @@ pub struct SpeakerPipeline {
     pub tts: Arc<PiperTts>,
     pub source_language: Language,
     pub flush_interval_seconds: f32,
+    /// Shared echo buffer — both pipelines write translations here and check
+    /// STT results against it. Prevents cross-pipeline feedback (mic TTS
+    /// recaptured by speaker loopback).
+    pub echo_buffer: EchoBuffer,
 }
 
 impl SpeakerPipeline {
@@ -75,8 +85,12 @@ impl SpeakerPipeline {
         tts: Arc<PiperTts>,
         source_language: Language,
         flush_interval_seconds: f32,
+        echo_buffer: EchoBuffer,
     ) -> Self {
-        Self { name: name.into(), stt, translator, tts, source_language, flush_interval_seconds }
+        Self {
+            name: name.into(), stt, translator, tts,
+            source_language, flush_interval_seconds, echo_buffer,
+        }
     }
 
     pub async fn run(
@@ -93,6 +107,7 @@ impl SpeakerPipeline {
         let source_language = self.source_language;
         let flush_interval = self.flush_interval_seconds;
         let flush_sample_count = (WHISPER_SAMPLE_RATE as f32 * flush_interval) as usize;
+        let echo_buffer = self.echo_buffer;
 
         let mut is_running = false;
         let mut accumulated_samples: Vec<f32> = Vec::new();
@@ -105,9 +120,6 @@ impl SpeakerPipeline {
 
         // STT results arrive here (from parallel spawn_blocking tasks)
         let (stt_tx, mut stt_rx) = mpsc::unbounded_channel::<SttResult>();
-
-        // Recent translations for echo detection (shared with translate worker)
-        let echo_buffer: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
 
         // Text chunks go to the concurrent translate+TTS worker (with ordered delivery)
         let (text_tx, text_rx) = mpsc::unbounded_channel::<(u64, String)>();

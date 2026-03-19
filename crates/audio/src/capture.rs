@@ -5,11 +5,15 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing;
 
+use crate::denoise;
 use crate::resampler;
 
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const MONO_CHANNELS: u16 = 1;
-const INPUT_GAIN: f32 = 15.0;
+
+/// Mild gain boost for quiet microphones. Most USB mics already have
+/// adequate levels — 15x was way too aggressive and amplified noise.
+const INPUT_GAIN: f32 = 2.0;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -76,22 +80,12 @@ impl AudioCapture {
             SampleFormat::F32 => {
                 let data_callback = move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mut buf = buffer_clone.lock().unwrap();
-                    let amplified: Vec<f32> = data.iter().map(|&s| (s * INPUT_GAIN).clamp(-1.0, 1.0)).collect();
+                    let amplified: Vec<f32> = data.iter()
+                        .map(|&s| (s * INPUT_GAIN).clamp(-1.0, 1.0))
+                        .collect();
                     buf.extend_from_slice(&amplified);
 
-                    while buf.len() >= samples_per_chunk {
-                        let chunk_samples: Vec<f32> = buf.drain(..samples_per_chunk).collect();
-
-                        let resampled = if sample_rate != WHISPER_SAMPLE_RATE || channels != MONO_CHANNELS {
-                            resampler::resample_to_16khz_mono(&chunk_samples, sample_rate, channels)
-                                .unwrap_or_default()
-                        } else {
-                            chunk_samples
-                        };
-
-                        let chunk = AudioChunk::new(resampled, WHISPER_SAMPLE_RATE, MONO_CHANNELS);
-                        let _ = sender.send(chunk);
-                    }
+                    flush_chunks(&mut buf, samples_per_chunk, sample_rate, channels, &sender);
                 };
 
                 self.device
@@ -100,24 +94,13 @@ impl AudioCapture {
             }
             SampleFormat::I16 => {
                 let data_callback = move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let float_data: Vec<f32> =
-                        data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                    let float_data: Vec<f32> = data.iter()
+                        .map(|&s| (s as f32 / i16::MAX as f32 * INPUT_GAIN).clamp(-1.0, 1.0))
+                        .collect();
                     let mut buf = buffer_clone.lock().unwrap();
                     buf.extend_from_slice(&float_data);
 
-                    while buf.len() >= samples_per_chunk {
-                        let chunk_samples: Vec<f32> = buf.drain(..samples_per_chunk).collect();
-
-                        let resampled = if sample_rate != WHISPER_SAMPLE_RATE || channels != MONO_CHANNELS {
-                            resampler::resample_to_16khz_mono(&chunk_samples, sample_rate, channels)
-                                .unwrap_or_default()
-                        } else {
-                            chunk_samples
-                        };
-
-                        let chunk = AudioChunk::new(resampled, WHISPER_SAMPLE_RATE, MONO_CHANNELS);
-                        let _ = sender.send(chunk);
-                    }
+                    flush_chunks(&mut buf, samples_per_chunk, sample_rate, channels, &sender);
                 };
 
                 self.device
@@ -137,5 +120,51 @@ impl AudioCapture {
             .map_err(|e| CaptureError::StreamStartError(e.to_string()))?;
 
         Ok(stream)
+    }
+}
+
+const DENOISE_SAMPLE_RATE: u32 = 48_000;
+
+/// Drains complete chunks from the buffer. Processing pipeline:
+/// downmix to mono → resample to 48kHz → RNNoise denoise → resample to 16kHz.
+/// The intermediate 48kHz step is required because RNNoise only works at 48kHz.
+fn flush_chunks(
+    buf: &mut Vec<f32>,
+    samples_per_chunk: usize,
+    sample_rate: u32,
+    channels: u16,
+    sender: &mpsc::UnboundedSender<AudioChunk>,
+) {
+    while buf.len() >= samples_per_chunk {
+        let chunk_samples: Vec<f32> = buf.drain(..samples_per_chunk).collect();
+
+        let resampled = if sample_rate != WHISPER_SAMPLE_RATE || channels != MONO_CHANNELS {
+            // Step 1: downmix to mono
+            let mono = if channels > 1 {
+                denoise::stereo_to_mono(&chunk_samples)
+            } else {
+                chunk_samples
+            };
+
+            // Step 2: resample to 48kHz for RNNoise (if not already 48kHz)
+            let mut mono_48k = if sample_rate != DENOISE_SAMPLE_RATE {
+                resampler::resample_mono(&mono, sample_rate, DENOISE_SAMPLE_RATE)
+                    .unwrap_or(mono)
+            } else {
+                mono
+            };
+
+            // Step 3: denoise at 48kHz
+            denoise::denoise_48khz_mono(&mut mono_48k);
+
+            // Step 4: resample to 16kHz for Whisper
+            resampler::resample_mono(&mono_48k, DENOISE_SAMPLE_RATE, WHISPER_SAMPLE_RATE)
+                .unwrap_or_default()
+        } else {
+            chunk_samples
+        };
+
+        let chunk = AudioChunk::new(resampled, WHISPER_SAMPLE_RATE, MONO_CHANNELS);
+        let _ = sender.send(chunk);
     }
 }
