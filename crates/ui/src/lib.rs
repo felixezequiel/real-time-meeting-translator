@@ -36,6 +36,8 @@ pub struct TrayUi {
     window_action_tx: std_mpsc::Sender<TrayAction>,
     /// Handle to the settings window thread (if open)
     settings_thread: Option<std::thread::JoinHandle<()>>,
+    /// Sender to signal the persistent settings window to show with updated config
+    show_settings_tx: Option<std_mpsc::Sender<settings_window::SettingsInit>>,
 }
 
 impl TrayUi {
@@ -70,6 +72,7 @@ impl TrayUi {
             window_action_rx,
             window_action_tx,
             settings_thread: None,
+            show_settings_tx: None,
         })
     }
 
@@ -95,7 +98,7 @@ impl TrayUi {
         None
     }
 
-    /// Open the egui settings window (if not already open).
+    /// Open the egui settings window, or show it again if already running (hidden).
     pub fn open_settings(
         &mut self,
         output_devices: &[String],
@@ -103,14 +106,6 @@ impl TrayUi {
         config: &PipelineConfig,
         is_active: bool,
     ) {
-        // Check if the window thread is still running
-        if let Some(handle) = &self.settings_thread {
-            if !handle.is_finished() {
-                tracing::info!("Settings window already open");
-                return;
-            }
-        }
-
         let init = settings_window::SettingsInit {
             output_devices: output_devices.to_vec(),
             input_devices: input_devices.to_vec(),
@@ -121,7 +116,22 @@ impl TrayUi {
             is_active,
         };
 
-        let handle = settings_window::open(init, self.window_action_tx.clone());
+        // If the window thread is still alive, send a "show" signal with updated data
+        if let Some(handle) = &self.settings_thread {
+            if !handle.is_finished() {
+                if let Some(tx) = &self.show_settings_tx {
+                    let _ = tx.send(init);
+                    tracing::info!("Settings window re-shown");
+                }
+                return;
+            }
+        }
+
+        // First time or thread died unexpectedly — create a new one
+        let (show_tx, show_rx) = std_mpsc::channel();
+        self.show_settings_tx = Some(show_tx);
+
+        let handle = settings_window::open(init, self.window_action_tx.clone(), show_rx);
         self.settings_thread = Some(handle);
         tracing::info!("Settings window opened");
     }

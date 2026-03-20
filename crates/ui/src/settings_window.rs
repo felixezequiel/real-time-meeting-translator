@@ -1,8 +1,51 @@
 use eframe::egui;
 use shared::{Language, PipelineCommand};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
 
 use crate::TrayAction;
+
+// ─── Win32 helpers for reliable show/hide ────────────────────────────────────
+
+/// Unique window title so FindWindowW can locate our HWND reliably.
+const WINDOW_TITLE: &str = "Meeting Translator Settings";
+
+#[cfg(windows)]
+mod win32 {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOW,
+    };
+
+    /// Find our settings window by its exact title.
+    pub fn find_hwnd() -> Option<HWND> {
+        let title: Vec<u16> = super::WINDOW_TITLE
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+        if hwnd.is_null() {
+            None
+        } else {
+            Some(hwnd)
+        }
+    }
+
+    pub fn hide_window() {
+        if let Some(hwnd) = find_hwnd() {
+            unsafe { ShowWindow(hwnd, SW_HIDE) };
+        }
+    }
+
+    pub fn show_window() {
+        if let Some(hwnd) = find_hwnd() {
+            unsafe {
+                ShowWindow(hwnd, SW_SHOW);
+                SetForegroundWindow(hwnd);
+            };
+        }
+    }
+}
 
 // ─── shadcn/ui zinc dark palette ─────────────────────────────────────────────
 
@@ -35,8 +78,11 @@ pub struct SettingsInit {
 pub fn open(
     init: SettingsInit,
     action_tx: std_mpsc::Sender<TrayAction>,
+    show_rx: std_mpsc::Receiver<SettingsInit>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        let pending_show: Arc<Mutex<Option<SettingsInit>>> = Arc::new(Mutex::new(None));
+
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([460.0, 440.0])
@@ -51,12 +97,28 @@ pub fn open(
         };
 
         let tx = action_tx;
+        let pending = Arc::clone(&pending_show);
         let _ = eframe::run_native(
-            "Meeting Translator",
+            WINDOW_TITLE,
             options,
             Box::new(move |cc| {
                 configure_style(&cc.egui_ctx);
-                Ok(Box::new(SettingsApp::new(init, tx)))
+
+                // Spawn a watcher thread that blocks on the show channel.
+                // When a show signal arrives, it stores the data, makes the
+                // window visible via Win32 API, and wakes the event loop.
+                let ctx = cc.egui_ctx.clone();
+                let pending_for_watcher = Arc::clone(&pending);
+                std::thread::spawn(move || {
+                    while let Ok(init) = show_rx.recv() {
+                        *pending_for_watcher.lock().unwrap() = Some(init);
+                        #[cfg(windows)]
+                        win32::show_window();
+                        ctx.request_repaint();
+                    }
+                });
+
+                Ok(Box::new(SettingsApp::new(init, tx, pending)))
             }),
         );
     })
@@ -73,10 +135,15 @@ struct SettingsApp {
     speaker_source_lang: Language,
     is_active: bool,
     action_tx: std_mpsc::Sender<TrayAction>,
+    pending_show: Arc<Mutex<Option<SettingsInit>>>,
 }
 
 impl SettingsApp {
-    fn new(init: SettingsInit, action_tx: std_mpsc::Sender<TrayAction>) -> Self {
+    fn new(
+        init: SettingsInit,
+        action_tx: std_mpsc::Sender<TrayAction>,
+        pending_show: Arc<Mutex<Option<SettingsInit>>>,
+    ) -> Self {
         let mic_idx = init
             .input_devices
             .iter()
@@ -97,7 +164,26 @@ impl SettingsApp {
             speaker_source_lang: init.speaker_source_lang,
             is_active: init.is_active,
             action_tx,
+            pending_show,
         }
+    }
+
+    fn apply_init(&mut self, init: SettingsInit) {
+        self.mic_idx = init
+            .input_devices
+            .iter()
+            .position(|d| *d == init.selected_mic)
+            .unwrap_or(0);
+        self.headphones_idx = init
+            .output_devices
+            .iter()
+            .position(|d| *d == init.selected_headphones)
+            .unwrap_or(0);
+        self.output_devices = init.output_devices;
+        self.input_devices = init.input_devices;
+        self.mic_source_lang = init.mic_source_lang;
+        self.speaker_source_lang = init.speaker_source_lang;
+        self.is_active = init.is_active;
     }
 
     fn send(&self, action: TrayAction) {
@@ -123,6 +209,20 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Check for pending "show" signal set by the watcher thread
+        let pending_init = self.pending_show.lock().unwrap().take();
+        if let Some(init) = pending_init {
+            self.apply_init(init);
+        }
+
+        // Intercept close: hide the window via Win32 instead of destroying it.
+        // CancelClose keeps the event loop alive; SW_HIDE removes from screen.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            #[cfg(windows)]
+            win32::hide_window();
+        }
+
         // Status bar
         egui::TopBottomPanel::top("status_bar")
             .frame(
