@@ -44,9 +44,7 @@ pub fn open(
                 .with_inner_size([480.0, 360.0])
                 .with_min_inner_size([400.0, 300.0])
                 .with_resizable(true)
-                .with_always_on_top()
-                .with_title_shown(false)
-                .with_decorations(false),
+                .with_always_on_top(),
             event_loop_builder: Some(Box::new(|builder| {
                 use winit::platform::windows::EventLoopBuilderExtWindows;
                 builder.with_any_thread(true);
@@ -77,8 +75,6 @@ struct SettingsApp {
     speaker_source_lang: Language,
     is_active: bool,
     action_tx: std_mpsc::Sender<TrayAction>,
-    drag_origin: Option<egui::Pos2>,
-    window_pos: Option<egui::Pos2>,
 }
 
 impl SettingsApp {
@@ -103,8 +99,6 @@ impl SettingsApp {
             speaker_source_lang: init.speaker_source_lang,
             is_active: init.is_active,
             action_tx,
-            drag_origin: None,
-            window_pos: None,
         }
     }
 
@@ -131,69 +125,24 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Custom title bar + drag support
-        let title_response = egui::TopBottomPanel::top("titlebar")
+        // Status bar at top of content
+        egui::TopBottomPanel::top("status_bar")
             .frame(egui::Frame::none().fill(BG_PRIMARY).inner_margin(egui::Margin {
                 left: 16.0,
-                right: 12.0,
+                right: 16.0,
                 top: 10.0,
                 bottom: 10.0,
             }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Status dot
                     let dot_color = if self.is_active { ACCENT_GREEN } else { TEXT_MUTED };
                     let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot_rect.center(), 5.0, dot_color);
-
-                    ui.add_space(8.0);
-
-                    ui.label(
-                        egui::RichText::new("Meeting Translator")
-                            .color(TEXT_PRIMARY)
-                            .size(15.0)
-                            .strong(),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Close button
-                        let close_btn = ui.add(
-                            egui::Button::new(egui::RichText::new("✕").color(TEXT_MUTED).size(13.0))
-                                .fill(egui::Color32::TRANSPARENT)
-                                .frame(false),
-                        );
-                        if close_btn.clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if close_btn.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                    });
+                    ui.add_space(6.0);
+                    let status_text = if self.is_active { "Tradução ativa" } else { "Tradução pausada" };
+                    ui.label(egui::RichText::new(status_text).color(TEXT_MUTED).size(11.5));
                 });
             });
-
-        // Drag window by title bar
-        let title_resp = title_response.response;
-        if title_resp.is_pointer_button_down_on() {
-            if self.drag_origin.is_none() {
-                if let Some(pointer_pos) = ctx.pointer_interact_pos() {
-                    if let Some(win_pos) = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min) {
-                        self.drag_origin = Some(pointer_pos);
-                        self.window_pos = Some(win_pos);
-                    }
-                }
-            }
-            if let (Some(origin), Some(start_pos)) = (self.drag_origin, self.window_pos) {
-                if let Some(current) = ctx.pointer_interact_pos() {
-                    let delta = current - origin;
-                    let new_pos = start_pos + delta;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new_pos));
-                }
-            }
-        } else {
-            self.drag_origin = None;
-            self.window_pos = None;
-        }
 
         // Main content
         egui::CentralPanel::default()
