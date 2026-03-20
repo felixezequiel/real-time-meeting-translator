@@ -17,7 +17,6 @@ const TEXT_SUBTLE: egui::Color32 = egui::Color32::from_rgb(113, 113, 122); // zi
 const ACCENT_INDIGO: egui::Color32 = egui::Color32::from_rgb(99, 102, 241); // indigo-500
 const ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(34, 197, 94);   // green-500
 const ACCENT_RED: egui::Color32 = egui::Color32::from_rgb(239, 68, 68);     // red-500
-const BADGE_BG: egui::Color32 = egui::Color32::from_rgb(39, 39, 42);        // zinc-800
 
 // ─── Init data ────────────────────────────────────────────────────────────────
 
@@ -147,90 +146,15 @@ impl eframe::App for SettingsApp {
                 });
             });
 
-        // Content
-        egui::CentralPanel::default()
+        // Action button pinned at bottom
+        egui::TopBottomPanel::bottom("action_bar")
             .frame(
                 egui::Frame::none()
                     .fill(BG_BASE)
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(ctx, |ui| {
-                ui.set_min_size(ui.available_size());
                 let content_width = ui.available_width();
-
-                // ── Microfone card ─────────────────────────────────────────
-                shadcn_card(ui, content_width, |ui| {
-                    card_header(ui, "🎙  Microfone");
-
-                    // Device field
-                    field_label(ui, "Dispositivo de entrada");
-                    {
-                        let old = self.mic_idx;
-                        let name = self.mic_name();
-                        full_width_combo(ui, "mic_device", &name, &self.input_devices, &mut self.mic_idx, content_width);
-                        if self.mic_idx != old {
-                            self.send(TrayAction::SetMicDevice(self.mic_name()));
-                        }
-                    }
-
-                    ui.add_space(12.0);
-
-                    // Language field
-                    field_label(ui, "Idioma");
-                    {
-                        let old = self.mic_source_lang;
-                        language_field(
-                            ui, "mic_lang",
-                            "Eu falo em",
-                            &mut self.mic_source_lang,
-                        );
-                        if self.mic_source_lang != old {
-                            self.send(TrayAction::SetMicSourceLanguage(self.mic_source_lang));
-                        }
-                    }
-                });
-
-                ui.add_space(12.0);
-
-                // ── Alto-falante card ──────────────────────────────────────
-                shadcn_card(ui, content_width, |ui| {
-                    card_header(ui, "🔊  Alto-falante");
-
-                    // Device field
-                    field_label(ui, "Dispositivo de saída");
-                    {
-                        let old = self.headphones_idx;
-                        let name = self.headphones_name();
-                        full_width_combo(ui, "fone_device", &name, &self.output_devices, &mut self.headphones_idx, content_width);
-                        if self.headphones_idx != old {
-                            self.send(TrayAction::SetHeadphonesDevice(self.headphones_name()));
-                        }
-                    }
-
-                    ui.add_space(12.0);
-
-                    // Language field
-                    field_label(ui, "Idioma");
-                    {
-                        let old = self.speaker_source_lang;
-                        language_field(
-                            ui, "spk_lang",
-                            "Reunião em",
-                            &mut self.speaker_source_lang,
-                        );
-                        if self.speaker_source_lang != old {
-                            self.send(TrayAction::SetSpeakerSourceLanguage(self.speaker_source_lang));
-                        }
-                    }
-                });
-
-                // Push button to bottom
-                let remaining = ui.available_height() - 54.0;
-                if remaining > 0.0 {
-                    ui.add_space(remaining);
-                }
-
-                // ── Action button ──────────────────────────────────────────
                 let (label, btn_color) = if self.is_active {
                     ("⏹   Parar tradução", ACCENT_RED)
                 } else {
@@ -256,6 +180,79 @@ impl eframe::App for SettingsApp {
                     };
                     self.send(TrayAction::Command(cmd));
                 }
+            });
+
+        // Scrollable content
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(BG_BASE)
+                    .inner_margin(egui::Margin::same(16.0)),
+            )
+            .show(ctx, |ui| {
+                let content_width = ui.available_width();
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(content_width);
+
+                        // ── Microfone card ─────────────────────────────────
+                        shadcn_card(ui, content_width, |ui| {
+                            card_header(ui, "🎙  Microfone");
+
+                            field_label(ui, "Dispositivo de entrada");
+                            {
+                                let old = self.mic_idx;
+                                let name = self.mic_name();
+                                full_width_combo(ui, "mic_device", &name, &self.input_devices, &mut self.mic_idx, content_width);
+                                if self.mic_idx != old {
+                                    self.send(TrayAction::SetMicDevice(self.mic_name()));
+                                }
+                            }
+
+                            ui.add_space(12.0);
+
+                            field_label(ui, "Idioma");
+                            {
+                                let old = self.mic_source_lang;
+                                language_field(ui, "mic_lang", "Eu falo em", "sai em", &mut self.mic_source_lang);
+                                if self.mic_source_lang != old {
+                                    self.send(TrayAction::SetMicSourceLanguage(self.mic_source_lang));
+                                }
+                            }
+                        });
+
+                        ui.add_space(12.0);
+
+                        // ── Alto-falante card ───────────────────────────────
+                        shadcn_card(ui, content_width, |ui| {
+                            card_header(ui, "🔊  Alto-falante");
+
+                            field_label(ui, "Dispositivo de saída");
+                            {
+                                let old = self.headphones_idx;
+                                let name = self.headphones_name();
+                                full_width_combo(ui, "fone_device", &name, &self.output_devices, &mut self.headphones_idx, content_width);
+                                if self.headphones_idx != old {
+                                    self.send(TrayAction::SetHeadphonesDevice(self.headphones_name()));
+                                }
+                            }
+
+                            ui.add_space(12.0);
+
+                            field_label(ui, "Idioma");
+                            {
+                                let old = self.speaker_source_lang;
+                                language_field(ui, "spk_lang", "Reunião em", "eu escuto em", &mut self.speaker_source_lang);
+                                if self.speaker_source_lang != old {
+                                    self.send(TrayAction::SetSpeakerSourceLanguage(self.speaker_source_lang));
+                                }
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                    });
             });
     }
 }
@@ -320,21 +317,24 @@ fn full_width_combo(
         });
 }
 
-fn language_field(ui: &mut egui::Ui, id: &str, context_label: &str, lang: &mut Language) {
+/// `context_label`: e.g. "Eu falo em" | `connector`: e.g. "sai em" or "eu escuto em"
+fn language_field(
+    ui: &mut egui::Ui,
+    id: &str,
+    context_label: &str,
+    connector: &str,
+    lang: &mut Language,
+) {
     let target = opposite_lang(*lang);
 
-    // Row: "Você fala em" [Português ▼]   →   [English badge]
+    // "Eu falo em  [Português ▼]  sai em  English"
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(context_label)
-                .color(TEXT_MUTED)
-                .size(12.0),
-        );
+        ui.label(egui::RichText::new(context_label).color(TEXT_MUTED).size(12.0));
 
         ui.add_space(4.0);
 
         egui::ComboBox::from_id_salt(id)
-            .width(120.0)
+            .width(115.0)
             .selected_text(lang.display_name())
             .show_ui(ui, |ui| {
                 ui.selectable_value(lang, Language::Portuguese, "Português");
@@ -342,35 +342,9 @@ fn language_field(ui: &mut egui::Ui, id: &str, context_label: &str, lang: &mut L
             });
 
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("→").color(TEXT_SUBTLE).size(12.0));
-        ui.add_space(6.0);
-
-        // Target language badge
-        lang_badge(ui, target.display_name());
-    });
-
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new("Traduzido automaticamente pelo pipeline")
-            .color(TEXT_SUBTLE)
-            .size(10.5),
-    );
-}
-
-fn lang_badge(ui: &mut egui::Ui, text: &str) {
-    let badge_frame = egui::Frame::none()
-        .fill(BADGE_BG)
-        .stroke(egui::Stroke::new(1.0, BORDER_HOVER))
-        .rounding(egui::Rounding::same(4.0))
-        .inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 3.0, bottom: 3.0 });
-
-    badge_frame.show(ui, |ui| {
-        ui.label(
-            egui::RichText::new(text)
-                .color(TEXT_PRIMARY)
-                .size(11.5)
-                .strong(),
-        );
+        ui.label(egui::RichText::new(connector).color(TEXT_SUBTLE).size(12.0));
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(target.display_name()).color(TEXT_PRIMARY).size(12.0).strong());
     });
 }
 
