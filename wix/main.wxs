@@ -84,10 +84,25 @@
     <!-- ================================================================== -->
 
     <DirectoryRef Id='INSTALLFOLDER'>
-      <!-- Main executable -->
+      <!-- Main executable (initially CPU version — setup upgrades to GPU if CUDA available) -->
       <Component Id='MainExecutable' Guid='*' Win64='yes'>
         <File Id='MeetingTranslatorExe'
-              Source='target\release\meeting-translator.exe'
+              Source='$(var.CargoTargetBinDir)\meeting-translator-cpu.exe'
+              Name='meeting-translator.exe'
+              KeyPath='yes' />
+      </Component>
+
+      <!-- GPU variant (CUDA-enabled, selected by setup if NVIDIA GPU present) -->
+      <Component Id='GpuExecutable' Guid='*' Win64='yes'>
+        <File Id='MeetingTranslatorGpuExe'
+              Source='$(var.CargoTargetBinDir)\meeting-translator-gpu.exe'
+              KeyPath='yes' />
+      </Component>
+
+      <!-- CPU variant (kept as explicit fallback) -->
+      <Component Id='CpuExecutable' Guid='*' Win64='yes'>
+        <File Id='MeetingTranslatorCpuExe'
+              Source='$(var.CargoTargetBinDir)\meeting-translator-cpu.exe'
               KeyPath='yes' />
       </Component>
 
@@ -223,7 +238,7 @@
     </DirectoryRef>
 
     <!-- Icon for shortcuts (uses the exe's embedded icon) -->
-    <Icon Id='AppIcon.ico' SourceFile='target\release\meeting-translator.exe' />
+    <Icon Id='AppIcon.ico' SourceFile='$(var.CargoTargetBinDir)\meeting-translator.exe' />
     <Property Id='ARPPRODUCTICON' Value='AppIcon.ico' />
 
     <!-- ================================================================== -->
@@ -234,6 +249,8 @@
              Title='Meeting Translator'
              Description='Real-Time Meeting Translator application and scripts'>
       <ComponentRef Id='MainExecutable' />
+      <ComponentRef Id='GpuExecutable' />
+      <ComponentRef Id='CpuExecutable' />
       <ComponentRef Id='DefaultConfig' />
       <ComponentRef Id='SetupDepsScript' />
       <ComponentRef Id='RunSetupBatch' />

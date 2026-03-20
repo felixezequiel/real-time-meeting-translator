@@ -100,7 +100,7 @@ impl ActivePipelines {
 // ─── Application ──────────────────────────────────────────────────────────────
 
 async fn run_application(mut config: PipelineConfig) -> Result<()> {
-    let project_dir = std::env::current_dir()?;
+    let project_dir = app_dir()?;
     let scripts_dir = project_dir.join("scripts");
 
     // ── Load and initialize all model bridges (done once) ─────────────────────
@@ -571,10 +571,36 @@ fn restore_default_input(script_path: &std::path::Path, saved: &mut Option<Strin
     }
 }
 
+// ─── Path resolution ─────────────────────────────────────────────────────────
+
+/// Returns the application's base directory.
+///
+/// - **Installed mode** (exe lives outside a `target/` build dir):
+///   uses the exe's own directory (e.g. `C:\Program Files\Meeting Translator\`).
+/// - **Dev mode** (`cargo run` — exe lives inside `target\release\` or `target\debug\`):
+///   uses the current working directory (the project root).
+fn app_dir() -> Result<std::path::PathBuf> {
+    let exe_path = std::env::current_exe()?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine executable directory"))?;
+
+    // Detect dev mode: exe is inside a `target\{profile}\` directory
+    let is_dev = exe_dir
+        .components()
+        .any(|c| c.as_os_str() == "target");
+
+    if is_dev {
+        Ok(std::env::current_dir()?)
+    } else {
+        Ok(exe_dir.to_path_buf())
+    }
+}
+
 // ─── Config I/O ───────────────────────────────────────────────────────────────
 
 fn load_config() -> Result<PipelineConfig> {
-    let config_path = std::env::current_dir()?.join("config.toml");
+    let config_path = app_dir()?.join("config.toml");
     if config_path.exists() {
         let content = std::fs::read_to_string(&config_path)?;
         let config: PipelineConfig = toml::from_str(&content)?;
@@ -587,10 +613,10 @@ fn load_config() -> Result<PipelineConfig> {
 }
 
 fn save_config(config: &PipelineConfig) {
-    let config_path = match std::env::current_dir() {
+    let config_path = match app_dir() {
         Ok(dir) => dir.join("config.toml"),
         Err(e) => {
-            tracing::warn!("Could not determine working dir for config save: {}", e);
+            tracing::warn!("Could not determine app dir for config save: {}", e);
             return;
         }
     };

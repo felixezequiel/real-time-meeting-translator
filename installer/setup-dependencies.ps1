@@ -98,6 +98,32 @@ function Refresh-Path {
 
 # --- Installation Steps ---
 
+function Install-VCRedist {
+    Write-Step "Visual C++ Redistributable (required runtime)"
+
+    # Check if VC++ Redist is already installed
+    $vcInstalled = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" -ErrorAction SilentlyContinue
+    if ($vcInstalled) {
+        Write-Ok "Visual C++ Redistributable already installed (v$($vcInstalled.Version))"
+        return
+    }
+
+    Write-Host "  Installing Visual C++ Redistributable via winget..." -ForegroundColor Gray
+    try {
+        winget install --id Microsoft.VCRedist.2015+.x64 --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Host
+    } catch {}
+
+    Refresh-Path
+
+    $vcInstalled = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" -ErrorAction SilentlyContinue
+    if ($vcInstalled) {
+        Write-Ok "Visual C++ Redistributable installed"
+    } else {
+        Write-Fail "VC++ Redistributable installation could not be verified"
+        Write-Host "  Download manually from: https://aka.ms/vs/17/release/vc_redist.x64.exe" -ForegroundColor Yellow
+    }
+}
+
 function Install-Python {
     Write-Step "Python 3.10+ (required for ML models)"
 
@@ -229,6 +255,49 @@ function Install-HiFiCable {
     }
 }
 
+function Install-CUDA {
+    Write-Step "CUDA Toolkit (GPU Acceleration)"
+
+    if (Test-Command "nvcc") {
+        $version = (nvcc --version | Select-String "release") -replace ".*release ", "" -replace ",.*", ""
+        Write-Ok "CUDA already installed: $version"
+        return
+    }
+
+    $cudaPaths = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue
+    if ($cudaPaths) {
+        $latest = $cudaPaths | Sort-Object Name -Descending | Select-Object -First 1
+        Write-Ok "CUDA found at: $($latest.FullName)"
+        return
+    }
+
+    $nvidiaGpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "*NVIDIA*" }
+
+    if (-not $nvidiaGpu) {
+        Write-Skip "No NVIDIA GPU detected -- CUDA not needed (will use CPU for STT)"
+        return
+    }
+
+    Write-Host "  NVIDIA GPU detected: $($nvidiaGpu.Name)" -ForegroundColor Gray
+    Write-Host "  Installing CUDA Toolkit via winget..." -ForegroundColor Gray
+    Write-Host "  (This may take 10-15 minutes)" -ForegroundColor Gray
+
+    try {
+        winget install --id Nvidia.CUDA --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Host
+    } catch {}
+
+    Refresh-Path
+
+    if (Test-Command "nvcc") {
+        $version = (nvcc --version | Select-String "release") -replace ".*release ", "" -replace ",.*", ""
+        Write-Ok "CUDA installed: $version"
+    } else {
+        Write-Skip "CUDA installation could not be verified. Install manually from https://developer.nvidia.com/cuda-downloads"
+        Write-Host "  The app will still work using CPU (slower STT)." -ForegroundColor Yellow
+    }
+}
+
 function Install-PythonDeps {
     param([string]$PythonExe)
 
@@ -331,21 +400,29 @@ Write-Host ""
 Write-Host "  Install directory: $InstallDir" -ForegroundColor Gray
 Write-Host ""
 Write-Host "  This will install:" -ForegroundColor White
+Write-Host "    - Visual C++ Redistributable (runtime)" -ForegroundColor Gray
 Write-Host "    - Python 3.12 (if not present)" -ForegroundColor Gray
+Write-Host "    - CUDA Toolkit (if NVIDIA GPU detected)" -ForegroundColor Gray
 Write-Host "    - VB-Cable virtual audio driver" -ForegroundColor Gray
 Write-Host "    - Hi-Fi Cable virtual audio driver" -ForegroundColor Gray
 Write-Host "    - Python ML packages (STT, Translation, TTS)" -ForegroundColor Gray
 Write-Host "    - Whisper speech recognition model (~466MB)" -ForegroundColor Gray
 Write-Host ""
 
-# 1. Python runtime
+# 1. VC++ Redistributable (required for the exe)
+Install-VCRedist
+
+# 2. Python runtime
 $pythonExe = Install-Python
 
-# 2. Virtual audio drivers
+# 3. GPU acceleration
+Install-CUDA
+
+# 4. Virtual audio drivers
 Install-VBCable
 Install-HiFiCable
 
-# 3. Python ML packages (only if Python was installed)
+# 5. Python ML packages (only if Python was installed)
 if ($pythonExe) {
     Install-PythonDeps -PythonExe $pythonExe
 } else {
@@ -353,8 +430,29 @@ if ($pythonExe) {
     Write-Skip "Skipped (Python not available). Install Python and re-run this setup."
 }
 
-# 4. Whisper model
+# 6. Whisper model
 Install-WhisperModel
+
+# 7. Select GPU or CPU binary based on CUDA availability
+Write-Step "Selecting optimal binary"
+
+$gpuExe = Join-Path $InstallDir "meeting-translator-gpu.exe"
+$cpuExe = Join-Path $InstallDir "meeting-translator-cpu.exe"
+$mainExe = Join-Path $InstallDir "meeting-translator.exe"
+
+Refresh-Path
+$hasCudaToolkit = (Test-Command "nvcc") -or
+    (Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue)
+
+if ($hasCudaToolkit -and (Test-Path $gpuExe)) {
+    Copy-Item $gpuExe $mainExe -Force
+    Write-Ok "GPU binary selected (CUDA acceleration enabled)"
+} elseif (Test-Path $cpuExe) {
+    Copy-Item $cpuExe $mainExe -Force
+    Write-Ok "CPU binary selected"
+} else {
+    Write-Skip "Binary selection skipped (files not found)"
+}
 
 # --- Summary ---
 
@@ -366,13 +464,20 @@ Write-Host ""
 
 # Verify core dependencies
 $allOk = $true
+$vcCheck = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" -ErrorAction SilentlyContinue
 $pythonCheck = Get-PythonExe
+$cudaCheck = (Test-Command "nvcc") -or
+    (Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue)
+$nvidiaGpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like "*NVIDIA*" }
 $vbCableCheck = Get-PnpDevice -FriendlyName "*VB-Audio*" -ErrorAction SilentlyContinue
 $hifiCheck = Get-PnpDevice -FriendlyName "*Hi-Fi*" -ErrorAction SilentlyContinue
 $modelCheck = Test-Path (Join-Path $ModelsDir "ggml-small.bin")
 
 Write-Host "  Dependency Status:" -ForegroundColor White
+if ($vcCheck) { Write-Ok "Visual C++ Redistributable" } else { Write-Fail "VC++ Redistributable - NOT INSTALLED"; $allOk = $false }
 if ($pythonCheck) { Write-Ok "Python" } else { Write-Fail "Python - NOT INSTALLED"; $allOk = $false }
+if ($cudaCheck) { Write-Ok "CUDA" } elseif ($nvidiaGpu) { Write-Fail "CUDA - NOT INSTALLED (NVIDIA GPU detected)"; $allOk = $false } else { Write-Skip "CUDA - not needed (no NVIDIA GPU)" }
 if ($vbCableCheck) { Write-Ok "VB-Cable" } else { Write-Fail "VB-Cable - NOT INSTALLED"; $allOk = $false }
 if ($hifiCheck) { Write-Ok "Hi-Fi Cable" } else { Write-Fail "Hi-Fi Cable - NOT INSTALLED"; $allOk = $false }
 if ($modelCheck) { Write-Ok "Whisper Model" } else { Write-Fail "Whisper Model - NOT DOWNLOADED"; $allOk = $false }

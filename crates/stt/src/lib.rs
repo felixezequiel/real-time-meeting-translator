@@ -163,10 +163,56 @@ fn is_repetitive(text: &str) -> bool {
     false
 }
 
-/// Find GGML model file
+/// Check if CUDA is available by attempting to load ALL required NVIDIA DLLs.
+/// This avoids calling any CUDA functions (which would trigger delay-loaded
+/// DLL resolution and crash if CUDA Toolkit is not installed).
+/// Requires: NVIDIA driver (nvcuda.dll) + CUDA Toolkit (cublas, cudart).
+#[cfg(windows)]
+fn is_cuda_available() -> bool {
+    let required_dlls = [
+        "nvcuda.dll",      // NVIDIA driver
+        "cublas64_12.dll", // CUDA Toolkit
+        "cudart64_12.dll", // CUDA Runtime
+    ];
+
+    for dll_name in required_dlls {
+        let c_name = std::ffi::CString::new(dll_name).unwrap();
+        let handle = unsafe {
+            windows_sys::Win32::System::LibraryLoader::LoadLibraryA(c_name.as_ptr() as *const u8)
+        };
+        if handle.is_null() {
+            tracing::debug!("CUDA DLL not found: {} — falling back to CPU", dll_name);
+            return false;
+        }
+        unsafe { windows_sys::Win32::Foundation::FreeLibrary(handle); }
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn is_cuda_available() -> bool {
+    false
+}
+
+/// Find GGML model file.
+/// Searches in order:
+/// 1. `models/ggml-{name}.bin` relative to the executable directory (installed mode)
+/// 2. `models/ggml-{name}.bin` relative to the current working directory (dev mode)
+/// 3. Absolute/direct path (if `name` is already a full path)
 fn find_ggml_model(name: &str) -> Option<PathBuf> {
-    let ggml_path = PathBuf::from(format!("models/ggml-{}.bin", name));
-    if ggml_path.exists() { return Some(ggml_path); }
+    let ggml_filename = format!("models/ggml-{}.bin", name);
+
+    // 1. Relative to exe directory (installed mode)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let path = exe_dir.join(&ggml_filename);
+            if path.exists() { return Some(path); }
+        }
+    }
+    // 2. Relative to current working directory (dev mode / cargo run)
+    let path = PathBuf::from(&ggml_filename);
+    if path.exists() { return Some(path); }
+    // 3. Direct/absolute path
     let direct = PathBuf::from(name);
     if direct.exists() { return Some(direct); }
     None
@@ -183,9 +229,16 @@ impl PipelineStage for WhisperStt {
                 format!("GGML model not found for '{}'. Expected models/ggml-{}.bin", model_str, model_str)
             ))?;
 
-        tracing::info!("Loading whisper.cpp model: {}", ggml_path.display());
+        let gpu_available = is_cuda_available();
+        tracing::info!(
+            "Loading whisper.cpp model: {} (GPU: {})",
+            ggml_path.display(),
+            if gpu_available { "yes" } else { "no — using CPU" }
+        );
 
-        let params = WhisperContextParameters::default();
+        let mut params = WhisperContextParameters::default();
+        params.use_gpu(gpu_available);
+
         let path_str = ggml_path.to_string_lossy().to_string();
         let ctx = WhisperContext::new_with_params(&path_str, params)
             .map_err(|e| StageError::NotInitialized(format!("Failed to load model: {}", e)))?;
@@ -195,7 +248,7 @@ impl PipelineStage for WhisperStt {
         let state = ctx.create_state()
             .map_err(|e| StageError::NotInitialized(format!("Failed to create state: {}", e)))?;
 
-        tracing::info!("whisper.cpp ready (state created, GPU buffers allocated)");
+        tracing::info!("whisper.cpp ready (state created, {} backend)", if gpu_available { "GPU" } else { "CPU" });
         self.state = Some(Mutex::new(state));
         Ok(())
     }

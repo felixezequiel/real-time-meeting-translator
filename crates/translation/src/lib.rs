@@ -118,13 +118,16 @@ impl PipelineStage for OpusMtTranslator {
         let script_path = self.bridge_script_path.to_string_lossy().to_string();
         tracing::info!("Starting translation bridge: {}", script_path);
 
-        let mut child = Command::new("python")
+        let python = shared::find_python();
+        let mut child = Command::new(&python)
             .arg(&script_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| StageError::NotInitialized(format!("Failed to start Python: {}", e)))?;
+            .map_err(|e| StageError::NotInitialized(
+                format!("Failed to start Python (tried '{}'). Is Python 3.10+ installed and in PATH? Error: {}", python, e)
+            ))?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             StageError::NotInitialized("Failed to capture stdin".to_string())

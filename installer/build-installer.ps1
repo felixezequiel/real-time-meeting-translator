@@ -68,53 +68,75 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  [OK] cargo-wix installed" -ForegroundColor Green
 
-# CUDA detection
+# CUDA: disabled by default for portable MSI distribution.
+# CUDA DLLs (cublas64_12.dll, cudart64_12.dll) would be required at runtime,
+# making the installer fail on machines without CUDA Toolkit.
+# Pass -CudaEnabled $true to build with CUDA if targeting machines that have it.
 if ($null -eq $CudaEnabled) {
-    $CudaEnabled = (Get-Command "nvcc" -ErrorAction SilentlyContinue) -or
-        (Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+    $CudaEnabled = $false
 }
 if ($CudaEnabled) {
-    Write-Host "  [OK] CUDA detected - building with GPU support" -ForegroundColor Green
+    Write-Host "  [!!] Building WITH CUDA - exe will require CUDA Toolkit on target machine" -ForegroundColor Yellow
 } else {
-    Write-Host "  [--] No CUDA - building CPU-only" -ForegroundColor Yellow
+    Write-Host "  [OK] Building without CUDA - portable (works on any Windows 11)" -ForegroundColor Green
 }
 
 # --- Step 2: Build Rust project ---
+# Builds BOTH GPU (CUDA) and CPU binaries to target/dist/.
+# Uses a separate target directory to avoid overwriting the dev build.
+
+$DistTargetDir = Join-Path $ProjectRoot "target\dist"
+$DistReleaseDir = Join-Path $DistTargetDir "release"
+$GpuBinary = Join-Path $DistReleaseDir "meeting-translator-gpu.exe"
+$CpuBinary = Join-Path $DistReleaseDir "meeting-translator-cpu.exe"
 
 if (-not $SkipBuild) {
     Write-Host ""
-    Write-Host "=== Building Release Binary ===" -ForegroundColor Cyan
+    Write-Host "=== Building Release Binaries (for distribution) ===" -ForegroundColor Cyan
+    Write-Host "  Output: target\dist\release\ (does not affect your dev build)" -ForegroundColor Gray
 
     Push-Location $ProjectRoot
     try {
-        if ($CudaEnabled) {
-            Write-Host "  cargo build --release (with CUDA)..." -ForegroundColor Gray
-            cargo build --release 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
-        } else {
-            Write-Host "  cargo build --release --no-default-features..." -ForegroundColor Gray
-            cargo build --release --no-default-features 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
-        }
+        $env:CARGO_TARGET_DIR = $DistTargetDir
 
+        # Build GPU binary (with CUDA)
+        Write-Host ""
+        Write-Host "  [1/2] Building GPU binary (CUDA)..." -ForegroundColor Gray
+        cargo build --release 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "  [FAIL] Build failed" -ForegroundColor Red
+            Remove-Item Env:\CARGO_TARGET_DIR
+            Write-Host "  [FAIL] GPU build failed" -ForegroundColor Red
             exit 1
         }
+        $builtExe = Join-Path $DistReleaseDir "meeting-translator.exe"
+        Copy-Item $builtExe $GpuBinary -Force
+        $gpuSize = [math]::Round((Get-Item $GpuBinary).Length / 1MB, 1)
+        Write-Host "  [OK] GPU binary: meeting-translator-gpu.exe (${gpuSize}MB)" -ForegroundColor Green
 
-        $binaryPath = Join-Path $ProjectRoot "target\release\meeting-translator.exe"
-        if (Test-Path $binaryPath) {
-            $size = [math]::Round((Get-Item $binaryPath).Length / 1MB, 1)
-            Write-Host "  [OK] Built: meeting-translator.exe (${size}MB)" -ForegroundColor Green
+        # Build CPU binary (no CUDA)
+        Write-Host ""
+        Write-Host "  [2/2] Building CPU binary (portable)..." -ForegroundColor Gray
+        cargo build --release --no-default-features 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+        if ($LASTEXITCODE -ne 0) {
+            Remove-Item Env:\CARGO_TARGET_DIR
+            Write-Host "  [FAIL] CPU build failed" -ForegroundColor Red
+            exit 1
         }
+        Copy-Item $builtExe $CpuBinary -Force
+        $cpuSize = [math]::Round((Get-Item $CpuBinary).Length / 1MB, 1)
+        Write-Host "  [OK] CPU binary: meeting-translator-cpu.exe (${cpuSize}MB)" -ForegroundColor Green
+
+        Remove-Item Env:\CARGO_TARGET_DIR
     } finally {
+        Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
         Pop-Location
     }
 } else {
-    $binaryPath = Join-Path $ProjectRoot "target\release\meeting-translator.exe"
-    if (-not (Test-Path $binaryPath)) {
-        Write-Host "  [FAIL] Binary not found at $binaryPath. Run without -SkipBuild." -ForegroundColor Red
+    if (-not (Test-Path $GpuBinary) -or -not (Test-Path $CpuBinary)) {
+        Write-Host "  [FAIL] Binaries not found in $DistReleaseDir. Run without -SkipBuild." -ForegroundColor Red
         exit 1
     }
-    Write-Host "  [SKIP] Using existing binary" -ForegroundColor Yellow
+    Write-Host "  [SKIP] Using existing binaries" -ForegroundColor Yellow
 }
 
 # --- Step 3: Create MSI ---
@@ -135,7 +157,7 @@ try {
         Write-Host "  Using local WiX binaries: $wixBinPath" -ForegroundColor Gray
     }
 
-    $wixArgs = @("wix", "--no-build", "--nocapture", "-p", "meeting-translator") + $wixBinArg
+    $wixArgs = @("wix", "--no-build", "--nocapture", "-p", "meeting-translator", "--target-bin-dir", "$DistTargetDir\release") + $wixBinArg
     & cargo @wixArgs 2>&1 | ForEach-Object {
         Write-Host "  $_" -ForegroundColor Gray
     }

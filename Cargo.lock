@@ -2852,6 +2852,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -3032,6 +3033,7 @@ dependencies = [
  "tokio",
  "tracing",
  "whisper-rs",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

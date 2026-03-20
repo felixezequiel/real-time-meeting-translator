@@ -31,16 +31,33 @@ except ImportError:
 
 
 def add_cuda_dll_dirs():
-    """Add NVIDIA pip package DLL directories to search path."""
-    site_packages = os.path.join(
-        os.path.expanduser("~"), "AppData", "Roaming",
-        "Python", "Python312", "site-packages", "nvidia"
-    )
-    for subdir in ["cublas", "cudnn"]:
-        bin_dir = os.path.join(site_packages, subdir, "bin")
-        if os.path.isdir(bin_dir):
-            os.add_dll_directory(bin_dir)
-            os.environ["PATH"] = bin_dir + ";" + os.environ.get("PATH", "")
+    """Add NVIDIA pip package DLL directories to search path.
+
+    Searches all Python site-packages locations (user, system, virtualenv)
+    for nvidia CUDA DLLs instead of hardcoding a specific Python version.
+    """
+    import site
+
+    candidate_dirs = []
+
+    # All site-packages directories (covers system, user, and virtualenv installs)
+    for sp in site.getsitepackages() + [site.getusersitepackages()]:
+        nvidia_dir = os.path.join(sp, "nvidia")
+        if os.path.isdir(nvidia_dir):
+            candidate_dirs.append(nvidia_dir)
+
+    # Also check the running interpreter's own site-packages
+    for path_entry in sys.path:
+        nvidia_dir = os.path.join(path_entry, "nvidia")
+        if os.path.isdir(nvidia_dir) and nvidia_dir not in candidate_dirs:
+            candidate_dirs.append(nvidia_dir)
+
+    for nvidia_dir in candidate_dirs:
+        for subdir in ["cublas", "cudnn", "cuda_runtime", "cufft", "curand"]:
+            bin_dir = os.path.join(nvidia_dir, subdir, "bin")
+            if os.path.isdir(bin_dir):
+                os.add_dll_directory(bin_dir)
+                os.environ["PATH"] = bin_dir + ";" + os.environ.get("PATH", "")
 
 
 def load_model(model_name):
