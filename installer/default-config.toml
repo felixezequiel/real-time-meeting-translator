@@ -1,0 +1,7 @@
+speaker_source_language = "English"
+speaker_target_language = "Portuguese"
+mic_source_language = "Portuguese"
+mic_target_language = "English"
+chunk_duration_ms = 500
+whisper_model = "small"
+tts_speed = 1.1

@@ -1,0 +1,254 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  WiX v3 source for Meeting Translator MSI installer.
+  Build with: cargo wix -e WixUtilExtension
+  Or manually: candle.exe + light.exe (see installer/build-installer.ps1)
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'
+     xmlns:util='http://schemas.microsoft.com/wix/UtilExtension'>
+
+  <?define ProductVersion = "0.1.0" ?>
+  <?define Manufacturer = "Meeting Translator" ?>
+  <?define ProductName = "Meeting Translator" ?>
+  <?define UpgradeCode = "{8F4E9A2B-3C5D-4E6F-B7A8-9D0E1F2A3B4C}" ?>
+
+  <Product Id='*'
+           Name='$(var.ProductName)'
+           Version='$(var.ProductVersion)'
+           Manufacturer='$(var.Manufacturer)'
+           Language='1033'
+           Codepage='1252'
+           UpgradeCode='$(var.UpgradeCode)'>
+
+    <Package InstallerVersion='500'
+             Compressed='yes'
+             InstallScope='perMachine'
+             Platform='x64'
+             Description='Real-Time Meeting Translator — translates audio between English and Portuguese in real-time'
+             Comments='Requires Windows 11. Dependencies installed via post-install setup.' />
+
+    <!-- Upgrade handling: remove older versions, block downgrades -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed."
+                  AllowSameVersionUpgrades='yes' />
+
+    <!-- Embed all files in a single compressed cabinet -->
+    <MediaTemplate EmbedCab='yes' CompressionLevel='high' />
+
+    <!-- ================================================================== -->
+    <!--  UI Configuration                                                   -->
+    <!-- ================================================================== -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <UIRef Id="WixUI_InstallDir" />
+    <WixVariable Id="WixUILicenseRtf" Value="wix\License.rtf" />
+
+    <!-- Exit dialog checkbox: "Run dependency setup" (checked by default) -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT"
+              Value="Install dependencies now (Python, audio drivers, ML models)" />
+
+    <!-- WixShellExec target: the batch file that launches dependency setup -->
+    <Property Id="WixShellExecTarget" Value="[#RunSetupBat]" />
+    <CustomAction Id="LaunchSetup"
+                  BinaryKey="WixCA"
+                  DllEntry="WixShellExec"
+                  Impersonate="yes" />
+
+    <!-- Trigger setup when user clicks "Finish" with the checkbox checked -->
+    <UI>
+      <Publish Dialog="ExitDialog"
+               Control="Finish"
+               Event="DoAction"
+               Value="LaunchSetup">
+        WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed
+      </Publish>
+    </UI>
+
+    <!-- ================================================================== -->
+    <!--  Directory Structure                                                -->
+    <!-- ================================================================== -->
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <Directory Id='ProgramFiles64Folder'>
+        <Directory Id='INSTALLFOLDER' Name='Meeting Translator'>
+          <Directory Id='ScriptsFolder' Name='scripts' />
+          <Directory Id='ModelsFolder' Name='models' />
+        </Directory>
+      </Directory>
+      <Directory Id='ProgramMenuFolder'>
+        <Directory Id='ApplicationProgramsFolder' Name='Meeting Translator' />
+      </Directory>
+      <Directory Id="DesktopFolder" Name="Desktop" />
+    </Directory>
+
+    <!-- ================================================================== -->
+    <!--  Components: Application Files                                      -->
+    <!-- ================================================================== -->
+
+    <DirectoryRef Id='INSTALLFOLDER'>
+      <!-- Main executable -->
+      <Component Id='MainExecutable' Guid='*' Win64='yes'>
+        <File Id='MeetingTranslatorExe'
+              Source='target\release\meeting-translator.exe'
+              KeyPath='yes' />
+      </Component>
+
+      <!-- Default config.toml (NeverOverwrite: preserves user changes on upgrade) -->
+      <Component Id='DefaultConfig' Guid='{B7E3F2A1-4D5C-6E7F-8A9B-0C1D2E3F4A5B}' Win64='yes' NeverOverwrite='yes'>
+        <File Id='ConfigToml'
+              Source='installer\default-config.toml'
+              Name='config.toml'
+              KeyPath='yes' />
+      </Component>
+
+      <!-- Post-install dependency setup script -->
+      <Component Id='SetupDepsScript' Guid='*' Win64='yes'>
+        <File Id='SetupDependenciesPs1'
+              Source='installer\setup-dependencies.ps1'
+              KeyPath='yes' />
+      </Component>
+
+      <!-- Batch wrapper for setup (visible console window) -->
+      <Component Id='RunSetupBatch' Guid='*' Win64='yes'>
+        <File Id='RunSetupBat'
+              Source='installer\run-setup.bat'
+              KeyPath='yes' />
+      </Component>
+
+    </DirectoryRef>
+
+    <!-- ================================================================== -->
+    <!--  Components: Python Scripts                                         -->
+    <!-- ================================================================== -->
+
+    <DirectoryRef Id='ScriptsFolder'>
+      <Component Id='SttBridge' Guid='*' Win64='yes'>
+        <File Id='SttBridgePy' Source='scripts\stt_bridge.py' KeyPath='yes' />
+      </Component>
+
+      <Component Id='TtsBridge' Guid='*' Win64='yes'>
+        <File Id='TtsBridgePy' Source='scripts\tts_bridge.py' KeyPath='yes' />
+      </Component>
+
+      <Component Id='TranslationBridge' Guid='*' Win64='yes'>
+        <File Id='TranslationBridgePy' Source='scripts\translation_bridge.py' KeyPath='yes' />
+      </Component>
+
+      <Component Id='AudioSwitch' Guid='*' Win64='yes'>
+        <File Id='AudioSwitchPs1' Source='scripts\audio_switch.ps1' KeyPath='yes' />
+      </Component>
+
+      <Component Id='PipRequirements' Guid='*' Win64='yes'>
+        <File Id='RequirementsTxt' Source='scripts\requirements.txt' KeyPath='yes' />
+      </Component>
+    </DirectoryRef>
+
+    <!-- ================================================================== -->
+    <!--  Components: Models Directory (empty — downloaded during setup)      -->
+    <!-- ================================================================== -->
+
+    <DirectoryRef Id='ModelsFolder'>
+      <Component Id='ModelsDir' Guid='{C1A2B3C4-D5E6-F7A8-B9C0-D1E2F3A4B5C6}' Win64='yes'>
+        <CreateFolder />
+      </Component>
+    </DirectoryRef>
+
+    <!-- ================================================================== -->
+    <!--  Components: Directory Permissions                                   -->
+    <!--  Allow Users to write config.toml and download models               -->
+    <!-- ================================================================== -->
+
+    <DirectoryRef Id='INSTALLFOLDER'>
+      <Component Id='InstallDirPermissions' Guid='{D2B3C4D5-E6F7-A8B9-C0D1-E2F3A4B5C6D7}' Win64='yes'>
+        <CreateFolder>
+          <util:PermissionEx User='Users' GenericAll='yes' />
+        </CreateFolder>
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id='ModelsFolder'>
+      <Component Id='ModelsDirPermissions' Guid='{E3C4D5E6-F7A8-B9C0-D1E2-F3A4B5C6D7E8}' Win64='yes'>
+        <CreateFolder>
+          <util:PermissionEx User='Users' GenericAll='yes' />
+        </CreateFolder>
+      </Component>
+    </DirectoryRef>
+
+    <!-- ================================================================== -->
+    <!--  Components: Shortcuts                                              -->
+    <!-- ================================================================== -->
+
+    <DirectoryRef Id='ApplicationProgramsFolder'>
+      <Component Id='StartMenuShortcuts' Guid='*'>
+        <!-- Main app shortcut -->
+        <Shortcut Id='AppShortcut'
+                  Name='Meeting Translator'
+                  Description='Real-Time Meeting Translator'
+                  Target='[INSTALLFOLDER]meeting-translator.exe'
+                  WorkingDirectory='INSTALLFOLDER'
+                  Icon='AppIcon.ico' />
+
+        <!-- Setup dependencies shortcut -->
+        <Shortcut Id='SetupShortcut'
+                  Name='Setup Dependencies'
+                  Description='Install or update Meeting Translator dependencies'
+                  Target='[INSTALLFOLDER]run-setup.bat'
+                  WorkingDirectory='INSTALLFOLDER' />
+
+        <!-- Cleanup on uninstall -->
+        <RemoveFolder Id='RemoveAppProgramsFolder' On='uninstall' />
+        <RegistryValue Root='HKCU'
+                       Key='Software\MeetingTranslator'
+                       Name='installed'
+                       Type='integer'
+                       Value='1'
+                       KeyPath='yes' />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Desktop shortcut -->
+    <DirectoryRef Id='DesktopFolder'>
+      <Component Id='DesktopShortcut' Guid='*'>
+        <Shortcut Id='DesktopAppShortcut'
+                  Name='Meeting Translator'
+                  Description='Real-Time Meeting Translator'
+                  Target='[INSTALLFOLDER]meeting-translator.exe'
+                  WorkingDirectory='INSTALLFOLDER'
+                  Icon='AppIcon.ico' />
+        <RegistryValue Root='HKCU'
+                       Key='Software\MeetingTranslator'
+                       Name='desktop_shortcut'
+                       Type='integer'
+                       Value='1'
+                       KeyPath='yes' />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Icon for shortcuts (uses the exe's embedded icon) -->
+    <Icon Id='AppIcon.ico' SourceFile='target\release\meeting-translator.exe' />
+    <Property Id='ARPPRODUCTICON' Value='AppIcon.ico' />
+
+    <!-- ================================================================== -->
+    <!--  Feature: Complete Installation                                     -->
+    <!-- ================================================================== -->
+
+    <Feature Id='Complete' Level='1'
+             Title='Meeting Translator'
+             Description='Real-Time Meeting Translator application and scripts'>
+      <ComponentRef Id='MainExecutable' />
+      <ComponentRef Id='DefaultConfig' />
+      <ComponentRef Id='SetupDepsScript' />
+      <ComponentRef Id='RunSetupBatch' />
+
+      <ComponentRef Id='SttBridge' />
+      <ComponentRef Id='TtsBridge' />
+      <ComponentRef Id='TranslationBridge' />
+      <ComponentRef Id='AudioSwitch' />
+      <ComponentRef Id='PipRequirements' />
+      <ComponentRef Id='ModelsDir' />
+      <ComponentRef Id='InstallDirPermissions' />
+      <ComponentRef Id='ModelsDirPermissions' />
+      <ComponentRef Id='StartMenuShortcuts' />
+      <ComponentRef Id='DesktopShortcut' />
+    </Feature>
+
+  </Product>
+</Wix>
