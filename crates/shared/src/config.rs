@@ -63,9 +63,12 @@ impl PipelineConfig {
         self.chunk_duration_ms as f32 / 1000.0
     }
 
-    /// Returns the virtual mic device name, defaulting to "CABLE Input".
+    /// Returns the virtual mic device name, defaulting to "Hi-Fi Cable".
+    /// Uses Hi-Fi Cable (separate from VB-Cable used for loopback) to avoid
+    /// audio contamination between speaker and mic pipelines.
+    /// Substring match: "Hi-Fi Cable" matches "Alto-falantes (VB-Audio Hi-Fi Cable)".
     pub fn effective_virtual_mic(&self) -> &str {
-        self.virtual_mic_device.as_deref().unwrap_or("CABLE Input")
+        self.virtual_mic_device.as_deref().unwrap_or("Hi-Fi Cable")
     }
 }
 
@@ -101,9 +104,9 @@ mod tests {
     }
 
     #[test]
-    fn effective_virtual_mic_defaults_to_cable_input() {
+    fn effective_virtual_mic_defaults_to_hifi_cable() {
         let config = PipelineConfig::default();
-        assert_eq!(config.effective_virtual_mic(), "CABLE Input");
+        assert_eq!(config.effective_virtual_mic(), "Hi-Fi Cable");
     }
 
     #[test]

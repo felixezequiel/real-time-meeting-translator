@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet("get-default", "set-default", "list")]
+    [ValidateSet("get-default", "set-default", "list", "get-default-input", "set-default-input", "list-inputs")]
     [string]$Action,
 
     [string]$DeviceName
@@ -151,6 +151,52 @@ public static class AudioSwitcher {
         }
         return names;
     }
+
+    public static string GetDefaultInputName() {
+        var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+        IMMDevice device;
+        enumerator.GetDefaultAudioEndpoint(EDataFlow.eCapture, ERole.eConsole, out device);
+        return GetDeviceName(device);
+    }
+
+    public static void SetDefaultInputByName(string targetName) {
+        var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+        IMMDeviceCollection collection;
+        enumerator.EnumAudioEndpoints(EDataFlow.eCapture, (uint)DEVICE_STATE.ACTIVE, out collection);
+        int count;
+        collection.GetCount(out count);
+
+        string targetLower = targetName.ToLowerInvariant();
+        for (int i = 0; i < count; i++) {
+            IMMDevice device;
+            collection.Item(i, out device);
+            string name = GetDeviceName(device);
+            if (name.ToLowerInvariant().Contains(targetLower)) {
+                string id = GetDeviceId(device);
+                var config = (IPolicyConfig)new PolicyConfigClient();
+                config.SetDefaultEndpoint(id, (int)ERole.eConsole);
+                config.SetDefaultEndpoint(id, (int)ERole.eMultimedia);
+                config.SetDefaultEndpoint(id, (int)ERole.eCommunications);
+                return;
+            }
+        }
+        throw new Exception("Input device not found: " + targetName);
+    }
+
+    public static string[] ListInputDevices() {
+        var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+        IMMDeviceCollection collection;
+        enumerator.EnumAudioEndpoints(EDataFlow.eCapture, (uint)DEVICE_STATE.ACTIVE, out collection);
+        int count;
+        collection.GetCount(out count);
+        var names = new string[count];
+        for (int i = 0; i < count; i++) {
+            IMMDevice device;
+            collection.Item(i, out device);
+            names[i] = GetDeviceName(device);
+        }
+        return names;
+    }
 }
 "@ -ErrorAction Stop
 
@@ -170,5 +216,21 @@ switch ($Action) {
     }
     "list" {
         [AudioSwitcher]::ListOutputDevices()
+    }
+    "get-default-input" {
+        [AudioSwitcher]::GetDefaultInputName()
+    }
+    "set-default-input" {
+        if (-not $DeviceName) {
+            Write-Error "DeviceName required for set-default-input"
+            exit 1
+        }
+        $previous = [AudioSwitcher]::GetDefaultInputName()
+        [AudioSwitcher]::SetDefaultInputByName($DeviceName)
+        # Return previous input device name so caller can restore it
+        $previous
+    }
+    "list-inputs" {
+        [AudioSwitcher]::ListInputDevices()
     }
 }

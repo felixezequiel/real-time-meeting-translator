@@ -10,7 +10,7 @@
     - Whisper GGML models
     - Rust build artifacts (target/ directory)
     - Generated .cargo/config.toml
-    - Optionally: VB-Cable, CUDA, LLVM, CMake, Rust toolchain
+    - Optionally: VB-Cable, Hi-Fi Cable, CUDA, LLVM, CMake, Rust toolchain
 
 .NOTES
     Run as Administrator for full cleanup.

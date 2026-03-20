@@ -1,6 +1,5 @@
 use anyhow::Result;
 use shared::{Language, PipelineCommand, PipelineConfig, PipelineStage, TranslationDirection};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -15,7 +14,15 @@ use translation::OpusMtTranslator;
 use tts::PiperTts;
 use ui::{TrayAction, TrayUi};
 
-const VIRTUAL_CABLE_NAME: &str = "CABLE Input";
+/// VB-Cable A: used as system default output so meeting audio flows here.
+/// Loopback captures from this device (meeting audio only).
+/// Uses "VB-Audio Virtual Cable" (not "CABLE Input") to avoid matching
+/// "Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)" via substring search.
+const VIRTUAL_CABLE_NAME: &str = "VB-Audio Virtual Cable";
+
+/// Hi-Fi Cable: capture endpoint set as system default microphone.
+/// Meeting apps read translated mic audio from this device.
+const HIFI_CABLE_OUTPUT_NAME: &str = "Hi-Fi Cable";
 
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -116,8 +123,9 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
 
     // ── Main event loop ────────────────────────────────────────────────────────
     let mut is_active = false;
-    // Saved default device name — restored when the user presses Stop or quits.
-    let mut saved_default_device: Option<String> = None;
+    // Saved default device names — restored when the user presses Stop or quits.
+    let mut saved_default_output: Option<String> = None;
+    let mut saved_default_input: Option<String> = None;
 
     loop {
         if let Some(action) = tray.process_events() {
@@ -125,9 +133,8 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                 TrayAction::Command(cmd) => {
                     match cmd {
                         PipelineCommand::Start => {
-                            // Switch system default to VB-Cable so meetings output there.
-                            // Loopback captures from CABLE (meeting audio only),
-                            // TTS plays to user's headphones (no feedback loop).
+                            // Switch system default OUTPUT to VB-Cable so meetings output there.
+                            // Loopback captures from CABLE (meeting audio only).
                             match audio_switch::set_default_output_device(
                                 &audio_switch_script, VIRTUAL_CABLE_NAME,
                             ) {
@@ -136,13 +143,29 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                                         "Switched default output: \"{}\" → \"{}\"",
                                         previous, VIRTUAL_CABLE_NAME,
                                     );
-                                    saved_default_device = Some(previous);
-                                    // Loopback now captures from CABLE (only meeting audio)
+                                    saved_default_output = Some(previous);
                                     config.loopback_device = Some(VIRTUAL_CABLE_NAME.to_string());
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Could not switch audio device: {}. \
+                                    tracing::warn!("Could not switch output device: {}. \
                                         Falling back to shared device (may cause echo).", e);
+                                }
+                            }
+                            // Switch system default INPUT to Hi-Fi Cable so meeting
+                            // apps read translated mic audio from it.
+                            match audio_switch::set_default_input_device(
+                                &audio_switch_script, HIFI_CABLE_OUTPUT_NAME,
+                            ) {
+                                Ok(previous) => {
+                                    tracing::info!(
+                                        "Switched default input: \"{}\" → \"{}\"",
+                                        previous, HIFI_CABLE_OUTPUT_NAME,
+                                    );
+                                    saved_default_input = Some(previous);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Could not switch input device: {}. \
+                                        Set your meeting app mic to Hi-Fi Cable manually.", e);
                                 }
                             }
                             // Recreate pipelines with the new device routing
@@ -155,8 +178,9 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                             is_active = false;
                             tray.set_active(false);
                             pipelines.send_command(PipelineCommand::Stop).await;
-                            // Restore original default output device
-                            restore_default_device(&audio_switch_script, &mut saved_default_device);
+                            // Restore original default devices
+                            restore_default_output(&audio_switch_script, &mut saved_default_output);
+                            restore_default_input(&audio_switch_script, &mut saved_default_input);
                         }
                     }
                 }
@@ -205,8 +229,9 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
 
                 TrayAction::Quit => {
                     tracing::info!("Shutting down…");
-                    // Restore original default before exiting
-                    restore_default_device(&audio_switch_script, &mut saved_default_device);
+                    // Restore original defaults before exiting
+                    restore_default_output(&audio_switch_script, &mut saved_default_output);
+                    restore_default_input(&audio_switch_script, &mut saved_default_input);
                     break;
                 }
             }
@@ -323,37 +348,27 @@ async fn start_pipelines(
 
     // When loopback is on VB-Cable (different from headphones), create a passthrough
     // that forwards raw meeting audio to headphones so the user can hear it.
+    // Mic TTS goes to a separate Hi-Fi Cable, so no suppression is needed —
+    // the loopback on VB-Cable only ever sees meeting audio.
     let loopback_is_cable = config.loopback_device.as_deref()
         .map(|d| d.to_lowercase().contains("cable"))
         .unwrap_or(false);
 
-    // Flag: set by mic TTS playback while it has audio in its buffer.
-    // The passthrough checks this to avoid forwarding mic TTS back to headphones.
-    let mic_tts_playing = Arc::new(AtomicBool::new(false));
-
     let (speaker_capture, passthrough_stream) = if loopback_is_cable {
         // Broadcast: loopback audio (16kHz mono) → pipeline + passthrough to headphones.
-        // The passthrough needs upsampling to 48kHz for headphone playback.
-        // Passthrough is suppressed while mic TTS is playing (prevents self-hearing).
         let (broadcast_tx, mut broadcast_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
         let (passthrough_tx, passthrough_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
         let pipeline_tx = spk_audio_tx;
         let passthrough_sample_rate: u32 = 48_000;
-        let mic_playing = Arc::clone(&mic_tts_playing);
         tokio::spawn(async move {
             while let Some(chunk) = broadcast_rx.recv().await {
-                // Always forward to pipeline — the shared echo buffer will
-                // detect and discard any mic TTS that gets recaptured.
                 let _ = pipeline_tx.send(chunk.clone());
-                // Only passthrough to headphones if mic TTS is not playing.
-                if !mic_playing.load(Ordering::Acquire) {
-                    if let Ok(upsampled) = audio::resampler::resample_mono(
-                        &chunk.samples, chunk.sample_rate, passthrough_sample_rate,
-                    ) {
-                        let _ = passthrough_tx.send(shared::AudioChunk::new(
-                            upsampled, passthrough_sample_rate, 1,
-                        ));
-                    }
+                if let Ok(upsampled) = audio::resampler::resample_mono(
+                    &chunk.samples, chunk.sample_rate, passthrough_sample_rate,
+                ) {
+                    let _ = passthrough_tx.send(shared::AudioChunk::new(
+                        upsampled, passthrough_sample_rate, 1,
+                    ));
                 }
             }
         });
@@ -385,7 +400,7 @@ async fn start_pipelines(
         .map_err(|e| anyhow::anyhow!("Speaker playback failed: {}", e))?;
 
     let speaker_pipeline = SpeakerPipeline::new(
-        "Speaker", spk_stt, spk_trans, spk_tts, spk_source_lang, 1.5, echo_buffer.clone(),
+        "Speaker", spk_stt, spk_trans, spk_tts, spk_source_lang, 2.0, echo_buffer.clone(),
     );
     tokio::spawn(async move {
         speaker_pipeline.run(spk_audio_rx, spk_out_tx, spk_cmd_rx, spk_metrics_tx).await;
@@ -420,14 +435,14 @@ async fn start_pipelines(
         .unwrap_or_else(|_| "Unknown".to_string());
     tracing::info!("Mic TTS output to: {}", virtual_mic_name);
 
-    let mic_playback_node = AudioPlayback::with_playing_flag(virtual_mic_device, mic_tts_playing);
+    let mic_playback_node = AudioPlayback::new(virtual_mic_device);
     let mic_playback = mic_playback_node
         .start(mic_out_rx)
         .map_err(|e| anyhow::anyhow!("Mic playback failed: {}", e))?;
 
-    // Mic pipeline: 1.5s flush — match speaker pipeline
+    // Mic pipeline: 2.0s flush — match speaker pipeline
     let mic_pipeline = SpeakerPipeline::new(
-        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, 1.5, echo_buffer,
+        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, 2.0, echo_buffer,
     );
     tokio::spawn(async move {
         mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
@@ -537,11 +552,21 @@ fn list_input_device_names() -> Vec<String> {
 // ─── Audio device switching ──────────────────────────────────────────────────
 
 /// Restore the Windows default output device to what the user had before.
-fn restore_default_device(script_path: &std::path::Path, saved: &mut Option<String>) {
+fn restore_default_output(script_path: &std::path::Path, saved: &mut Option<String>) {
     if let Some(device_name) = saved.take() {
         match audio_switch::set_default_output_device(script_path, &device_name) {
             Ok(_) => tracing::info!("Restored default output: \"{}\"", device_name),
             Err(e) => tracing::warn!("Failed to restore default output: {}", e),
+        }
+    }
+}
+
+/// Restore the Windows default input (microphone) device to what the user had before.
+fn restore_default_input(script_path: &std::path::Path, saved: &mut Option<String>) {
+    if let Some(device_name) = saved.take() {
+        match audio_switch::set_default_input_device(script_path, &device_name) {
+            Ok(_) => tracing::info!("Restored default input: \"{}\"", device_name),
+            Err(e) => tracing::warn!("Failed to restore default input: {}", e),
         }
     }
 }

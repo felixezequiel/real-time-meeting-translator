@@ -11,7 +11,8 @@
     - CUDA Toolkit (for GPU-accelerated Whisper inference)
     - Rust toolchain (via rustup)
     - Python 3.12+ (via winget)
-    - VB-Cable virtual audio driver
+    - VB-Cable virtual audio driver (meeting audio loopback)
+    - Hi-Fi Cable virtual audio driver (mic TTS output)
     - Python packages (faster-whisper, transformers, piper-tts, etc.)
     - Whisper GGML model download
     - Auto-generates .cargo/config.toml with correct MSVC paths
@@ -268,7 +269,7 @@ function Install-CUDA {
         Where-Object { $_.Name -like "*NVIDIA*" }
 
     if (-not $nvidiaGpu) {
-        Write-Skip "No NVIDIA GPU detected — CUDA not needed (will use CPU for STT)"
+        Write-Skip "No NVIDIA GPU detected -- CUDA not needed (will use CPU for STT)"
         return
     }
 
@@ -300,7 +301,7 @@ function Install-Rust {
         $currentVersion = (rustc --version) -replace "rustc ", ""
         Write-Ok "Rust already installed: $currentVersion"
 
-        # Ensure MSVC target is the default (not GNU — GNU causes dlltool.exe errors)
+        # Ensure MSVC target is the default (not GNU -- GNU causes dlltool.exe errors)
         $defaultHost = & rustup show | Select-String "Default host"
         if ($defaultHost -and $defaultHost -notlike "*msvc*") {
             Write-Host "  Switching default toolchain to MSVC..." -ForegroundColor Gray
@@ -417,6 +418,56 @@ function Install-VBCable {
     }
 }
 
+function Install-HiFiCable {
+    Write-Step "Hi-Fi Cable Virtual Audio Driver (second virtual cable)"
+
+    # Check if Hi-Fi Cable is already installed
+    $hifiDevice = Get-PnpDevice -FriendlyName "*Hi-Fi*" -ErrorAction SilentlyContinue
+    if ($hifiDevice) {
+        Write-Ok "Hi-Fi Cable already installed"
+        return
+    }
+
+    $hifiZip = Join-Path $env:TEMP "HiFiCable.zip"
+    $hifiDir = Join-Path $env:TEMP "HiFiCable"
+
+    Write-Host "  Downloading Hi-Fi Cable & ASIO Bridge..." -ForegroundColor Gray
+    $downloadUrl = "https://download.vb-audio.com/Download_CABLE/HiFiCableAsioBridgeSetup_v1007.zip"
+
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $hifiZip -UseBasicParsing
+
+        if (Test-Path $hifiDir) { Remove-Item $hifiDir -Recurse -Force }
+        Expand-Archive -Path $hifiZip -DestinationPath $hifiDir -Force
+
+        $setupExe = Get-ChildItem -Path $hifiDir -Filter "*.exe" -Recurse |
+            Where-Object { $_.Name -like "*Setup*" -or $_.Name -like "*HIFI*" } |
+            Select-Object -First 1
+
+        if ($setupExe) {
+            Write-Host "  Installing Hi-Fi Cable driver..." -ForegroundColor Gray
+            Start-Process -FilePath $setupExe.FullName -ArgumentList "/i" -Wait -Verb RunAs 2>$null
+
+            Start-Sleep -Seconds 3
+            $hifiDevice = Get-PnpDevice -FriendlyName "*Hi-Fi*" -ErrorAction SilentlyContinue
+            if ($hifiDevice) {
+                Write-Ok "Hi-Fi Cable installed successfully"
+            } else {
+                Write-Skip "Hi-Fi Cable installer ran but device not detected. You may need to restart."
+            }
+        } else {
+            Write-Fail "Hi-Fi Cable installer not found in downloaded archive"
+            Write-Host "  Please install manually from: https://vb-audio.com/Cable/" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Fail "Failed to download Hi-Fi Cable: $_"
+        Write-Host "  Please install manually from: https://vb-audio.com/Cable/" -ForegroundColor Yellow
+    } finally {
+        Remove-Item $hifiZip -Force -ErrorAction SilentlyContinue
+        Remove-Item $hifiDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-PythonDeps {
     param([string]$PythonExe)
 
@@ -515,10 +566,10 @@ function Configure-CargoConfig {
         Pop-Location
 
         # If cargo can at least parse the config (even if build fails for other reasons),
-        # the config is fine — don't overwrite it
+        # the config is fine -- don't overwrite it
         $configBroken = $checkOutput | Select-String "could not parse TOML configuration"
         if (-not $configBroken) {
-            Write-Ok ".cargo/config.toml is valid — keeping existing"
+            Write-Ok ".cargo/config.toml is valid -- keeping existing"
             return
         }
         Write-Host "  Existing config is broken, regenerating..." -ForegroundColor Yellow
@@ -528,12 +579,12 @@ function Configure-CargoConfig {
     $ucrtInclude = Find-UcrtIncludePath
 
     if (-not $msvcInclude) {
-        Write-Skip "MSVC include path not found — skipping .cargo/config.toml generation"
+        Write-Skip "MSVC include path not found -- skipping .cargo/config.toml generation"
         return
     }
 
     if (-not $ucrtInclude) {
-        Write-Skip "UCRT include path not found — skipping .cargo/config.toml generation"
+        Write-Skip "UCRT include path not found -- skipping .cargo/config.toml generation"
         return
     }
 
@@ -612,10 +663,10 @@ function Build-RustProject {
     $hasCuda = (Test-Command "nvcc") -or
         (Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
     if ($hasCuda) {
-        Write-Host "  CUDA detected — building with GPU acceleration" -ForegroundColor Green
+        Write-Host "  CUDA detected -- building with GPU acceleration" -ForegroundColor Green
         $cargoArgs = @("build", "--release")
     } else {
-        Write-Host "  No CUDA — building CPU-only (STT will be slower)" -ForegroundColor Yellow
+        Write-Host "  No CUDA -- building CPU-only (STT will be slower)" -ForegroundColor Yellow
         $cargoArgs = @("build", "--release", "--no-default-features")
     }
 
@@ -720,8 +771,9 @@ Install-CUDA
 Install-Rust
 $pythonExe = Install-Python
 
-# 4. Audio driver
+# 4. Audio drivers (two virtual cables for pipeline isolation)
 Install-VBCable
+Install-HiFiCable
 
 # 5. Dependencies
 Install-PythonDeps -PythonExe $pythonExe

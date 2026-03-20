@@ -25,11 +25,11 @@ const MAX_CONCURRENT_TRANSLATE: usize = 3;
 
 /// Minimum word count before sending accumulated text to translation.
 /// Gives the translator enough context for coherent output.
-const MIN_WORDS_FOR_TRANSLATE: usize = 5;
+const MIN_WORDS_FOR_TRANSLATE: usize = 8;
 
 /// Maximum time (in seconds) to hold accumulated text before force-flushing,
 /// even if we haven't reached MIN_WORDS_FOR_TRANSLATE or punctuation.
-const MAX_HOLD_SECONDS: f32 = 2.0;
+const MAX_HOLD_SECONDS: f32 = 3.0;
 
 /// How long (seconds) to keep recent translations for echo detection.
 /// STT feedback typically appears within 2-4 seconds of TTS playback.
@@ -561,13 +561,13 @@ mod tests {
 
     #[test]
     fn min_words_is_reasonable() {
-        assert!(MIN_WORDS_FOR_TRANSLATE >= 3);
+        assert!(MIN_WORDS_FOR_TRANSLATE >= 5);
         assert!(MIN_WORDS_FOR_TRANSLATE <= 15);
     }
 
     #[test]
     fn max_hold_seconds_caps_delay() {
-        assert!(MAX_HOLD_SECONDS >= 1.0);
+        assert!(MAX_HOLD_SECONDS >= 2.0);
         assert!(MAX_HOLD_SECONDS <= 5.0);
     }
 
