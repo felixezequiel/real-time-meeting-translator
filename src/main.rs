@@ -6,9 +6,8 @@ use tokio::sync::mpsc;
 use audio::audio_switch;
 use audio::capture::AudioCapture;
 use audio::device;
-use audio::ducking::{AudioDucker, DEFAULT_DUCK_VOLUME};
 use audio::loopback::LoopbackCapture;
-use audio::playback::AudioPlayback;
+use audio::playback::{AudioPlayback, MixerPlayback};
 use pipeline::SpeakerPipeline;
 use stt::WhisperStt;
 use translation::OpusMtTranslator;
@@ -75,19 +74,13 @@ struct LoadedModels {
 struct ActivePipelines {
     /// Keeps the speaker loopback capture alive
     _speaker_capture: cpal::Stream,
-    /// Keeps the speaker TTS playback alive
-    _speaker_playback: cpal::Stream,
-    /// Passthrough: forwards raw loopback audio to headphones so the user
-    /// can hear the original meeting audio (needed because system default
-    /// is redirected to VB-Cable while active).
-    _speaker_passthrough: Option<cpal::Stream>,
+    /// Mixer output: passthrough (raw meeting audio) + TTS in one stream,
+    /// with smooth ducking applied to the passthrough while TTS speaks.
+    _speaker_mixer: cpal::Stream,
     /// Keeps the mic capture alive
     _mic_capture: cpal::Stream,
     /// Keeps the mic TTS playback alive
     _mic_playback: cpal::Stream,
-    /// WASAPI audio ducker — lowers other apps' volume while TTS plays.
-    /// Dropping this restores every volume it changed.
-    _ducker: AudioDucker,
     /// Send Start/Stop to the speaker pipeline task
     speaker_cmd_tx: mpsc::Sender<PipelineCommand>,
     /// Send Start/Stop to the mic pipeline task
@@ -350,69 +343,40 @@ async fn start_pipelines(
         .unwrap_or_else(|_| "Unknown".to_string());
     tracing::info!("Speaker TTS output to: {}", headphones_name);
 
-    // When loopback is on VB-Cable (different from headphones), create a passthrough
-    // that forwards raw meeting audio to headphones so the user can hear it.
-    // Mic TTS goes to a separate Hi-Fi Cable, so no suppression is needed —
-    // the loopback on VB-Cable only ever sees meeting audio.
+    // When loopback is on VB-Cable (different from headphones), split the
+    // loopback into two streams: the existing 16 kHz denoised path for STT
+    // and a pristine native-rate pre-denoise path for the mixer passthrough.
+    // Otherwise (shared-device setup), no passthrough — user hears the meeting
+    // directly on the same device.
     let loopback_is_cable = config.loopback_device.as_deref()
         .map(|d| d.to_lowercase().contains("cable"))
         .unwrap_or(false);
 
-    let (speaker_capture, passthrough_stream) = if loopback_is_cable {
-        // Broadcast: loopback audio (16kHz mono) → pipeline + passthrough to headphones.
-        let (broadcast_tx, mut broadcast_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
-        let (passthrough_tx, passthrough_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
-        let pipeline_tx = spk_audio_tx;
-        let passthrough_sample_rate: u32 = 48_000;
-        tokio::spawn(async move {
-            while let Some(chunk) = broadcast_rx.recv().await {
-                let _ = pipeline_tx.send(chunk.clone());
-                if let Ok(upsampled) = audio::resampler::resample_mono(
-                    &chunk.samples, chunk.sample_rate, passthrough_sample_rate,
-                ) {
-                    let _ = passthrough_tx.send(shared::AudioChunk::new(
-                        upsampled, passthrough_sample_rate, 1,
-                    ));
-                }
-            }
-        });
+    let (passthrough_tx, passthrough_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
 
-        let passthrough_device = resolve_output_device(config.headphones_device.as_deref(), "passthrough")?;
-        let passthrough_playback = AudioPlayback::new(passthrough_device);
-        let passthrough_stream = passthrough_playback
-            .start(passthrough_rx)
-            .map_err(|e| anyhow::anyhow!("Passthrough playback failed: {}", e))?;
-
+    let speaker_capture = if loopback_is_cable {
         let loopback = LoopbackCapture::new(loopback_device, config.chunk_duration_ms);
         let capture = loopback
-            .start(broadcast_tx)
+            .start_with_raw(spk_audio_tx, passthrough_tx)
             .map_err(|e| anyhow::anyhow!("Loopback capture failed: {}", e))?;
-
-        tracing::info!("Passthrough active: meeting audio → headphones");
-        (capture, Some(passthrough_stream))
+        tracing::info!("Passthrough active: raw meeting audio → mixer");
+        capture
     } else {
+        // No passthrough — drop the tx so the mixer's passthrough buffer stays empty.
+        drop(passthrough_tx);
         let loopback = LoopbackCapture::new(loopback_device, config.chunk_duration_ms);
-        let capture = loopback
+        loopback
             .start(spk_audio_tx)
-            .map_err(|e| anyhow::anyhow!("Loopback capture failed: {}", e))?;
-        (capture, None)
+            .map_err(|e| anyhow::anyhow!("Loopback capture failed: {}", e))?
     };
 
-    // Shared flag flipped by AudioPlayback whenever the TTS buffer has
-    // samples to emit. The ducker supervisor task watches this flag.
-    let speaker_playing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let spk_playback =
-        AudioPlayback::with_playing_flag(headphones_device, speaker_playing.clone());
-    let speaker_playback = spk_playback
-        .start(spk_out_rx)
-        .map_err(|e| anyhow::anyhow!("Speaker playback failed: {}", e))?;
-
-    let ducker = AudioDucker::new(DEFAULT_DUCK_VOLUME)
-        .map_err(|e| anyhow::anyhow!("Audio ducker init failed: {}", e))?;
-    spawn_ducker_supervisor(ducker.handle(), speaker_playing);
+    let mixer = MixerPlayback::new(headphones_device);
+    let speaker_mixer = mixer
+        .start(passthrough_rx, spk_out_rx)
+        .map_err(|e| anyhow::anyhow!("Mixer playback failed: {}", e))?;
 
     let speaker_pipeline = SpeakerPipeline::new(
-        "Speaker", spk_stt, spk_trans, spk_tts, spk_source_lang, 2.0, echo_buffer.clone(),
+        "Speaker", spk_stt, spk_trans, spk_tts, spk_source_lang, 2.5, echo_buffer.clone(),
     );
     tokio::spawn(async move {
         speaker_pipeline.run(spk_audio_rx, spk_out_tx, spk_cmd_rx, spk_metrics_tx).await;
@@ -452,9 +416,9 @@ async fn start_pipelines(
         .start(mic_out_rx)
         .map_err(|e| anyhow::anyhow!("Mic playback failed: {}", e))?;
 
-    // Mic pipeline: 2.0s flush — match speaker pipeline
+    // Mic pipeline: 2.5s flush — match speaker pipeline
     let mic_pipeline = SpeakerPipeline::new(
-        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, 2.0, echo_buffer,
+        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, 2.5, echo_buffer,
     );
     tokio::spawn(async move {
         mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
@@ -469,62 +433,12 @@ async fn start_pipelines(
 
     Ok(ActivePipelines {
         _speaker_capture: speaker_capture,
-        _speaker_playback: speaker_playback,
-        _speaker_passthrough: passthrough_stream,
+        _speaker_mixer: speaker_mixer,
         _mic_capture: mic_capture,
         _mic_playback: mic_playback,
-        _ducker: ducker,
         speaker_cmd_tx: spk_cmd_tx,
         mic_cmd_tx: mic_cmd_tx,
     })
-}
-
-/// Watches the speaker TTS playback flag and drives the ducker:
-/// - When the flag flips true, immediately request Duck.
-/// - When it goes false, wait for a debounce window before Restore, so
-///   micro-pauses between TTS chunks don't cause audible volume pumping.
-///
-/// Uses a `Weak` reference to the flag so the supervisor exits automatically
-/// once `ActivePipelines` is dropped (which releases the last strong ref).
-fn spawn_ducker_supervisor(
-    ducker: audio::ducking::DuckerHandle,
-    playing_flag: Arc<std::sync::atomic::AtomicBool>,
-) {
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
-
-    let weak_flag = Arc::downgrade(&playing_flag);
-    // Release our strong ref so the supervisor exits when ActivePipelines drops it.
-    drop(playing_flag);
-
-    const POLL_INTERVAL: Duration = Duration::from_millis(25);
-    const RESTORE_DEBOUNCE: Duration = Duration::from_millis(400);
-
-    tokio::spawn(async move {
-        let mut is_ducked = false;
-        let mut silence_since: Option<Instant> = None;
-
-        loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            let Some(flag) = weak_flag.upgrade() else { break };
-            let playing = flag.load(Ordering::Acquire);
-
-            if playing {
-                silence_since = None;
-                if !is_ducked {
-                    ducker.duck();
-                    is_ducked = true;
-                }
-            } else if is_ducked {
-                let started = silence_since.get_or_insert_with(Instant::now);
-                if started.elapsed() >= RESTORE_DEBOUNCE {
-                    ducker.restore();
-                    is_ducked = false;
-                    silence_since = None;
-                }
-            }
-        }
-    });
 }
 
 /// Drop old pipelines (streams stop, tasks exit) and start fresh ones.

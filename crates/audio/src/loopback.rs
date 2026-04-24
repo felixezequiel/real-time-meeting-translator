@@ -45,7 +45,31 @@ impl LoopbackCapture {
         }
     }
 
-    pub fn start(&self, sender: mpsc::UnboundedSender<AudioChunk>) -> Result<cpal::Stream, LoopbackError> {
+    /// Start capture with a single consumer. Emits 16 kHz mono denoised
+    /// chunks suitable for Whisper.
+    pub fn start(&self, stt_sender: mpsc::UnboundedSender<AudioChunk>) -> Result<cpal::Stream, LoopbackError> {
+        self.start_split(stt_sender, None)
+    }
+
+    /// Start capture with two consumers.
+    ///
+    /// - `stt_sender` receives 16 kHz mono denoised chunks (for Whisper).
+    /// - `raw_sender` receives the **pre-denoise** native-rate stereo audio
+    ///   (for the mixer passthrough so the user hears the original at full
+    ///   fidelity, not the STT-bound denoised version).
+    pub fn start_with_raw(
+        &self,
+        stt_sender: mpsc::UnboundedSender<AudioChunk>,
+        raw_sender: mpsc::UnboundedSender<AudioChunk>,
+    ) -> Result<cpal::Stream, LoopbackError> {
+        self.start_split(stt_sender, Some(raw_sender))
+    }
+
+    fn start_split(
+        &self,
+        stt_sender: mpsc::UnboundedSender<AudioChunk>,
+        raw_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+    ) -> Result<cpal::Stream, LoopbackError> {
         // Use the OUTPUT config — cpal WASAPI backend uses AUDCLNT_STREAMFLAGS_LOOPBACK
         // when an input stream is built from an output device.
         let config = self
@@ -60,11 +84,12 @@ impl LoopbackCapture {
             (sample_rate as u64 * channels as u64 * self.chunk_duration_ms / 1000) as usize;
 
         tracing::info!(
-            "Loopback capture: {}Hz, {} ch, {:?}, chunk={}ms",
+            "Loopback capture: {}Hz, {} ch, {:?}, chunk={}ms, raw_split={}",
             sample_rate,
             channels,
             sample_format,
-            self.chunk_duration_ms
+            self.chunk_duration_ms,
+            raw_sender.is_some(),
         );
 
         let stream_config: StreamConfig = config.into();
@@ -79,22 +104,31 @@ impl LoopbackCapture {
 
         let stream = match sample_format {
             SampleFormat::F32 => {
+                let raw_tx = raw_sender.clone();
                 let data_callback = move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    // Emit raw native-format chunk for passthrough (pre-denoise).
+                    if let Some(tx) = &raw_tx {
+                        let _ = tx.send(AudioChunk::new(data.to_vec(), sample_rate, channels));
+                    }
                     let mut buf = buffer_clone.lock().unwrap();
                     buf.extend_from_slice(data);
-                    flush_chunks(&mut buf, samples_per_chunk, sample_rate, channels, &sender);
+                    flush_chunks(&mut buf, samples_per_chunk, sample_rate, channels, &stt_sender);
                 };
                 self.device
                     .build_input_stream(&stream_config, data_callback, error_callback, None)
                     .map_err(|e| LoopbackError::StreamBuildError(e.to_string()))?
             }
             SampleFormat::I16 => {
+                let raw_tx = raw_sender.clone();
                 let data_callback = move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let float_samples: Vec<f32> =
                         data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                    if let Some(tx) = &raw_tx {
+                        let _ = tx.send(AudioChunk::new(float_samples.clone(), sample_rate, channels));
+                    }
                     let mut buf = buffer_clone.lock().unwrap();
                     buf.extend_from_slice(&float_samples);
-                    flush_chunks(&mut buf, samples_per_chunk, sample_rate, channels, &sender);
+                    flush_chunks(&mut buf, samples_per_chunk, sample_rate, channels, &stt_sender);
                 };
                 self.device
                     .build_input_stream(&stream_config, data_callback, error_callback, None)

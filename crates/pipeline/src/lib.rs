@@ -19,17 +19,31 @@ const WHISPER_SAMPLE_RATE: u32 = 16_000;
 /// check. Cost: one pass over the samples (~0ms).
 const MIN_RMS_FOR_STT: f32 = 0.003;
 
+/// Window (seconds) scanned at the end of each STT chunk to decide whether
+/// the speaker paused. A quiet tail is the strongest "phrase ended" signal
+/// we can extract without real VAD — mirrors how a human interpreter flushes
+/// a sentence the moment the speaker exhales.
+const PAUSE_DETECTION_TAIL_SECONDS: f32 = 0.35;
+
+/// RMS threshold for the tail-pause detector. Slightly above the chunk-gate
+/// threshold so we only treat the tail as "paused" when it's meaningfully
+/// quieter than the active-speech baseline.
+const PAUSE_TAIL_RMS: f32 = MIN_RMS_FOR_STT * 1.5;
+
 /// Maximum concurrent translate+TTS tasks in flight. Limits GPU/CPU pressure
 /// while still allowing pipeline overlap between chunks.
 const MAX_CONCURRENT_TRANSLATE: usize = 3;
 
-/// Minimum word count before sending accumulated text to translation.
-/// Gives the translator enough context for coherent output.
-const MIN_WORDS_FOR_TRANSLATE: usize = 8;
+/// Minimum word count required before a timeout flush is allowed. Acts as a
+/// floor — below this we keep waiting even if `MAX_HOLD_SECONDS` elapses, so
+/// we never ship a fragment like "The market has been" to the translator.
+const MIN_WORDS_FOR_TIMEOUT_FLUSH: usize = 4;
 
-/// Maximum time (in seconds) to hold accumulated text before force-flushing,
-/// even if we haven't reached MIN_WORDS_FOR_TRANSLATE or punctuation.
-const MAX_HOLD_SECONDS: f32 = 3.0;
+/// Maximum time (in seconds) to hold accumulated text before force-flushing.
+/// Longer than a pure-latency tuning would suggest: a human interpreter will
+/// wait several seconds inside a long sentence rather than cut it mid-clause,
+/// because fragmented input produces literal, incoherent translations.
+const MAX_HOLD_SECONDS: f32 = 6.0;
 
 /// How long (seconds) to keep recent translations for echo detection.
 /// STT feedback typically appears within 2-4 seconds of TTS playback.
@@ -168,9 +182,13 @@ impl SpeakerPipeline {
                                 detected_language: source_language,
                                 expected_language: source_language,
                                 stt_duration: std::time::Duration::ZERO,
+                                tail_silent: true,
                             });
                             continue;
                         }
+
+                        // Conviction signal: did the speaker pause at the end of this chunk?
+                        let tail_silent = tail_is_silent(&samples);
 
                         let stt_clone = stt.clone();
                         let tx = stt_tx.clone();
@@ -189,6 +207,7 @@ impl SpeakerPipeline {
                                         detected_language: seg.language,
                                         expected_language: expected_lang,
                                         stt_duration: start.elapsed(),
+                                        tail_silent,
                                     });
                                 }
                                 Err(e) => {
@@ -199,6 +218,7 @@ impl SpeakerPipeline {
                                         detected_language: expected_lang,
                                         expected_language: expected_lang,
                                         stt_duration: start.elapsed(),
+                                        tail_silent,
                                     });
                                 }
                             }
@@ -253,25 +273,33 @@ impl SpeakerPipeline {
                             accumulator_start = Some(Instant::now());
                         }
 
-                        // Decide whether to flush the accumulator:
-                        // 1. Punctuation → send immediately (complete thought)
-                        // 2. >= 5 words  → send (enough context for good translation)
-                        // 3. >= 2s held  → force flush (delay cap)
+                        // Interpreter-style flush: prefer real sentence boundaries
+                        // over word-count thresholds. A live interpreter waits
+                        // through a long clause rather than cut it mid-thought.
+                        //
+                        //   1. Punctuation   → complete thought, flush now.
+                        //   2. Tail pause   → speaker breathed; flush UNLESS the
+                        //                     phrase clearly continues (ends in
+                        //                     a conjunction / connective).
+                        //   3. Held too long → cap the delay, but only once we
+                        //                     have a minimum chunk of context.
                         let has_punctuation = ends_with_punctuation(&accumulator);
                         let word_count = accumulator.split_whitespace().count();
+                        let looks_incomplete = ends_with_continuation_word(&accumulator);
                         let held_too_long = accumulator_start
                             .map(|t| t.elapsed().as_secs_f32() >= MAX_HOLD_SECONDS)
                             .unwrap_or(false);
+                        let speaker_paused = r.tail_silent && !looks_incomplete;
 
                         let should_flush = has_punctuation
-                            || word_count >= MIN_WORDS_FOR_TRANSLATE
-                            || held_too_long;
+                            || speaker_paused
+                            || (held_too_long && word_count >= MIN_WORDS_FOR_TIMEOUT_FLUSH);
 
                         if should_flush {
                             let text = std::mem::take(&mut accumulator);
                             accumulator_start = None;
                             let reason = if has_punctuation { "punctuation" }
-                                else if word_count >= MIN_WORDS_FOR_TRANSLATE { "word count" }
+                                else if speaker_paused { "pause" }
                                 else { "timeout" };
                             tracing::info!("→ flush ({}): \"{}\"", reason, &text[..text.len().min(80)]);
                             let seq = translate_seq;
@@ -404,6 +432,11 @@ struct SttResult {
     detected_language: Language,
     expected_language: Language,
     stt_duration: std::time::Duration,
+    /// True when the last ~350 ms of the chunk were below `PAUSE_TAIL_RMS`.
+    /// Signals "speaker paused" and triggers an immediate flush of the
+    /// text accumulator — the conviction-style flush a live interpreter
+    /// does when they hear a breath between sentences.
+    tail_silent: bool,
 }
 
 // ─── Punctuation detection ───────────────────────────────────────────────────
@@ -412,6 +445,64 @@ struct SttResult {
 fn ends_with_punctuation(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?')
+}
+
+/// Returns true when the accumulator ends in a conjunction or connective —
+/// a strong hint the speaker has NOT finished the thought, even if they
+/// paused briefly. A human interpreter treats "...because" as "wait for it"
+/// and refuses to emit the translation of an orphan clause.
+///
+/// Covers EN + PT because either pipeline direction may be accumulating.
+/// Matches on lowercased, punctuation-stripped last word.
+fn ends_with_continuation_word(text: &str) -> bool {
+    const CONTINUATIONS: &[&str] = &[
+        // English
+        "and", "but", "or", "nor", "so", "because", "though", "although",
+        "if", "unless", "while", "whereas", "that", "which", "who", "whom",
+        "whose", "when", "where", "why", "how", "however", "therefore",
+        "thus", "since", "as", "of", "to", "for", "with", "by", "in", "on",
+        "at", "the", "a", "an",
+        // Portuguese
+        "e", "mas", "ou", "porque", "porém", "porem", "embora", "se",
+        "enquanto", "que", "qual", "quais", "quando", "onde", "como",
+        "então", "entao", "portanto", "pois", "de", "da", "do", "das", "dos",
+        "para", "pra", "com", "por", "em", "no", "na", "nos", "nas", "ao",
+        "aos", "à", "às",
+    ];
+
+    let last = text
+        .trim_end_matches(|c: char| c.is_ascii_punctuation())
+        .split_whitespace()
+        .next_back();
+
+    match last {
+        Some(word) => {
+            let normalized: String = word
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .flat_map(char::to_lowercase)
+                .collect();
+            !normalized.is_empty() && CONTINUATIONS.contains(&normalized.as_str())
+        }
+        None => false,
+    }
+}
+
+// ─── Pause detection (tail-silence heuristic) ───────────────────────────────
+
+/// Returns true when the last `PAUSE_DETECTION_TAIL_SECONDS` of the chunk
+/// have RMS below `PAUSE_TAIL_RMS`. Used as the "speaker paused" signal
+/// that flushes the accumulator immediately without waiting for punctuation
+/// or the word-count cap.
+fn tail_is_silent(samples: &[f32]) -> bool {
+    let tail_len = (WHISPER_SAMPLE_RATE as f32 * PAUSE_DETECTION_TAIL_SECONDS) as usize;
+    if samples.len() < tail_len {
+        return false;
+    }
+    let tail = &samples[samples.len() - tail_len..];
+    let sum_sq: f32 = tail.iter().map(|s| s * s).sum();
+    let rms = (sum_sq / tail.len() as f32).sqrt();
+    rms < PAUSE_TAIL_RMS
 }
 
 // ─── Translation quality guard ──────────────────────────────────────────────
@@ -560,15 +651,77 @@ mod tests {
     }
 
     #[test]
-    fn min_words_is_reasonable() {
-        assert!(MIN_WORDS_FOR_TRANSLATE >= 5);
-        assert!(MIN_WORDS_FOR_TRANSLATE <= 15);
+    fn min_words_timeout_floor_is_reasonable() {
+        assert!(MIN_WORDS_FOR_TIMEOUT_FLUSH >= 3);
+        assert!(MIN_WORDS_FOR_TIMEOUT_FLUSH <= 8);
     }
 
     #[test]
     fn max_hold_seconds_caps_delay() {
-        assert!(MAX_HOLD_SECONDS >= 2.0);
-        assert!(MAX_HOLD_SECONDS <= 5.0);
+        // Needs to be generous enough for long interpreter-style clauses
+        // but still bounded so a stuck accumulator eventually drains.
+        assert!(MAX_HOLD_SECONDS >= 4.0);
+        assert!(MAX_HOLD_SECONDS <= 10.0);
+    }
+
+    // ── Continuation-word detection ──────────────────────────────────────────
+
+    #[test]
+    fn ends_with_conjunction_english() {
+        assert!(ends_with_continuation_word("the market crashed because"));
+        assert!(ends_with_continuation_word("we arrived and"));
+        assert!(ends_with_continuation_word("either this or"));
+    }
+
+    #[test]
+    fn ends_with_conjunction_portuguese() {
+        assert!(ends_with_continuation_word("o mercado caiu porque"));
+        assert!(ends_with_continuation_word("chegamos e"));
+        assert!(ends_with_continuation_word("isso ou"));
+    }
+
+    #[test]
+    fn continuation_ignores_trailing_whitespace_and_case() {
+        assert!(ends_with_continuation_word("this AND   "));
+    }
+
+    #[test]
+    fn complete_sentence_is_not_continuation() {
+        assert!(!ends_with_continuation_word("the market crashed"));
+        assert!(!ends_with_continuation_word("the market crashed."));
+    }
+
+    #[test]
+    fn empty_text_is_not_continuation() {
+        assert!(!ends_with_continuation_word(""));
+        assert!(!ends_with_continuation_word("   "));
+    }
+
+    // ── Pause detection (tail silence) ───────────────────────────────────────
+
+    #[test]
+    fn tail_silent_detects_quiet_ending() {
+        // 2.5s of loud speech followed by 0.4s of silence.
+        let loud_len = (WHISPER_SAMPLE_RATE as f32 * 2.5) as usize;
+        let silent_len = (WHISPER_SAMPLE_RATE as f32 * 0.4) as usize;
+        let mut samples = vec![0.3f32; loud_len];
+        samples.extend(std::iter::repeat(0.0).take(silent_len));
+        assert!(tail_is_silent(&samples));
+    }
+
+    #[test]
+    fn tail_silent_false_when_speaker_still_talking() {
+        // Continuous speech — tail has high RMS.
+        let total_len = (WHISPER_SAMPLE_RATE as f32 * 2.5) as usize;
+        let samples = vec![0.3f32; total_len];
+        assert!(!tail_is_silent(&samples));
+    }
+
+    #[test]
+    fn tail_silent_false_for_short_samples() {
+        // Chunk smaller than the tail window — caller shouldn't flush.
+        let samples = vec![0.0f32; 100];
+        assert!(!tail_is_silent(&samples));
     }
 
     #[test]

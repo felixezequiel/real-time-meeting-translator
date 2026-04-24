@@ -135,9 +135,15 @@ def translate(models, text, source_lang, target_lang):
         text = prefix + text
 
     tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
+    # beam_size=5 + length_penalty~=1.0 is the Opus-MT paper default and gives
+    # noticeably more coherent, idiomatic output than greedy (beam=1), at the
+    # cost of ~80ms extra on GPU int8 — still inside the 2-5s latency target.
+    # no_repeat_ngram_size prevents the occasional loop on ambiguous/short input.
     results = translator.translate_batch(
         [tokens],
-        beam_size=1,
+        beam_size=5,
+        length_penalty=1.0,
+        no_repeat_ngram_size=3,
         max_decoding_length=512,
     )
     translated_tokens = results[0].hypotheses[0]
