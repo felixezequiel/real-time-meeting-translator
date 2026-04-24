@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use audio::audio_switch;
 use audio::capture::AudioCapture;
 use audio::device;
+use audio::ducking::{AudioDucker, DEFAULT_DUCK_VOLUME};
 use audio::loopback::LoopbackCapture;
 use audio::playback::AudioPlayback;
 use pipeline::SpeakerPipeline;
@@ -84,6 +85,9 @@ struct ActivePipelines {
     _mic_capture: cpal::Stream,
     /// Keeps the mic TTS playback alive
     _mic_playback: cpal::Stream,
+    /// WASAPI audio ducker — lowers other apps' volume while TTS plays.
+    /// Dropping this restores every volume it changed.
+    _ducker: AudioDucker,
     /// Send Start/Stop to the speaker pipeline task
     speaker_cmd_tx: mpsc::Sender<PipelineCommand>,
     /// Send Start/Stop to the mic pipeline task
@@ -394,10 +398,18 @@ async fn start_pipelines(
         (capture, None)
     };
 
-    let spk_playback = AudioPlayback::new(headphones_device);
+    // Shared flag flipped by AudioPlayback whenever the TTS buffer has
+    // samples to emit. The ducker supervisor task watches this flag.
+    let speaker_playing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spk_playback =
+        AudioPlayback::with_playing_flag(headphones_device, speaker_playing.clone());
     let speaker_playback = spk_playback
         .start(spk_out_rx)
         .map_err(|e| anyhow::anyhow!("Speaker playback failed: {}", e))?;
+
+    let ducker = AudioDucker::new(DEFAULT_DUCK_VOLUME)
+        .map_err(|e| anyhow::anyhow!("Audio ducker init failed: {}", e))?;
+    spawn_ducker_supervisor(ducker.handle(), speaker_playing);
 
     let speaker_pipeline = SpeakerPipeline::new(
         "Speaker", spk_stt, spk_trans, spk_tts, spk_source_lang, 2.0, echo_buffer.clone(),
@@ -461,9 +473,58 @@ async fn start_pipelines(
         _speaker_passthrough: passthrough_stream,
         _mic_capture: mic_capture,
         _mic_playback: mic_playback,
+        _ducker: ducker,
         speaker_cmd_tx: spk_cmd_tx,
         mic_cmd_tx: mic_cmd_tx,
     })
+}
+
+/// Watches the speaker TTS playback flag and drives the ducker:
+/// - When the flag flips true, immediately request Duck.
+/// - When it goes false, wait for a debounce window before Restore, so
+///   micro-pauses between TTS chunks don't cause audible volume pumping.
+///
+/// Uses a `Weak` reference to the flag so the supervisor exits automatically
+/// once `ActivePipelines` is dropped (which releases the last strong ref).
+fn spawn_ducker_supervisor(
+    ducker: audio::ducking::DuckerHandle,
+    playing_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let weak_flag = Arc::downgrade(&playing_flag);
+    // Release our strong ref so the supervisor exits when ActivePipelines drops it.
+    drop(playing_flag);
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    const RESTORE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+    tokio::spawn(async move {
+        let mut is_ducked = false;
+        let mut silence_since: Option<Instant> = None;
+
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            let Some(flag) = weak_flag.upgrade() else { break };
+            let playing = flag.load(Ordering::Acquire);
+
+            if playing {
+                silence_since = None;
+                if !is_ducked {
+                    ducker.duck();
+                    is_ducked = true;
+                }
+            } else if is_ducked {
+                let started = silence_since.get_or_insert_with(Instant::now);
+                if started.elapsed() >= RESTORE_DEBOUNCE {
+                    ducker.restore();
+                    is_ducked = false;
+                    silence_since = None;
+                }
+            }
+        }
+    });
 }
 
 /// Drop old pipelines (streams stop, tasks exit) and start fresh ones.

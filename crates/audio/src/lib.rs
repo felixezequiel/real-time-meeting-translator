@@ -2,6 +2,7 @@ pub mod audio_switch;
 pub mod capture;
 pub mod denoise;
 pub mod device;
+pub mod ducking;
 pub mod loopback;
 pub mod playback;
 pub mod resampler;
