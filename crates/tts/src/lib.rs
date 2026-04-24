@@ -1,16 +1,15 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use shared::{AudioChunk, Language, PipelineStage, StageError, TextSegment};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use thiserror::Error;
 use tracing;
 
-use std::io::Read as IoRead;
-
 const MONO_CHANNELS: u16 = 1;
+const BYTES_PER_INT16_SAMPLE: usize = 2;
 
 #[derive(Debug, Error)]
 pub enum TtsError {
@@ -27,10 +26,13 @@ struct TtsRequest {
     language: String,
 }
 
+/// Header sent by the Python bridge before the raw int16 PCM bytes.
+/// See scripts/tts_bridge.py — the binary-framed protocol avoids a
+/// filesystem round-trip (write WAV → read WAV → delete) per synthesis.
 #[derive(Deserialize)]
-struct TtsResponse {
-    audio_file: String,
+struct TtsResponseHeader {
     sample_rate: u32,
+    num_samples: u32,
 }
 
 pub struct PiperTts {
@@ -82,33 +84,44 @@ impl PiperTts {
             .flush()
             .map_err(|e| TtsError::SynthesisFailed(e.to_string()))?;
 
-        let mut response_line = String::new();
+        let mut header_line = String::new();
         bridge
             .stdout
-            .read_line(&mut response_line)
+            .read_line(&mut header_line)
             .map_err(|e| TtsError::SynthesisFailed(e.to_string()))?;
 
-        let response: TtsResponse = serde_json::from_str(&response_line)
-            .map_err(|e| TtsError::SynthesisFailed(format!("Invalid TTS response: {}", e)))?;
+        let header: TtsResponseHeader = serde_json::from_str(header_line.trim())
+            .map_err(|e| TtsError::SynthesisFailed(format!("Invalid TTS header: {}", e)))?;
 
-        let samples = read_wav_samples(&response.audio_file)
-            .map_err(|e| TtsError::SynthesisFailed(format!("Failed to read TTS WAV: {}", e)))?;
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&response.audio_file);
+        let samples = read_pcm_samples(&mut bridge.stdout, header.num_samples as usize)
+            .map_err(|e| TtsError::SynthesisFailed(format!("Failed to read PCM: {}", e)))?;
 
         tracing::debug!(
             "TTS synthesized {} samples at {}Hz",
             samples.len(),
-            response.sample_rate
+            header.sample_rate
         );
 
-        Ok(AudioChunk::new(
-            samples,
-            response.sample_rate,
-            MONO_CHANNELS,
-        ))
+        Ok(AudioChunk::new(samples, header.sample_rate, MONO_CHANNELS))
     }
+}
+
+/// Read exactly `num_samples` int16 samples from the bridge stdout and
+/// convert to normalized f32. Uses `read_exact` on the BufReader so any
+/// bytes already buffered after the header line are consumed first.
+fn read_pcm_samples<R: Read>(
+    reader: &mut BufReader<R>,
+    num_samples: usize,
+) -> std::io::Result<Vec<f32>> {
+    let mut bytes = vec![0u8; num_samples * BYTES_PER_INT16_SAMPLE];
+    reader.read_exact(&mut bytes)?;
+
+    let mut samples = Vec::with_capacity(num_samples);
+    for chunk in bytes.chunks_exact(BYTES_PER_INT16_SAMPLE) {
+        let int16 = i16::from_le_bytes([chunk[0], chunk[1]]);
+        samples.push(int16 as f32 / 32768.0);
+    }
+    Ok(samples)
 }
 
 #[async_trait]
@@ -174,33 +187,10 @@ impl PipelineStage for PiperTts {
     }
 }
 
-fn read_wav_samples(path: &str) -> std::io::Result<Vec<f32>> {
-    let mut file = std::fs::File::open(path)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-
-    if data.len() < 44 {
-        return Ok(vec![0.0; 100]);
-    }
-
-    // Skip 44-byte WAV header, read 16-bit PCM samples
-    let pcm_data = &data[44..];
-    let num_samples = pcm_data.len() / 2;
-    let mut samples = Vec::with_capacity(num_samples);
-
-    for i in 0..num_samples {
-        let lo = pcm_data[i * 2] as i16;
-        let hi = (pcm_data[i * 2 + 1] as i16) << 8;
-        let int16 = lo | hi;
-        samples.push(int16 as f32 / 32768.0);
-    }
-
-    Ok(samples)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn tts_request_serializes_correctly() {
@@ -214,11 +204,32 @@ mod tests {
     }
 
     #[test]
-    fn tts_response_deserializes_correctly() {
-        let json = r#"{"audio_file": "/tmp/test.wav", "sample_rate": 22050}"#;
-        let response: TtsResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.audio_file, "/tmp/test.wav");
-        assert_eq!(response.sample_rate, 22050);
+    fn tts_header_deserializes_correctly() {
+        let json = r#"{"sample_rate": 22050, "num_samples": 3}"#;
+        let header: TtsResponseHeader = serde_json::from_str(json).unwrap();
+        assert_eq!(header.sample_rate, 22050);
+        assert_eq!(header.num_samples, 3);
+    }
+
+    #[test]
+    fn read_pcm_samples_converts_int16_to_normalized_f32() {
+        // 3 samples: 0, i16::MAX, i16::MIN — little-endian.
+        let bytes: Vec<u8> = vec![0x00, 0x00, 0xFF, 0x7F, 0x00, 0x80];
+        let mut reader = BufReader::new(Cursor::new(bytes));
+        let samples = read_pcm_samples(&mut reader, 3).unwrap();
+
+        assert_eq!(samples.len(), 3);
+        assert!((samples[0] - 0.0).abs() < 1e-6);
+        assert!((samples[1] - (i16::MAX as f32 / 32768.0)).abs() < 1e-6);
+        assert!((samples[2] - (i16::MIN as f32 / 32768.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn read_pcm_samples_errors_on_truncated_stream() {
+        // Promise 2 samples (4 bytes) but provide only 2 bytes.
+        let bytes: Vec<u8> = vec![0x00, 0x00];
+        let mut reader = BufReader::new(Cursor::new(bytes));
+        assert!(read_pcm_samples(&mut reader, 2).is_err());
     }
 
     #[test]

@@ -2,30 +2,32 @@
 TTS bridge using Piper neural voices (fast, local, ~150ms).
 Falls back to Windows SAPI if Piper is not available.
 
-Protocol:
-- Startup: prints {"status": "ready"}
-- Request:  {"text": "...", "language": "en-us"}
-- Response: {"audio_file": "path/to/wav", "sample_rate": 22050}
+Protocol (binary-framed, no temp files):
+- Startup (text line): {"status": "ready"}\n
+- Request  (text line, stdin): {"text": "...", "language": "en-us"}\n
+- Response (mixed, stdout):
+    {"sample_rate": 22050, "num_samples": N}\n        <-- JSON header
+    <N * 2 bytes int16 little-endian PCM>             <-- raw samples
+
+The binary payload is written to sys.stdout.buffer after the JSON header,
+skipping the WAV header + temp file round-trip.
 
 Requires: pip install piper-tts pywin32
 """
 
 import json
 import sys
-import io
 import os
 import wave
 import struct
 import tempfile
 import numpy as np
 
-# Force UTF-8 on Windows pipes
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
-
-# Each TTS process gets a unique temp file to avoid race conditions
-# when two TTS instances run concurrently (speaker pipeline + mic pipeline).
-TMP_WAV = os.path.join(tempfile.gettempdir(), f"tts_out_{os.getpid()}.wav")
+# stdin stays text-wrapped; stdout we keep as BINARY on purpose so we can
+# write the JSON header as utf-8 bytes followed by raw PCM bytes. Writing
+# bytes through TextIOWrapper is not safe.
+stdout_bin = sys.stdout.buffer
+sys.stdin = __import__('io').TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
 
 PIPER_VOICE_MAP = {
     "en-us": "en_US-ryan-medium",
@@ -57,6 +59,23 @@ except ImportError:
     HAS_SAPI = False
 
 
+def write_line(obj):
+    """Write a JSON line to the binary stdout (so it can coexist with PCM)."""
+    stdout_bin.write((json.dumps(obj, ensure_ascii=True) + "\n").encode("utf-8"))
+    stdout_bin.flush()
+
+
+def write_pcm_response(samples_np, sample_rate):
+    """Send header + raw int16 PCM in one framed response."""
+    samples_np = np.clip(samples_np, -1.0, 1.0)
+    int16 = (samples_np * 32767).astype(np.int16)
+    pcm_bytes = int16.tobytes()
+    header = {"sample_rate": int(sample_rate), "num_samples": int(int16.size)}
+    stdout_bin.write((json.dumps(header) + "\n").encode("utf-8"))
+    stdout_bin.write(pcm_bytes)
+    stdout_bin.flush()
+
+
 def download_piper_voice(voice_name, voices_dir):
     import urllib.request
     urls = PIPER_VOICE_URLS.get(voice_name, [])
@@ -75,12 +94,6 @@ def download_piper_voice(voice_name, voices_dir):
 def setup_piper(voices_dir):
     loaded_voices = {}
     for language, voice_name in PIPER_VOICE_MAP.items():
-        if voice_name in [v[0] for v in loaded_voices.values()]:
-            loaded_voices[language] = loaded_voices[
-                [k for k, v in loaded_voices.items() if v[0] == voice_name][0]
-            ]
-            continue
-
         onnx_path = os.path.join(voices_dir, f"{voice_name}.onnx")
         json_path = os.path.join(voices_dir, f"{voice_name}.onnx.json")
 
@@ -123,7 +136,7 @@ def synthesize_piper(piper_voices, text, language):
     if entry is None:
         return None, None
 
-    voice_name, voice = entry
+    _voice_name, voice = entry
     sr = voice.config.sample_rate
 
     all_samples = []
@@ -131,14 +144,13 @@ def synthesize_piper(piper_voices, text, language):
         all_samples.append(chunk.audio_float_array)
 
     if not all_samples:
-        return [0.0] * 100, sr
+        return np.zeros(100, dtype=np.float32), sr
 
-    audio = np.concatenate(all_samples)
-    return audio.tolist(), sr
+    return np.concatenate(all_samples).astype(np.float32), sr
 
 
 def synthesize_sapi(speaker, stream, voice_map, text, language):
-    sapi_wav = os.path.join(tempfile.gettempdir(), "sapi_tts.wav")
+    sapi_wav = os.path.join(tempfile.gettempdir(), f"sapi_tts_{os.getpid()}.wav")
     voice = voice_map.get(language, voice_map.get("en-us"))
     if voice:
         speaker.Voice = voice
@@ -156,22 +168,21 @@ def synthesize_sapi(speaker, stream, voice_map, text, language):
         sample_width = w.getsampwidth()
         raw_data = w.readframes(n_frames)
 
-    os.remove(sapi_wav)
+    try:
+        os.remove(sapi_wav)
+    except OSError:
+        pass
 
-    total_samples = n_frames * channels
     if sample_width == 2:
-        int16_samples = struct.unpack(f"<{total_samples}h", raw_data)
-        float_samples = [s / 32768.0 for s in int16_samples]
+        int16_samples = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
     else:
-        float_samples = [0.0] * 100
+        int16_samples = np.zeros(100, dtype=np.float32)
 
     if channels > 1:
-        mono = []
-        for i in range(0, len(float_samples), channels):
-            mono.append(sum(float_samples[i:i + channels]) / channels)
-        float_samples = mono
+        # downmix to mono
+        int16_samples = int16_samples.reshape(-1, channels).mean(axis=1)
 
-    return float_samples, sample_rate
+    return int16_samples, sample_rate
 
 
 def main():
@@ -193,7 +204,7 @@ def main():
         sys.stderr.flush()
         sapi_speaker, sapi_stream, sapi_voice_map = setup_sapi()
 
-    print(json.dumps({"status": "ready"}), flush=True)
+    write_line({"status": "ready"})
 
     for line in sys.stdin:
         line = line.strip()
@@ -207,41 +218,22 @@ def main():
             samples, sample_rate = None, None
 
             if text.strip():
-                # Try Piper first
                 if piper_voices:
                     samples, sample_rate = synthesize_piper(piper_voices, text, language)
 
-                # Fall back to SAPI
                 if samples is None and sapi_speaker:
                     samples, sample_rate = synthesize_sapi(
                         sapi_speaker, sapi_stream, sapi_voice_map, text, language
                     )
 
             if samples is None:
-                samples, sample_rate = [0.0] * 100, 22050
+                samples, sample_rate = np.zeros(100, dtype=np.float32), 22050
 
-            # Write WAV with batch numpy conversion (was per-sample Python loop)
-            samples_np = np.array(samples, dtype=np.float32)
-            samples_np = np.clip(samples_np, -1.0, 1.0)
-            int16_data = (samples_np * 32767).astype(np.int16)
-            with wave.open(TMP_WAV, 'wb') as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)
-                w.setframerate(sample_rate)
-                w.writeframes(int16_data.tobytes())
-
-            response = {"audio_file": TMP_WAV, "sample_rate": sample_rate}
-            print(json.dumps(response, ensure_ascii=True), flush=True)
+            write_pcm_response(samples, sample_rate)
         except Exception as e:
             sys.stderr.write(f"TTS error: {e}\n")
             sys.stderr.flush()
-            # Return empty audio on error
-            with wave.open(TMP_WAV, 'wb') as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)
-                w.setframerate(22050)
-                w.writeframes(struct.pack('<h', 0) * 100)
-            print(json.dumps({"audio_file": TMP_WAV, "sample_rate": 22050}), flush=True)
+            write_pcm_response(np.zeros(100, dtype=np.float32), 22050)
 
 
 if __name__ == "__main__":

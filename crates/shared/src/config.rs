@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::language::Language;
 
 const DEFAULT_CHUNK_DURATION_MS: u64 = 2000;
-const DEFAULT_WHISPER_MODEL: &str = "base";
+/// Small quantized (q5_1) — ~181 MB vs 466 MB fp16, ~2x faster inference
+/// on both CPU and GPU with marginal quality loss for PT/EN.
+const DEFAULT_WHISPER_MODEL: &str = "small-q5_1";
 const DEFAULT_TTS_SPEED: f32 = 1.1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,9 +100,9 @@ mod tests {
     }
 
     #[test]
-    fn default_whisper_model_is_base() {
+    fn default_whisper_model_is_small_quantized() {
         let config = PipelineConfig::default();
-        assert_eq!(config.whisper_model, "base");
+        assert_eq!(config.whisper_model, "small-q5_1");
     }
 
     #[test]

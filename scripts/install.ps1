@@ -490,7 +490,7 @@ function Install-PythonDeps {
     $ErrorActionPreference = $prevPref
 
     if ($pipExitCode -eq 0) {
-        $packages = @("faster_whisper", "transformers", "torch")
+        $packages = @("faster_whisper", "transformers", "torch", "ctranslate2")
         $allOk = $true
         foreach ($pkg in $packages) {
             $check = & $PythonExe -c "import $pkg; print($pkg.__version__)" 2>&1
@@ -519,7 +519,9 @@ function Install-WhisperModel {
         New-Item -Path $ModelsDir -ItemType Directory -Force | Out-Null
     }
 
-    $modelName = "small"
+    # q5_1 quantization: ~181 MB vs 466 MB fp16, ~2x faster inference.
+    # Must match DEFAULT_WHISPER_MODEL in crates/shared/src/config.rs.
+    $modelName = "small-q5_1"
     $modelFile = Join-Path $ModelsDir "ggml-$modelName.bin"
 
     if (Test-Path $modelFile) {
@@ -530,7 +532,7 @@ function Install-WhisperModel {
 
     $modelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$modelName.bin"
 
-    Write-Host "  Downloading ggml-$modelName.bin (~466MB)..." -ForegroundColor Gray
+    Write-Host "  Downloading ggml-$modelName.bin (~181MB, quantized)..." -ForegroundColor Gray
     Write-Host "  From: $modelUrl" -ForegroundColor Gray
 
     try {
@@ -546,6 +548,53 @@ function Install-WhisperModel {
         Write-Fail "Failed to download model: $_"
         Write-Host "  Download manually from: $modelUrl" -ForegroundColor Yellow
         Write-Host "  Place the file at: $modelFile" -ForegroundColor Yellow
+    }
+}
+
+function Install-TranslationModels {
+    param([string]$PythonExe)
+
+    # Converts Opus-MT models to CTranslate2 int8 format for ~3-5x faster
+    # inference. See docs/adr/0001-ctranslate2-translation.md.
+    Write-Step "Opus-MT Translation Models (CTranslate2 int8)"
+
+    if (-not (Test-Path $ModelsDir)) {
+        New-Item -Path $ModelsDir -ItemType Directory -Force | Out-Null
+    }
+
+    $pairs = @(
+        @{ Hf = "Helsinki-NLP/opus-mt-en-ROMANCE"; Dir = "opus-mt-en-ROMANCE-ct2" },
+        @{ Hf = "Helsinki-NLP/opus-mt-ROMANCE-en"; Dir = "opus-mt-ROMANCE-en-ct2" }
+    )
+
+    foreach ($p in $pairs) {
+        $targetDir = Join-Path $ModelsDir $p.Dir
+        $modelBin = Join-Path $targetDir "model.bin"
+
+        if (Test-Path $modelBin) {
+            $size = [math]::Round((Get-Item $modelBin).Length / 1MB, 1)
+            Write-Ok "Already converted: $($p.Dir) (${size}MB)"
+            continue
+        }
+
+        Write-Host "  Converting $($p.Hf) -> $($p.Dir) (int8)..." -ForegroundColor Gray
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & $PythonExe -m ctranslate2.converters.transformers `
+            --model $p.Hf `
+            --output_dir $targetDir `
+            --quantization int8 `
+            --force 2>&1 | Out-Host
+        $exit = $LASTEXITCODE
+        $ErrorActionPreference = $prevPref
+
+        if ($exit -eq 0 -and (Test-Path $modelBin)) {
+            $size = [math]::Round((Get-Item $modelBin).Length / 1MB, 1)
+            Write-Ok "Converted: $($p.Dir) (${size}MB)"
+        } else {
+            Write-Fail "Conversion failed for $($p.Hf) (exit $exit)"
+            Write-Host "  Run manually: $PythonExe -m ctranslate2.converters.transformers --model $($p.Hf) --output_dir $targetDir --quantization int8" -ForegroundColor Yellow
+        }
     }
 }
 
@@ -646,7 +695,7 @@ speaker_target_language = "Portuguese"
 mic_source_language = "Portuguese"
 mic_target_language = "English"
 chunk_duration_ms = 500
-whisper_model = "small"
+whisper_model = "small-q5_1"
 tts_speed = 1.1
 "@
 
@@ -778,6 +827,7 @@ Install-HiFiCable
 # 5. Dependencies
 Install-PythonDeps -PythonExe $pythonExe
 Install-WhisperModel
+Install-TranslationModels -PythonExe $pythonExe
 
 # 6. Configuration
 Configure-CargoConfig
