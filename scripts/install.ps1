@@ -554,47 +554,46 @@ function Install-WhisperModel {
 function Install-TranslationModels {
     param([string]$PythonExe)
 
-    # Converts Opus-MT models to CTranslate2 int8 format for ~3-5x faster
-    # inference. See docs/adr/0001-ctranslate2-translation.md.
-    Write-Step "Opus-MT Translation Models (CTranslate2 int8)"
+    # NLLB-200 distilled (600M params) converted to CTranslate2 int8. One
+    # model covers every supported direction (en<->pt), produces more natural
+    # and context-aware translations than Opus-MT. Latency on GPU int8_float16:
+    # ~200ms/sentence (vs ~100ms for Opus-MT — still inside the 2-5s budget).
+    Write-Step "NLLB-200 Translation Model (CTranslate2 int8)"
 
     if (-not (Test-Path $ModelsDir)) {
         New-Item -Path $ModelsDir -ItemType Directory -Force | Out-Null
     }
 
-    $pairs = @(
-        @{ Hf = "Helsinki-NLP/opus-mt-en-ROMANCE"; Dir = "opus-mt-en-ROMANCE-ct2" },
-        @{ Hf = "Helsinki-NLP/opus-mt-ROMANCE-en"; Dir = "opus-mt-ROMANCE-en-ct2" }
-    )
+    $hfName = "facebook/nllb-200-distilled-600M"
+    $dirName = "nllb-200-distilled-600M-ct2"
+    $targetDir = Join-Path $ModelsDir $dirName
+    $modelBin = Join-Path $targetDir "model.bin"
 
-    foreach ($p in $pairs) {
-        $targetDir = Join-Path $ModelsDir $p.Dir
-        $modelBin = Join-Path $targetDir "model.bin"
+    if (Test-Path $modelBin) {
+        $size = [math]::Round((Get-Item $modelBin).Length / 1MB, 1)
+        Write-Ok "Already converted: $dirName (${size}MB)"
+        return
+    }
 
-        if (Test-Path $modelBin) {
-            $size = [math]::Round((Get-Item $modelBin).Length / 1MB, 1)
-            Write-Ok "Already converted: $($p.Dir) (${size}MB)"
-            continue
-        }
+    Write-Host "  Converting $hfName -> $dirName (int8)..." -ForegroundColor Gray
+    Write-Host "  Downloads ~2.5GB from HuggingFace; final int8 model ~600MB on disk." -ForegroundColor Gray
+    Write-Host "  This may take several minutes on the first run." -ForegroundColor Gray
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $PythonExe -m ctranslate2.converters.transformers `
+        --model $hfName `
+        --output_dir $targetDir `
+        --quantization int8 `
+        --force 2>&1 | Out-Host
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = $prevPref
 
-        Write-Host "  Converting $($p.Hf) -> $($p.Dir) (int8)..." -ForegroundColor Gray
-        $prevPref = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        & $PythonExe -m ctranslate2.converters.transformers `
-            --model $p.Hf `
-            --output_dir $targetDir `
-            --quantization int8 `
-            --force 2>&1 | Out-Host
-        $exit = $LASTEXITCODE
-        $ErrorActionPreference = $prevPref
-
-        if ($exit -eq 0 -and (Test-Path $modelBin)) {
-            $size = [math]::Round((Get-Item $modelBin).Length / 1MB, 1)
-            Write-Ok "Converted: $($p.Dir) (${size}MB)"
-        } else {
-            Write-Fail "Conversion failed for $($p.Hf) (exit $exit)"
-            Write-Host "  Run manually: $PythonExe -m ctranslate2.converters.transformers --model $($p.Hf) --output_dir $targetDir --quantization int8" -ForegroundColor Yellow
-        }
+    if ($exit -eq 0 -and (Test-Path $modelBin)) {
+        $size = [math]::Round((Get-Item $modelBin).Length / 1MB, 1)
+        Write-Ok "Converted: $dirName (${size}MB)"
+    } else {
+        Write-Fail "Conversion failed for $hfName (exit $exit)"
+        Write-Host "  Run manually: $PythonExe -m ctranslate2.converters.transformers --model $hfName --output_dir $targetDir --quantization int8" -ForegroundColor Yellow
     }
 }
 

@@ -1,7 +1,10 @@
 faster-whisper>=1.0.0
 transformers>=4.40.0
 sentencepiece>=0.2.0
-torch>=2.0.0
+# transformers 4.52+ blocks torch.load on torch<2.6 due to CVE-2025-32434;
+# the NLLB model on HF is pytorch_model.bin (no safetensors) so the load
+# path is exercised during conversion. Keep torch >=2.6 to unblock it.
+torch>=2.6.0
 numpy>=1.24.0
 piper-tts>=1.2.0
 ctranslate2>=4.0.0
