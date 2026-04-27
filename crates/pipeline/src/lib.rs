@@ -21,10 +21,6 @@ const WHISPER_SAMPLE_RATE: u32 = 16_000;
 /// a fresh checkout that hasn't run install.ps1 yet.
 const FALLBACK_MIN_RMS_FOR_STT: f32 = 0.003;
 
-/// Maximum concurrent translate+TTS tasks in flight. Limits GPU/CPU pressure
-/// while still allowing pipeline overlap between sentences.
-const MAX_CONCURRENT_TRANSLATE: usize = 3;
-
 /// Minimum word count required before a timeout flush is allowed. Acts as a
 /// floor so we never ship a fragment like "The market has been" to the
 /// translator.
@@ -44,9 +40,15 @@ const ECHO_WINDOW_SECONDS: f32 = 8.0;
 const ECHO_SIMILARITY_THRESHOLD: f32 = 0.4;
 
 /// Number of consecutive chunks the diarizer must identify as a different
-/// speaker before we accept the change and flush the accumulator. Hides
-/// single-chunk wobble that used to fragment sentences.
-const MIN_CHUNKS_FOR_SPEAKER_CHANGE: u32 = 2;
+/// speaker before we accept the change. Lowered to 1 — i.e. we accept
+/// the new speaker_id immediately — because the TTS-bridge voice
+/// hysteresis already guards against "voice flapping" downstream
+/// (`pick_voice_with_hysteresis`). The pipeline now reflects who's
+/// talking on the FIRST chunk where the diariser sees a different
+/// person, important for documentaries where speakers alternate
+/// every few seconds. Earlier value of 2 added ~280 ms of dead-air
+/// before short interjections were attributed correctly.
+const MIN_CHUNKS_FOR_SPEAKER_CHANGE: u32 = 1;
 
 /// Smoothing factor for the per-speaker running F0. Each new sample is mixed
 /// in with this weight; a higher value reacts faster, a lower value is
@@ -467,7 +469,28 @@ fn start_stt_worker(
     });
 }
 
-// ─── Concurrent translate + TTS worker with ordered delivery ─────────────────
+// ─── Streaming translate + TTS worker (sequential, fragment-pipelined) ──────
+//
+// The translation engine (Qwen 2.5 1.5B via translation_bridge.py) emits
+// the translation as a sequence of *fragments* — pieces that ended on a
+// punctuation mark or a 25-char word boundary. We synthesise each
+// fragment as soon as it arrives and push it onto `audio_tx` in order.
+// The mixer drains the channel as samples become available, so the
+// listener hears the start of the translation while the LLM is still
+// generating the rest.
+//
+// Why sequential (no semaphore, no reorder buffer):
+//   - Within an utterance, fragments are inherently ordered (the bridge
+//     emits them in order on the same Python subprocess stdout).
+//   - Across utterances, the speaker pipeline produces them sequentially
+//     too (the accumulator commits at sentence boundaries; the next
+//     utterance can't be flushed before the current one is). So a
+//     worker that processes one utterance fully before pulling the next
+//     preserves the play order without any seq tracking.
+//   - The earlier concurrent design was an artefact of atomic
+//     translate-then-TTS — useful when each call took 500ms and you
+//     wanted to overlap them. With streaming inside a single utterance
+//     the parallelism is already there, just not at the utterance level.
 
 fn start_translate_worker(
     mut text_rx: mpsc::UnboundedReceiver<(u64, String, Option<u32>, Instant)>,
@@ -479,102 +502,140 @@ fn start_translate_worker(
     metrics_tx: mpsc::Sender<PipelineMetrics>,
 ) {
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSLATE));
-        let (result_tx, mut result_rx) =
-            mpsc::unbounded_channel::<(u64, Option<AudioChunk>)>();
+        // Maximum age (in seconds) of a queued utterance before we
+        // drop it as stale. When the LLM can't keep up with the speaker
+        // (most common cause: llama-cpp-python is the CPU wheel,
+        // running at ~15 tok/s instead of 70 tok/s on the GPU), text
+        // arriving every ~2 s queues behind translations that take ~5 s
+        // to complete. Without dropping, the perceived latency grows
+        // linearly without bound — by minute 3 the listener hears
+        // utterance 1. We'd rather skip the older utterances than
+        // play a translation 30 s out of date.
+        const MAX_QUEUE_AGE_SECONDS: f32 = 4.0;
 
-        let mut expected_seq: u64 = 0;
-        let mut pending: std::collections::BTreeMap<u64, Option<AudioChunk>> =
-            std::collections::BTreeMap::new();
-        // Maps each in-flight seq to the moment its source text flushed.
-        // We use it to compute the end-to-end "total" metric exactly once,
-        // when the corresponding audio chunk reaches `audio_tx.send()`.
-        let mut flush_instants: std::collections::HashMap<u64, Instant> =
-            std::collections::HashMap::new();
+        while let Some((mut seq, mut text, mut speaker_id, mut flushed_at)) =
+            text_rx.recv().await
+        {
+            // Drain stale utterances ahead of this one. We pull from
+            // the queue (try_recv, non-blocking) and skip anything
+            // older than MAX_QUEUE_AGE_SECONDS. This keeps the worker
+            // anchored to the latest meaningful utterance instead of
+            // marching through an ever-growing backlog.
+            let mut dropped = 0u32;
+            loop {
+                if flushed_at.elapsed().as_secs_f32() <= MAX_QUEUE_AGE_SECONDS {
+                    break;
+                }
+                match text_rx.try_recv() {
+                    Ok((next_seq, next_text, next_speaker, next_flushed)) => {
+                        tracing::warn!(
+                            "Dropping stale utterance {} (age {:.1}s): \"{}\"",
+                            seq,
+                            flushed_at.elapsed().as_secs_f32(),
+                            &text[..text.len().min(60)]
+                        );
+                        dropped += 1;
+                        seq = next_seq;
+                        text = next_text;
+                        speaker_id = next_speaker;
+                        flushed_at = next_flushed;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if dropped > 0 {
+                tracing::warn!(
+                    "Worker fell behind, skipped {} utterance(s). \
+                     Now processing seq {} ({:.1}s old).",
+                    dropped, seq, flushed_at.elapsed().as_secs_f32(),
+                );
+            }
 
-        loop {
-            tokio::select! {
-                Some((seq, text, speaker_id, flushed_at)) = text_rx.recv() => {
-                    flush_instants.insert(seq, flushed_at);
-                    let translator = translator.clone();
-                    let tts = tts.clone();
-                    let tx = result_tx.clone();
-                    let metrics = metrics_tx.clone();
-                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let translator = translator.clone();
+            let tts = tts.clone();
+            let audio_tx_inner = audio_tx.clone();
+            let metrics_inner = metrics_tx.clone();
+            let echo_buf = echo_buffer.clone();
 
-                    let echo_buf = echo_buffer.clone();
-                    // Resolve the voice profile for this utterance: pick
-                    // the speaker's running F0, or VoiceProfile::default()
-                    // (zero F0 → bridge skips the analysis-synthesis pass)
-                    // when no profile has been recorded yet.
-                    let voice_profile = match speaker_id {
-                        Some(sid) => {
-                            let f0 = voice_profiles.f0_for(sid);
-                            VoiceProfile {
-                                target_f0_hz: f0,
-                                formant_shift: formant_shift_for_f0(f0),
-                            }
-                        }
-                        None => VoiceProfile::default(),
-                    };
+            // Resolve the voice profile for this utterance. With
+            // streaming we resolve once per utterance — the profile
+            // doesn't change between fragments of the same speaker.
+            let voice_profile = match speaker_id {
+                Some(sid) => {
+                    let f0 = voice_profiles.f0_for(sid);
+                    VoiceProfile {
+                        target_f0_hz: f0,
+                        formant_shift: formant_shift_for_f0(f0),
+                        speaker_id: Some(sid),
+                    }
+                }
+                None => VoiceProfile::default(),
+            };
 
-                    tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        let translate_start = Instant::now();
+            // Sequential per-utterance, but inside the utterance the LLM
+            // and TTS run in *parallel*: the LLM stream pushes each
+            // fragment to a channel; a worker thread pulls fragments and
+            // synthesises them, pushing audio to the playback channel
+            // as each one finishes. This decoupling cuts the total
+            // utterance latency by roughly the time of N-1 TTS calls
+            // (for an utterance with N fragments) — the LLM finishes
+            // generating while the early fragments are still being
+            // spoken.
+            let _ = tokio::task::spawn_blocking(move || {
+                let segment = TextSegment::new(text.clone(), Language::English);
+                let translate_start = Instant::now();
 
-                        let segment = TextSegment::new(text.clone(), Language::English);
+                // std::sync::mpsc — blocking send/recv, exactly what we
+                // want here: the LLM stream callback is sync, the TTS
+                // worker is sync, both run on OS threads.
+                let (frag_tx, frag_rx) = std::sync::mpsc::channel::<String>();
 
-                        let translated = match translator.translate(&segment) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                tracing::warn!("Translation failed: {}", e);
-                                let _ = tx.send((seq, None));
-                                return;
-                            }
-                        };
-                        let translate_elapsed = translate_start.elapsed();
-                        let _ = metrics.try_send(PipelineMetrics::new(
-                            "translate".to_string(),
-                            translate_elapsed,
-                        ));
-
-                        if is_translation_degenerate(&text, &translated.text) {
-                            tracing::warn!("Translation degenerate, dropping: \"{}\" → \"{}\"",
-                                &text[..text.len().min(60)],
-                                &translated.text[..translated.text.len().min(60)]);
-                            let _ = tx.send((seq, None));
-                            return;
-                        }
-
-                        tracing::info!("← \"{}\" ({}ms)", translated.text, translate_elapsed.as_millis());
-                        record_translation(&echo_buf, &translated.text);
-
+                // TTS worker thread. Parallel to the LLM stream below;
+                // both run independently on their own native threads
+                // until the LLM closes its sender by dropping it.
+                let tts_clone = tts.clone();
+                let audio_tx_clone = audio_tx_inner.clone();
+                let metrics_clone = metrics_inner.clone();
+                let voice_profile_clone = voice_profile;
+                let speaker_id_clone = speaker_id;
+                let utterance_start = flushed_at;
+                let tts_handle = std::thread::spawn(move || {
+                    let mut first_audio_emitted = false;
+                    let mut fragment_idx: u32 = 0;
+                    while let Ok(fragment_text) = frag_rx.recv() {
+                        fragment_idx += 1;
+                        let fragment_segment = TextSegment::new(
+                            fragment_text.clone(),
+                            Language::English,
+                        );
                         let tts_start = Instant::now();
-                        let audio_out = match tts.synthesize(&translated, voice_profile) {
+                        let audio_out = match tts_clone.synthesize(&fragment_segment, voice_profile_clone) {
                             Ok(a) => a,
                             Err(e) => {
-                                tracing::warn!("TTS failed: {}", e);
-                                let _ = tx.send((seq, None));
-                                return;
+                                tracing::warn!("TTS failed (fragment {}): {}", fragment_idx, e);
+                                continue;
                             }
                         };
                         let tts_elapsed = tts_start.elapsed();
-                        let _ = metrics.try_send(PipelineMetrics::new(
+                        let _ = metrics_clone.try_send(PipelineMetrics::new(
                             "tts".to_string(),
                             tts_elapsed,
                         ));
                         tracing::info!(
-                            "TTS (speaker={:?}, target_f0={:.0}, formant={:.2}): {} samples ({}ms)",
-                            speaker_id,
-                            voice_profile.target_f0_hz,
-                            voice_profile.formant_shift,
+                            "TTS (speaker={:?}, target_f0={:.0}, formant={:.2}, fragment {}): {} samples ({}ms)",
+                            speaker_id_clone,
+                            voice_profile_clone.target_f0_hz,
+                            voice_profile_clone.formant_shift,
+                            fragment_idx,
                             audio_out.samples.len(),
                             tts_elapsed.as_millis(),
                         );
 
                         let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
                             resampler::resample_to_target(
-                                &audio_out.samples, audio_out.sample_rate, PLAYBACK_SAMPLE_RATE,
+                                &audio_out.samples,
+                                audio_out.sample_rate,
+                                PLAYBACK_SAMPLE_RATE,
                             )
                             .map(|r| AudioChunk::new(r, PLAYBACK_SAMPLE_RATE, 1))
                             .unwrap_or(audio_out)
@@ -582,48 +643,113 @@ fn start_translate_worker(
                             audio_out
                         };
 
-                        let _ = tx.send((seq, Some(audio_out)));
-                    });
-                }
+                        let _ = audio_tx_clone.send(audio_out);
 
-                Some((seq, audio)) = result_rx.recv() => {
-                    pending.insert(seq, audio);
-                    while let Some(audio) = pending.remove(&expected_seq) {
-                        let total = flush_instants
-                            .remove(&expected_seq)
-                            .map(|t| t.elapsed());
-                        expected_seq += 1;
-                        if let Some(chunk) = audio {
-                            let _ = audio_tx.send(chunk);
-                            if let Some(elapsed) = total {
-                                let _ = metrics_tx.try_send(PipelineMetrics::new(
-                                    "total".to_string(),
-                                    elapsed,
-                                ));
-                            }
+                        if !first_audio_emitted {
+                            // Time to first audio (TTFA): the metric the
+                            // listener actually feels — from the moment
+                            // the source utterance flushed to the moment
+                            // we hand the first sample to the mixer.
+                            let _ = metrics_clone.try_send(PipelineMetrics::new(
+                                "ttfa".to_string(),
+                                utterance_start.elapsed(),
+                            ));
+                            first_audio_emitted = true;
                         }
                     }
+                });
+
+                let mut accumulated = String::new();
+                let mut first_fragment = true;
+                let mut fragment_count: u32 = 0;
+
+                let stream_result = translator.translate_stream(&segment, |fragment| {
+                    if fragment.is_final {
+                        return;
+                    }
+                    let fragment_text = fragment.text.trim();
+                    if fragment_text.is_empty() {
+                        accumulated.push_str(&fragment.text);
+                        return;
+                    }
+                    if first_fragment {
+                        let _ = metrics_inner.try_send(PipelineMetrics::new(
+                            "translate_first_fragment".to_string(),
+                            translate_start.elapsed(),
+                        ));
+                        first_fragment = false;
+                    }
+                    fragment_count += 1;
+                    accumulated.push_str(&fragment.text);
+                    tracing::info!("← fragment {}: \"{}\"", fragment_count, fragment_text);
+                    // Hand the fragment off to the TTS worker; the LLM
+                    // stream continues immediately.
+                    let _ = frag_tx.send(fragment.text.clone());
+                });
+
+                // Closing the sender lets the TTS worker drain its
+                // queue and exit naturally.
+                drop(frag_tx);
+                let _ = tts_handle.join();
+
+                let translate_elapsed = translate_start.elapsed();
+                let _ = metrics_inner.try_send(PipelineMetrics::new(
+                    "translate".to_string(),
+                    translate_elapsed,
+                ));
+
+                if let Err(e) = stream_result {
+                    tracing::warn!("Translation stream failed: {}", e);
+                    return;
+                }
+                if accumulated.trim().is_empty() {
+                    return;
                 }
 
-                else => break,
-            }
+                tracing::info!(
+                    "← \"{}\" ({}ms, {} fragments)",
+                    accumulated.trim(),
+                    translate_elapsed.as_millis(),
+                    fragment_count,
+                );
+
+                // Echo registry is kept tight: only record translations
+                // that look sane. Degenerate output (the LLM fell into a
+                // repetition loop) would falsely match anything in the
+                // STT stream, and we'd start dropping legitimate input.
+                if is_translation_degenerate(&text, accumulated.trim()) {
+                    tracing::warn!(
+                        "Translation looks degenerate, skipping echo record: \"{}\" → \"{}\"",
+                        &text[..text.len().min(60)],
+                        &accumulated[..accumulated.len().min(60)],
+                    );
+                } else {
+                    record_translation(&echo_buf, accumulated.trim());
+                }
+
+                let _ = metrics_inner.try_send(PipelineMetrics::new(
+                    "total".to_string(),
+                    flushed_at.elapsed(),
+                ));
+            }).await;
+            let _ = seq; // sequence number is no longer used (no reorder buffer).
         }
     });
 }
 
-/// Heuristic mapping from running mean F0 to a formant-shift ratio.
-/// Higher F0 (typical female / child voices) → narrower vocal tract →
-/// formant_shift slightly below 1. Lower F0 → wider tract → above 1.
-/// The ratio is bounded conservatively (0.85–1.15) because aggressive
-/// shifts produce unnatural artefacts in the analysis-synthesis output.
-fn formant_shift_for_f0(f0_hz: f32) -> f32 {
-    if f0_hz <= 0.0 {
-        return 1.0;
-    }
-    // Anchor: a ~120 Hz adult-male voice maps to formant_shift = 1.0,
-    // a ~220 Hz typical adult-female voice maps to ~0.92.
-    let normalised = (f0_hz - 120.0) / 100.0;
-    (1.0 - normalised * 0.08).clamp(0.85, 1.15)
+/// Formant-shift ratio for the TTS bridge. We deliberately return 1.0
+/// (= no warp) for every speaker now. Earlier revisions ran a heuristic
+/// that warped the spectral envelope by ±15 % based on the speaker's
+/// F0, but the user reported the result as "extremely robotic": even
+/// small spectral-envelope warps push the WORLD analysis-synthesis
+/// output away from natural-sounding human speech, because the phase
+/// reconstruction has no idea about the new envelope and produces
+/// audible artefacts. Differentiation by **pitch alone** (F0 swap)
+/// keeps voices distinguishable without sounding fanha. If a deeper
+/// "vocal weight" cue ever becomes worth the artefact, this is the
+/// single function to flip.
+fn formant_shift_for_f0(_f0_hz: f32) -> f32 {
+    1.0
 }
 
 // ─── Punctuation detection ───────────────────────────────────────────────────
@@ -804,23 +930,18 @@ mod tests {
     }
 
     #[test]
-    fn formant_shift_is_unity_for_unknown_f0() {
-        assert!((formant_shift_for_f0(0.0) - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn formant_shift_decreases_for_higher_f0() {
-        let male = formant_shift_for_f0(120.0);
-        let female = formant_shift_for_f0(220.0);
-        assert!(female < male);
-    }
-
-    #[test]
-    fn formant_shift_is_clamped() {
-        let extreme_low = formant_shift_for_f0(50.0);
-        let extreme_high = formant_shift_for_f0(500.0);
-        assert!((0.85..=1.15).contains(&extreme_low));
-        assert!((0.85..=1.15).contains(&extreme_high));
+    fn formant_shift_always_returns_one() {
+        // Formant warping is currently disabled across the board because
+        // even small spectral-envelope shifts produced audible WORLD
+        // analysis-synthesis artefacts ("robotic colour"). If a future
+        // experiment re-enables it, this test will fail and force the
+        // owner to update the contract intentionally.
+        for f0 in [0.0, 50.0, 120.0, 220.0, 500.0] {
+            assert!(
+                (formant_shift_for_f0(f0) - 1.0).abs() < 1e-6,
+                "formant_shift_for_f0({f0}) should be exactly 1.0",
+            );
+        }
     }
 
     #[test]

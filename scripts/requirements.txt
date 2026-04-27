@@ -1,24 +1,31 @@
 faster-whisper>=1.0.0
 # transformers 5.x removed helpers some upstream code still uses; pin to
-# the 4.x line so all stages coexist.
+# the 4.x line so kokoro-onnx + speechbrain coexist.
 transformers>=4.57,<5.0
 sentencepiece>=0.2.0
 torch>=2.6.0
 torchaudio>=2.6.0
 numpy>=1.24.0
-ctranslate2>=4.0.0
 
-# ── TTS (Piper + pyworld pitch/formant shift) ────────────────────────────────
-# Piper synthesises with a 25 MB ONNX voice in ~150 ms. pyworld then runs
-# WORLD analysis-synthesis on the output: extract F0 / spectral envelope /
-# aperiodicity, swap F0 for the speaker's running mean, optionally shift
-# the spectral envelope, resynthesise. Total TTS step ~250-350 ms — fast
-# enough for simultaneous translation, with per-speaker pitch
-# differentiation that doesn't need a voice cloning model. (ADR 0006)
-piper-tts>=1.2.0
+# ── Translation (Qwen 2.5 1.5B Instruct via llama.cpp, streaming) ────────────
+# Replaces NLLB-200 + CTranslate2 (atomic). Streaming token-by-token with
+# fragment commits at punctuation / 25-char boundary lets the TTS start
+# speaking before the LLM finishes generating the rest of the sentence.
+# CUDA wheel is preferred but the pip wheel auto-selects based on
+# platform. ADR 0009.
+llama-cpp-python>=0.3.2
+
+# ── TTS (Kokoro v1.0 ONNX + pyworld pitch/formant shift) ────────────────────
+# Kokoro is the same TTS the friend's voiceMaster spike uses. ~82M params,
+# 24 kHz output, much more natural prosody than Piper. pyworld stays on
+# top to apply per-speaker pitch differentiation (Kokoro has fixed voices,
+# we shift them with WORLD analysis-synthesis to get the speaker_id-driven
+# voice cue). ADR 0010 (TTS swap), ADR 0006 (pitch shift mechanism).
+kokoro-onnx>=0.3.6
+onnxruntime-gpu>=1.18
 pyworld>=0.3.5
 
 # ── Speaker diarisation (SpeechBrain ECAPA-TDNN) ─────────────────────────────
-# Same bridge also runs pyworld DIO to return per-chunk F0, which the
-# pipeline accumulates into a running mean per speaker.
+# Same bridge also runs pyworld DIO to return per-chunk F0 which feeds
+# the per-speaker running mean used by the TTS pitch shifter.
 speechbrain>=1.0.0

@@ -384,7 +384,6 @@ async fn start_pipelines(
 
     // ── Speaker pipeline ───────────────────────────────────────────────────────
     let (spk_audio_tx, spk_audio_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
-    let (spk_out_tx, spk_out_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
 
     let loopback_device = resolve_output_device(config.loopback_device.as_deref(), "loopback")?;
     let loopback_name = cpal::traits::DeviceTrait::name(&loopback_device)
@@ -417,17 +416,18 @@ async fn start_pipelines(
             .map_err(|e| anyhow::anyhow!("Loopback capture failed: {}", e))?
     };
 
-    let mixer = MixerPlayback::new(headphones_device);
-    let speaker_mixer = mixer
-        .start(passthrough_rx, spk_out_rx)
-        .map_err(|e| anyhow::anyhow!("Mixer playback failed: {}", e))?;
-
     // Build the list of (name, audio_rx) pairs the speaker side will run.
     // With separation off it's just one branch ("Speaker") consuming the
     // raw loopback. With separation on, a separation worker sits between
     // the loopback and two parallel branches ("Speaker-A" / "Speaker-B"),
-    // one per separated speaker channel; both feed back into the same
-    // `spk_out_tx` so the mixer plays them in the order they finish.
+    // one per separated speaker channel.
+    //
+    // CRITICAL: each branch gets its own dedicated TTS output channel
+    // — they do NOT share. The mixer accepts a Vec of TTS receivers and
+    // SUMS their samples frame-by-frame, so two simultaneous speakers
+    // (after Sepformer) play SIMULTANEOUSLY, not sequentially. Sharing
+    // a single output queue would serialise overlap → dropping the
+    // listener several seconds behind real time.
     let mut speaker_branches: Vec<(&'static str, mpsc::UnboundedReceiver<shared::AudioChunk>)> =
         Vec::new();
 
@@ -437,13 +437,17 @@ async fn start_pipelines(
         start_separation_worker(spk_audio_rx, Arc::clone(sep), ch_a_tx, ch_b_tx);
         speaker_branches.push(("Speaker-A", ch_a_rx));
         speaker_branches.push(("Speaker-B", ch_b_rx));
-        tracing::info!("Source separation ON: dual speaker pipelines (A + B)");
+        tracing::info!("Source separation ON: dual speaker pipelines (A + B), parallel mix");
     } else {
         speaker_branches.push(("Speaker", spk_audio_rx));
     }
 
     let mut speaker_cmd_txs: Vec<mpsc::Sender<PipelineCommand>> = Vec::new();
+    let mut speaker_tts_rxs: Vec<mpsc::UnboundedReceiver<shared::AudioChunk>> = Vec::new();
     for (name, audio_rx) in speaker_branches {
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
+        speaker_tts_rxs.push(out_rx);
+
         let (cmd_tx, cmd_rx) = mpsc::channel::<PipelineCommand>(8);
         let (metrics_tx, mut metrics_rx) =
             mpsc::channel::<shared::PipelineMetrics>(64);
@@ -462,7 +466,6 @@ async fn start_pipelines(
         if let Some(vad) = try_create_silero_vad(name) {
             pipeline = pipeline.with_vad(vad);
         }
-        let out_tx = spk_out_tx.clone();
         let branch_name = name.to_string();
         tokio::spawn(async move {
             pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
@@ -479,7 +482,11 @@ async fn start_pipelines(
         });
         speaker_cmd_txs.push(cmd_tx);
     }
-    drop(spk_out_tx); // remaining clones are inside the spawned pipelines
+
+    let mixer = MixerPlayback::new(headphones_device);
+    let speaker_mixer = mixer
+        .start(passthrough_rx, speaker_tts_rxs)
+        .map_err(|e| anyhow::anyhow!("Mixer playback failed: {}", e))?;
 
     // ── Mic pipeline ───────────────────────────────────────────────────────────
     let (mic_audio_tx, mic_audio_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();

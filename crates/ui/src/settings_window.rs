@@ -5,15 +5,26 @@ use std::sync::{Arc, Mutex};
 
 use crate::TrayAction;
 
-/// Stages displayed in the metrics panel, in pipeline order. Stages
-/// outside this list (none today) are silently ignored — keeps the
-/// panel layout stable when new stages are added later.
+/// Stages displayed in the metrics panel, in pipeline order. The first
+/// element is the internal stage key emitted by the pipeline; the second
+/// is the human-readable label shown in the UI. Labels were renamed
+/// from technical jargon (VAD/STT/MT/TTS) to plain Portuguese so the
+/// panel makes sense to anyone, not just to people who built the
+/// pipeline. The mapping table in plain English for posterity:
+///   vad                       → "Detecção de fala"
+///   stt                       → "Reconhecimento de voz"
+///   translate_first_fragment  → "Tempo até 1ª palavra"
+///   translate                 → "Tradução completa"
+///   tts                       → "Geração de áudio"
+///   total                     → "Latência ponta-a-ponta"
 const METRIC_STAGES: &[(&str, &str)] = &[
-    ("vad",       "VAD"),
-    ("stt",       "STT"),
-    ("translate", "Translate"),
-    ("tts",       "TTS"),
-    ("total",     "Total"),
+    ("vad",                      "Detecção de fala"),
+    ("stt",                      "Reconhecimento de voz"),
+    ("translate_first_fragment", "Tempo até 1ª palavra"),
+    ("translate",                "Tradução completa"),
+    ("tts",                      "Geração de áudio"),
+    ("ttfa",                     "Tempo até 1º som"),
+    ("total",                    "Latência ponta-a-ponta"),
 ];
 
 /// How often the settings window is forced to repaint while open. The

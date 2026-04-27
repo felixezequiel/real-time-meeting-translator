@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     This script removes:
-    - Python packages (transformers, torch, speechbrain, ctranslate2, etc.)
+    - Python packages (transformers, torch, speechbrain, llama-cpp-python, kokoro-onnx, etc.)
     - Downloaded ML models (models/ directory)
     - Whisper GGML models
     - Rust build artifacts (target/ directory)
@@ -81,6 +81,8 @@ function Remove-PythonPackages {
         "tokenizers",
         "safetensors",
         "ctranslate2",
+        "llama-cpp-python",
+        "kokoro-onnx",
         "onnxruntime",
         # New stack (CosyVoice 2 + SpeechBrain)
         "speechbrain",

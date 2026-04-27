@@ -143,19 +143,36 @@ impl AudioPlayback {
 /// produces when talking over the source speaker.
 const PASSTHROUGH_DUCK_GAIN: f32 = 0.35;
 
+/// Linear gain applied to the TTS stream before mixing. 1.20 (+20%) is the
+/// boost the user noticed missing after the streaming pipeline refactor —
+/// it makes the translation sit clearly *above* the ducked passthrough
+/// rather than at parity. Applied before the final ±1.0 clamp; loud peaks
+/// clip but TTS output rarely peaks above 0.85, so the audible range
+/// stays intact for normal speech.
+const TTS_GAIN_BOOST: f32 = 1.20;
+
 /// Time for the passthrough gain to settle (~95%) to its new target when
 /// TTS starts/stops. Slow enough to avoid pumping artifacts on short TTS
 /// gaps, fast enough to not clip the start of a sentence.
 const DUCK_SETTLE_SECONDS: f32 = 0.15;
 
-/// Mixes a passthrough stream and a TTS stream into one output device,
-/// applying smooth gain modulation to the passthrough while the TTS buffer
-/// contains audio. Replaces the older WASAPI ducker — this acts only on our
-/// own playback mix, never touches external application volumes.
+/// Mixes a passthrough stream and one-or-more TTS streams into one output
+/// device, applying smooth gain modulation to the passthrough while any
+/// TTS buffer contains audio.
 ///
-/// Contract: both streams should arrive at the device's sample rate. When
-/// they don't, the ingester resamples in 1024-frame chunks (Rubato FFT-based
-/// resampler).
+/// Why "one-or-more": when source separation is on (ADR 0007), two
+/// speakers talking at the same time produce two parallel translation
+/// streams. If we appended both into a single TTS buffer, two
+/// simultaneous voices would play sequentially — doubling the spoken
+/// duration of an overlap moment and dropping the listener several
+/// seconds behind real time. By keeping a separate buffer per TTS
+/// source and SUMMING them frame-by-frame, the listener hears overlap
+/// AS overlap (preserving the temporality of the original audio) and
+/// no extra latency accumulates from queueing.
+///
+/// Contract: every stream should arrive at the device's sample rate.
+/// When it doesn't, the ingester resamples in 1024-frame chunks
+/// (Rubato FFT-based resampler).
 pub struct MixerPlayback {
     device: Device,
 }
@@ -168,7 +185,7 @@ impl MixerPlayback {
     pub fn start(
         &self,
         passthrough_rx: mpsc::UnboundedReceiver<AudioChunk>,
-        tts_rx: mpsc::UnboundedReceiver<AudioChunk>,
+        tts_rxs: Vec<mpsc::UnboundedReceiver<AudioChunk>>,
     ) -> Result<cpal::Stream, PlaybackError> {
         let config = self
             .device
@@ -180,18 +197,33 @@ impl MixerPlayback {
         let sample_format = config.sample_format();
 
         tracing::info!(
-            "Mixer playback: {}Hz, {} ch, {:?}",
-            out_rate, out_channels, sample_format,
+            "Mixer playback: {}Hz, {} ch, {:?}, tts_streams={}",
+            out_rate, out_channels, sample_format, tts_rxs.len(),
         );
 
         let stream_config: StreamConfig = config.into();
 
         let passthrough_buf: Arc<Mutex<VecDeque<f32>>> =
             Arc::new(Mutex::new(VecDeque::new()));
-        let tts_buf: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let tts_bufs: Vec<Arc<Mutex<VecDeque<f32>>>> = tts_rxs
+            .iter()
+            .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+            .collect();
 
         spawn_ingester("passthrough", passthrough_rx, passthrough_buf.clone(), out_rate, out_channels);
-        spawn_ingester("tts", tts_rx, tts_buf.clone(), out_rate, out_channels);
+        for (idx, rx) in tts_rxs.into_iter().enumerate() {
+            // Static-name table for up to 4 TTS streams. Beyond that we
+            // log them all under "tts-N" via a leaked String (rare; keeps
+            // the spawn_ingester signature simple).
+            let name: &'static str = match idx {
+                0 => "tts-0",
+                1 => "tts-1",
+                2 => "tts-2",
+                3 => "tts-3",
+                _ => Box::leak(format!("tts-{}", idx).into_boxed_str()),
+            };
+            spawn_ingester(name, rx, tts_bufs[idx].clone(), out_rate, out_channels);
+        }
 
         let error_callback = |err: cpal::StreamError| {
             tracing::error!("Mixer playback stream error: {}", err);
@@ -205,22 +237,37 @@ impl MixerPlayback {
         let stream = match sample_format {
             SampleFormat::F32 => {
                 let pt_reader = passthrough_buf.clone();
-                let tts_reader = tts_buf.clone();
+                let tts_readers = tts_bufs.clone();
                 let mut current_gain: f32 = 1.0;
                 let data_callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut pt = pt_reader.lock().unwrap();
-                    let mut tts = tts_reader.lock().unwrap();
-                    let tts_active = !tts.is_empty();
-                    let target_gain = if tts_active { PASSTHROUGH_DUCK_GAIN } else { 1.0 };
+                    // Lock all TTS buffers up front so the per-frame loop
+                    // does not pay re-acquisition cost. Lock order is
+                    // stable (vector index) so a deadlock between two
+                    // concurrent callbacks is impossible by construction.
+                    let mut ttss: Vec<_> = tts_readers
+                        .iter()
+                        .map(|b| b.lock().unwrap())
+                        .collect();
+                    let any_tts_active = ttss.iter().any(|b| !b.is_empty());
+                    let target_gain = if any_tts_active { PASSTHROUGH_DUCK_GAIN } else { 1.0 };
 
                     let frames = data.len() / channels_usize;
                     for frame_idx in 0..frames {
                         current_gain += (target_gain - current_gain) * ramp_coeff;
                         let base = frame_idx * channels_usize;
                         for ch in 0..channels_usize {
-                            let tts_sample = tts.pop_front().unwrap_or(0.0);
+                            // Sum every TTS stream's next sample. Each
+                            // sample is gain-boosted; the final clamp
+                            // catches the overflow when both streams are
+                            // simultaneously loud (which is exactly the
+                            // overlap case we're rendering).
+                            let mut tts_sum: f32 = 0.0;
+                            for tts in ttss.iter_mut() {
+                                tts_sum += tts.pop_front().unwrap_or(0.0) * TTS_GAIN_BOOST;
+                            }
                             let pt_sample = pt.pop_front().unwrap_or(0.0);
-                            let mixed = tts_sample + pt_sample * current_gain;
+                            let mixed = tts_sum + pt_sample * current_gain;
                             data[base + ch] = mixed.clamp(-1.0, 1.0);
                         }
                     }
@@ -231,22 +278,28 @@ impl MixerPlayback {
             }
             SampleFormat::I16 => {
                 let pt_reader = passthrough_buf.clone();
-                let tts_reader = tts_buf.clone();
+                let tts_readers = tts_bufs.clone();
                 let mut current_gain: f32 = 1.0;
                 let data_callback = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     let mut pt = pt_reader.lock().unwrap();
-                    let mut tts = tts_reader.lock().unwrap();
-                    let tts_active = !tts.is_empty();
-                    let target_gain = if tts_active { PASSTHROUGH_DUCK_GAIN } else { 1.0 };
+                    let mut ttss: Vec<_> = tts_readers
+                        .iter()
+                        .map(|b| b.lock().unwrap())
+                        .collect();
+                    let any_tts_active = ttss.iter().any(|b| !b.is_empty());
+                    let target_gain = if any_tts_active { PASSTHROUGH_DUCK_GAIN } else { 1.0 };
 
                     let frames = data.len() / channels_usize;
                     for frame_idx in 0..frames {
                         current_gain += (target_gain - current_gain) * ramp_coeff;
                         let base = frame_idx * channels_usize;
                         for ch in 0..channels_usize {
-                            let tts_sample = tts.pop_front().unwrap_or(0.0);
+                            let mut tts_sum: f32 = 0.0;
+                            for tts in ttss.iter_mut() {
+                                tts_sum += tts.pop_front().unwrap_or(0.0) * TTS_GAIN_BOOST;
+                            }
                             let pt_sample = pt.pop_front().unwrap_or(0.0);
-                            let mixed = (tts_sample + pt_sample * current_gain).clamp(-1.0, 1.0);
+                            let mixed = (tts_sum + pt_sample * current_gain).clamp(-1.0, 1.0);
                             data[base + ch] = (mixed * i16::MAX as f32) as i16;
                         }
                     }
@@ -271,8 +324,21 @@ impl MixerPlayback {
     }
 }
 
+// NOTE: a previous revision had a TTS_MAX_QUEUED_SECONDS cap that
+// dropped queued audio when it grew past a threshold. We removed it.
+// The product priority is communication completeness — losing a
+// fragment is worse UX than the listener being a few seconds behind.
+// The TTS speedup (Kokoro speed=1.20) keeps the queue drift bounded
+// in practice: PT at 1.20× plays in roughly the same wall-clock time
+// as EN at 1.0×, so the queue stabilises around a small constant
+// during meetings with normal pauses. Sustained monologues still
+// drift, but the listener gets every word translated.
+
 /// Reads chunks from `rx`, normalizes them to (out_rate, out_channels)
-/// interleaved, and appends to the shared ring buffer.
+/// interleaved, and appends to the shared ring buffer. No drop policy:
+/// every sample produced upstream eventually plays, even if it queues
+/// behind a long backlog. Trade-off chosen deliberately — see comment
+/// above.
 fn spawn_ingester(
     name: &'static str,
     mut rx: mpsc::UnboundedReceiver<AudioChunk>,

@@ -13,7 +13,7 @@
     - Python 3.12+ (via winget)
     - VB-Cable virtual audio driver (meeting audio loopback)
     - Hi-Fi Cable virtual audio driver (mic TTS output)
-    - Python packages (faster-whisper, transformers, piper-tts, etc.)
+    - Python packages (kokoro-onnx, llama-cpp-python, speechbrain, transformers, etc.)
     - Whisper GGML model download
     - CosyVoice 2-0.5B clone + weights download (TTS + zero-shot voice cloning)
     - SpeechBrain ECAPA-TDNN warm-up (online diarisation)
@@ -528,12 +528,12 @@ function Install-PythonDeps {
 
     # Verify the imports the bridges will actually perform — if any of
     # these fail the bridges crash on startup with ModuleNotFoundError.
-    # This list reflects the Piper + pyworld + speechbrain stack; the
-    # CosyVoice-era deps (hyperpyyaml, lightning, diffusers, …) were
-    # removed when the TTS path moved back to Piper (ADR 0006).
+    # Stack: Qwen via llama-cpp-python (translation), kokoro-onnx (TTS),
+    # pyworld (pitch shift), speechbrain (diarisation + separation).
     $criticalImports = @(
-        "transformers", "torch", "torchaudio", "ctranslate2",
-        "piper", "pyworld", "speechbrain", "numpy"
+        "transformers", "torch", "torchaudio",
+        "llama_cpp", "kokoro_onnx", "pyworld",
+        "speechbrain", "numpy"
     )
     $missing = @()
     foreach ($pkg in $criticalImports) {
@@ -639,6 +639,76 @@ function Install-TranslationModels {
     } else {
         Write-Fail "Conversion failed for $hfName (exit $exit)"
         Write-Host "  Run manually: $PythonExe -m ctranslate2.converters.transformers --model $hfName --output_dir $targetDir --quantization int8" -ForegroundColor Yellow
+    }
+}
+
+function Install-KokoroModel {
+    # Kokoro v1.0 ONNX TTS — replaced Piper. Two files: the ~330 MB
+    # ONNX graph and the ~25 MB voice bank. Both live under
+    # `models/kokoro/` so the bridge can find them with a single search.
+    Write-Step "Kokoro v1.0 TTS Model"
+
+    $kokoroDir = Join-Path $ModelsDir "kokoro"
+    if (-not (Test-Path $kokoroDir)) {
+        New-Item -Path $kokoroDir -ItemType Directory -Force | Out-Null
+    }
+
+    $files = @(
+        @{
+            name = "kokoro-v1.0.onnx"
+            url = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
+        },
+        @{
+            name = "voices-v1.0.bin"
+            url = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+        }
+    )
+
+    foreach ($file in $files) {
+        $localPath = Join-Path $kokoroDir $file.name
+        if (Test-Path $localPath) {
+            $size = [math]::Round((Get-Item $localPath).Length / 1MB, 1)
+            Write-Ok "$($file.name) already downloaded (${size} MB)"
+            continue
+        }
+        Write-Host "  Downloading $($file.name)..." -ForegroundColor Gray
+        try {
+            Invoke-WebRequest -Uri $file.url -OutFile $localPath -UseBasicParsing
+            $size = [math]::Round((Get-Item $localPath).Length / 1MB, 1)
+            Write-Ok "$($file.name) (${size} MB)"
+        } catch {
+            Write-Fail "Could not download $($file.name) : $_"
+        }
+    }
+}
+
+function Install-LlmModel {
+    # Qwen 2.5 1.5B Instruct, Q4_K_M GGUF — local LLM for streaming
+    # translation. ~1 GB on disk, ~1 GB VRAM. Replaces NLLB CT2.
+    Write-Step "Qwen 2.5 1.5B Instruct (GGUF, Q4_K_M)"
+
+    if (-not (Test-Path $ModelsDir)) {
+        New-Item -Path $ModelsDir -ItemType Directory -Force | Out-Null
+    }
+
+    $modelName = "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
+    $modelFile = Join-Path $ModelsDir $modelName
+    if (Test-Path $modelFile) {
+        $size = [math]::Round((Get-Item $modelFile).Length / 1MB, 1)
+        Write-Ok "$modelName already downloaded (${size} MB)"
+        return
+    }
+
+    # Hosted by Qwen team's official GGUF repo on HuggingFace.
+    $modelUrl = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+    Write-Host "  Downloading $modelName (~1 GB)..." -ForegroundColor Gray
+    try {
+        Invoke-WebRequest -Uri $modelUrl -OutFile $modelFile -UseBasicParsing
+        $size = [math]::Round((Get-Item $modelFile).Length / 1MB, 1)
+        Write-Ok "$modelName (${size} MB)"
+    } catch {
+        Write-Fail "Could not download $modelName : $_"
+        Write-Host "  Manual: Invoke-WebRequest -Uri '$modelUrl' -OutFile '$modelFile' -UseBasicParsing" -ForegroundColor Yellow
     }
 }
 
@@ -1187,8 +1257,8 @@ Install-HiFiCable
 # 5. Dependencies
 Install-PythonDeps -PythonExe $pythonExe
 Install-WhisperModel
-Install-TranslationModels -PythonExe $pythonExe
-Install-PiperVoices
+Install-LlmModel
+Install-KokoroModel
 Install-DiarizationModel -PythonExe $pythonExe
 Install-SeparationModel -PythonExe $pythonExe
 

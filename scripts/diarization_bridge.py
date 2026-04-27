@@ -71,15 +71,24 @@ stdin_bin = sys.stdin.buffer
 EXPECTED_SAMPLE_RATE = 16_000
 
 # Cosine threshold for matching a chunk to a known speaker. Tuned for
-# ECAPA-TDNN: empirically, intra-speaker similarities sit ~0.65-0.85
-# and inter-speaker similarities ~0.10-0.45, so 0.55 cleanly separates
-# the two with margin. Resemblyzer needed 0.75 because its embedding
-# is noisier; do not raise this without measuring on the new model.
-MATCH_THRESHOLD = 0.55
+# ECAPA-TDNN. Lowered from 0.55 to 0.45 so documentaries with several
+# speakers of similar timbre (e.g. multiple adult men in a panel
+# discussion) get split into distinct speaker_ids instead of being
+# merged into one. Intra-speaker similarities for ECAPA usually stay
+# above 0.55 even on short windows, so 0.45 keeps the same speaker
+# stable while admitting more inter-speaker discrimination. Trade-off:
+# a slight risk of ONE speaker being split across two ids when the
+# audio quality varies a lot. The downstream voice-assignment logic
+# is "first come, first voice" so a split id just gets a different
+# voice — confusing but not catastrophic.
+MATCH_THRESHOLD = 0.45
 
-# Hard cap on concurrently tracked speakers; keeps the cosine-scan
-# cost bounded and prevents runaway clustering on noisy sessions.
-MAX_SPEAKERS = 8
+# Hard cap on concurrently tracked speakers. Documentaries can easily
+# hit 8-12 speakers across an episode; raising the cap means we don't
+# silently merge late-appearing speakers into earlier ones. The
+# cosine scan over N speakers is O(N) per chunk — at N=16 this is
+# still <1 ms.
+MAX_SPEAKERS = 16
 
 # Evict speakers whose last chunk is older than this. Their slot is
 # reused for the next person who shows up. 120 s tolerates normal

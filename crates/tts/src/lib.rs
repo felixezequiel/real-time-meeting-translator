@@ -22,7 +22,7 @@ pub enum TtsError {
 
 /// Target voice characteristics for the next synthesis. Resolved per-call
 /// from the speaker's running F0 + formant profile maintained by the
-/// pipeline; `None` means "use Piper's default voice unchanged".
+/// pipeline; default values mean "use the bridge's default voice".
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VoiceProfile {
     /// Target F0 in Hz (mean of voiced frames in the speaker's recent
@@ -31,6 +31,12 @@ pub struct VoiceProfile {
     /// Spectral-envelope warp ratio. 1.0 = no formant shift; >1 enlarges
     /// the vocal tract → deeper voice; <1 narrows → thinner.
     pub formant_shift: f32,
+    /// Diarised speaker id this synthesis is attributed to. The bridge
+    /// uses it to keep voice routing stable across utterances of the
+    /// same speaker (sticky voice + F0 hysteresis) — without it, F0
+    /// jitter chunk-to-chunk would alternate the same person's
+    /// translations between male and female voices.
+    pub speaker_id: Option<u32>,
 }
 
 impl VoiceProfile {
@@ -50,6 +56,10 @@ struct TtsRequest {
     target_f0: f32,
     /// Spectral-envelope warp. Always sent — defaults to 1.0 (no warp).
     formant_shift: f32,
+    /// Diarised speaker id, when known. The bridge keeps a sticky voice
+    /// per id so the same speaker keeps the same voice across utterances.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaker_id: Option<u32>,
 }
 
 fn f32_is_zero_or_negative(value: &f32) -> bool {
@@ -63,9 +73,13 @@ struct TtsResponseHeader {
     num_samples: u32,
 }
 
-/// Piper TTS client with optional pitch/formant shifting via the bridge's
-/// pyworld stage. Replaces the previous CosyVoice 2 zero-shot cloner —
-/// see ADR 0006.
+/// Local TTS client with optional pyworld pitch/formant shifting on top.
+///
+/// The current backend is **Kokoro v1.0** (~82M params, ONNX, 24 kHz —
+/// see ADR 0010). The struct kept its `PiperTts` name from the previous
+/// backend because the Rust-side protocol is identical (only the
+/// Python bridge changed); renaming would churn every downstream import
+/// for no functional gain.
 ///
 /// One instance owns a single Python subprocess; the `Mutex` serialises
 /// concurrent callers so stdout frames don't interleave. Clone the
@@ -122,6 +136,7 @@ impl PiperTts {
             } else {
                 1.0
             },
+            speaker_id: voice_profile.speaker_id,
         };
 
         let request_json =

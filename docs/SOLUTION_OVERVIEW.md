@@ -60,8 +60,8 @@ direção contamine a captura da outra.
 Capture (cpal/WASAPI) → Silero VAD → Sepformer (opt-in)
    → Streaming Whisper STT (Local Agreement-2)
    → Diarização ECAPA-TDNN + F0 (pyworld)
-   → Tradução NLLB-200 via CTranslate2 int8_float16
-   → Piper TTS + WORLD pitch shift
+   → Tradução Qwen 2.5 1.5B (llama.cpp, streaming token-a-token)
+   → Kokoro v1.0 TTS (24 kHz) + WORLD pitch shift
    → Mixer com ducking WASAPI → Saída
 ```
 
@@ -108,27 +108,32 @@ Capture (cpal/WASAPI) → Silero VAD → Sepformer (opt-in)
 - **F0 tracking:** pyworld DIO extrai a fundamental por chunk; média rolante
   por speaker_id alimenta o pitch shift do TTS.
 
-### 3.6 Tradução — **NLLB-200-distilled-600M** via **CTranslate2 int8_float16**
-- Modelo único bidirecional via `target_prefix` (códigos FLORES-200
-  `eng_Latn` / `por_Latn`).
-- Beam=5, `length_penalty=1.0`, `no_repeat_ngram=3`.
-- **Custo:** ~150–200 ms/sentença em GPU int8_float16.
-- Substituiu Opus-MT (commit 94099c1) — output mais natural e context-aware,
-  custo equivalente.
-- **Não é LLM autoregressivo de propósito geral** — é encoder-decoder
-  especializado em tradução. Sem alucinação criativa.
+### 3.6 Tradução — **Qwen 2.5 1.5B Instruct** (llama.cpp, streaming) — ADR 0009
+- LLM autoregressivo Q4_K_M GGUF, ~1 GB VRAM na RTX 3050.
+- Streaming token-a-token com **fragment commits** em pontuação ou 25-char.
+  TTS começa a sintetizar antes do LLM terminar de gerar a frase.
+- System prompt rígido + 8 few-shot examples PT↔EN (técnicos + casuais)
+  garantem que o modelo se comporte como engine de tradução.
+- **Custo:** ~80-150 ms first-token; depois ~15 ms/tok.
+- Substituiu NLLB-200 + CTranslate2 (atomic) — output significativamente
+  melhor em casos de contexto, idiomatismos e termos técnicos. Mesmo gap
+  de qualidade que separa GPT-4 de Google Translate, mas em escala menor
+  (1.5B vs 600M).
 
-### 3.7 TTS — **Piper** + **WORLD analysis-synthesis** (pyworld)
-- Piper sintetiza em voz fixa por idioma (Faber-medium pt-BR, Ryan-medium en-US).
-- ONNX, **roda em CPU**, ~150 ms/utterance, ~25 MB por voz.
-- pyworld extrai F0, envelope espectral e aperiodicidade do output do Piper,
-  troca a F0 pela média rolante do speaker, aplica formant shift conservador
-  (clamp 0.85–1.15) e ressintetiza.
-- Total TTS: **~250–350 ms** com pitch shift.
-- **Trade-off explícito:** a voz NÃO clona o speaker — só mantém um
-  *cue* de "quem está falando agora" via pitch + formant. Para clonar de
-  fato seria preciso CosyVoice 2-0.5B (testado e descartado: 2–4 s/utterance
-  numa RTX 3050 6 GB, fora do orçamento de latência).
+### 3.7 TTS — **Kokoro v1.0** + **WORLD analysis-synthesis** (pyworld) — ADR 0010
+- Kokoro v1.0 ONNX (~82M params, 24 kHz). Vozes: `am_michael`/`af_bella`
+  (en-US M/F), `pm_alex`/`pf_dora` (pt-BR M/F).
+- **Roda em GPU via onnxruntime-gpu**, ~100-200 ms/utterance.
+- pyworld continua por cima: extrai F0/sp/ap, troca F0 pela média rolante
+  do speaker, aplica formant shift conservador (clamp 0.85-1.15) e
+  ressintetiza. Multi-voice routing pega a base mais próxima (e.g.
+  `af_bella` pra falante feminina) → shift residual pequeno → output
+  natural sem artefatos pyworld.
+- Total TTS: **~200-300 ms** com pitch shift.
+- **Trade-off explícito:** a voz NÃO clona o speaker — Kokoro é uma voz
+  fixa, pyworld só desloca pitch/formant. Para clonar de fato seria preciso
+  CosyVoice 2-0.5B (testado e descartado: 2-4 s/utterance numa RTX 3050
+  6 GB, fora do orçamento de latência — ADR 0006).
 
 ### 3.8 Mixer + Ducking — **WASAPI Session API**
 - Mixer único combina passthrough do áudio original com TTS.
@@ -147,8 +152,8 @@ Capture (cpal/WASAPI) → Silero VAD → Sepformer (opt-in)
 | Núcleo / orquestração | **Rust** (Tokio async) | Performance, zero-cost abstractions, FFI direto com whisper.cpp e ONNX Runtime |
 | STT runtime | whisper.cpp (via `whisper-rs`) | Único do mercado com q5_1 + GPU CUDA + qualidade PT-BR |
 | ML runtime (VAD) | ONNX Runtime (`ort`) | Inferência leve em Rust nativo, sem Python no caminho do áudio |
-| Tradução runtime | CTranslate2 (Python bridge) | 3–5× throughput vs HuggingFace transformers; int8 com perda chrF <1 |
-| TTS runtime | Piper ONNX (Python bridge) | TTS neural <200 ms em CPU, sem GPU |
+| Tradução runtime | llama-cpp-python (Python bridge) com Qwen 2.5 1.5B Q4_K_M | LLM streaming, GPU CUDA, fragment commits sub-200ms first-token |
+| TTS runtime | Kokoro v1.0 ONNX via kokoro-onnx (Python bridge) | TTS neural ~200ms GPU, qualidade muito acima de Piper |
 | Diarização | SpeechBrain ECAPA-TDNN (Python bridge) | Open weights, embedding com margem confortável |
 | Source separation | Sepformer libri2mix (Python bridge) | Estado-da-arte para 2 falantes simultâneos |
 | Áudio I/O | `cpal` + WASAPI | Loopback nativo Windows, low-level |
@@ -171,8 +176,8 @@ durante I/O com Python.
 | Separação (Sepformer, GPU, opt-in) | 50 ms | 80 ms | opcional |
 | STT (Whisper small q5_1, streaming) | ~250 ms / inferência (a cada 250 ms) | — | dominante |
 | Diarização (ECAPA + F0) | 30–50 ms | 70 ms | secundário |
-| Tradução (NLLB int8_float16) | 150 ms | 250 ms | secundário |
-| TTS (Piper + pyworld) | 250 ms | 400 ms | secundário |
+| Tradução first-fragment (Qwen 1.5B Q4 streaming) | 80–150 ms | 250 ms | secundário (streaming) |
+| TTS por fragmento (Kokoro + pyworld) | 200 ms | 350 ms | secundário (streaming) |
 | Ducking (debounced) | <5 ms | — | trivial |
 | **End-to-end** (primeira palavra → áudio nos fones) | **~1.5–2 s** | **~3 s** | dentro do alvo de 2–5 s |
 
@@ -182,8 +187,9 @@ vezes do que um pipeline batch-mode rodaria. O ganho está em **time-to-first-wo
 com batch, a primeira palavra só sai depois de ~2.5 s acumulados; com streaming,
 ela sai ~1 s depois do speaker começar a falar.
 
-**VRAM em uso:** ~2 GB (Whisper) + ~1.2 GB (NLLB CT2) + ~120 MB (Sepformer
-opt-in). Cabe folgado em GPU 6 GB. TTS roda em CPU.
+**VRAM em uso:** ~1.2 GB (Whisper q5_1) + ~1.0 GB (Qwen 1.5B Q4) +
+~300 MB (Kokoro) + ~120 MB (Sepformer opt-in). Total ~2.6 GB ativos
+em GPU. Cabe folgado em GPU 6 GB.
 
 ---
 
@@ -249,6 +255,8 @@ opt-in). Cabe folgado em GPU 6 GB. TTS roda em CPU.
 | 0006 | Piper + pyworld pitch shift (substitui CosyVoice) | `docs/adr/0006-piper-pitch-shift-tts.md` |
 | 0007 | Sepformer source separation (opt-in) | `docs/adr/0007-sepformer-source-separation.md` |
 | 0008 | Silero VAD (substitui RMS gate) | `docs/adr/0008-silero-vad.md` |
+| 0009 | Streaming MT via Qwen 2.5 1.5B (substitui NLLB CT2) | `docs/adr/0009-qwen-streaming-translation.md` |
+| 0010 | Kokoro v1.0 TTS (substitui Piper) | `docs/adr/0010-kokoro-tts.md` |
 
 Cada ADR contém: contexto, decisão, alternativas consideradas, consequências
 positivas/negativas/neutras, plano de rollout e plano de rollback.
@@ -259,8 +267,9 @@ positivas/negativas/neutras, plano de rollout e plano de rollback.
 
 - **Stack:** Rust + Python bridges, tudo offline, Windows-only.
 - **STT:** Whisper small q5_1 nativo, streaming com Local Agreement-2.
-- **Tradução:** NLLB-200-distilled-600M via CTranslate2 int8_float16.
-- **TTS:** Piper (CPU) + pyworld pitch shift por speaker.
+- **Tradução:** Qwen 2.5 1.5B Instruct via llama-cpp-python, streaming
+  token-a-token com fragment commits.
+- **TTS:** Kokoro v1.0 (GPU) + pyworld pitch shift por speaker.
 - **VAD:** Silero ONNX nativo (Rust).
 - **Diarização:** ECAPA-TDNN + F0 com confidence smoothing.
 - **Separation:** Sepformer libri2mix (opt-in).
