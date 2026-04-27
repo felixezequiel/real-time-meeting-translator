@@ -19,6 +19,7 @@ use tts::PiperTts;
 use ui::{TrayAction, TrayUi};
 use diarization::OnlineDiarizer;
 use separation::Sepformer;
+use voice_convert::ToneColorConverter;
 
 /// VB-Cable A: used as system default output so meeting audio flows here.
 /// Loopback captures from this device (meeting audio only).
@@ -83,6 +84,11 @@ struct LoadedModels {
     /// can be transcribed and rendered separately. Initialised only
     /// when `config.enable_separation` is true at startup.
     separator: Option<Arc<Sepformer>>,
+    /// Optional OpenVoice v2 tone-color converter (ADR 0011). Shared
+    /// by every pipeline branch — the bridge's mutex serialises
+    /// concurrent calls. Initialised only when
+    /// `config.enable_voice_conversion` is true at startup.
+    voice_convert: Option<Arc<ToneColorConverter>>,
 }
 
 // ─── Active audio pipelines (cheap — can be restarted on device change) ──────
@@ -340,6 +346,30 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
     // model download and ~50 ms / chunk runtime cost. When on, the
     // loopback stream is split into 2 channels and each fed through a
     // parallel pipeline.
+    // OpenVoice v2 tone-color converter (ADR 0011). The bridge can
+    // refuse to start when the OpenVoice repo or the TCC checkpoint
+    // hasn't been vendored yet — that's a soft failure that downgrades
+    // the pipeline to plain Kokoro output, never a hard crash.
+    let voice_convert = if config.enable_voice_conversion {
+        let voice_convert_script = scripts_dir.join("voice_convert_bridge.py");
+        tracing::info!("Initializing OpenVoice v2 tone-color converter…");
+        let mut vc = ToneColorConverter::new(voice_convert_script);
+        match vc.initialize().await {
+            Ok(()) => Some(Arc::new(vc)),
+            Err(e) => {
+                tracing::warn!(
+                    "Voice-convert bridge failed to start ({}). \
+                     Pipeline will play raw Kokoro output without timbre conversion.",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        tracing::info!("Voice conversion disabled (enable_voice_conversion=false)");
+        None
+    };
+
     let separator = if config.enable_separation {
         let separation_script = scripts_dir.join("separation_bridge.py");
         tracing::info!("Initializing source separator (Sepformer-libri2mix)…");
@@ -360,6 +390,7 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
         tts_english: Arc::new(tts_english),
         diarizer,
         separator,
+        voice_convert,
     })
 }
 
@@ -466,6 +497,9 @@ async fn start_pipelines(
         if let Some(vad) = try_create_silero_vad(name) {
             pipeline = pipeline.with_vad(vad);
         }
+        if let Some(vc) = models.voice_convert.as_ref() {
+            pipeline = pipeline.with_voice_convert(Arc::clone(vc));
+        }
         let branch_name = name.to_string();
         tokio::spawn(async move {
             pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
@@ -523,6 +557,9 @@ async fn start_pipelines(
     }
     if let Some(vad) = try_create_silero_vad("Mic") {
         mic_pipeline = mic_pipeline.with_vad(vad);
+    }
+    if let Some(vc) = models.voice_convert.as_ref() {
+        mic_pipeline = mic_pipeline.with_voice_convert(Arc::clone(vc));
     }
     tokio::spawn(async move {
         mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;

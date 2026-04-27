@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn voice_profile_is_active_when_f0_positive() {
-        let profile = VoiceProfile { target_f0_hz: 180.0, formant_shift: 1.0 };
+        let profile = VoiceProfile { target_f0_hz: 180.0, formant_shift: 1.0, speaker_id: None };
         assert!(profile.is_active());
         let default = VoiceProfile::default();
         assert!(!default.is_active());
@@ -271,6 +271,7 @@ mod tests {
             language: "pt".to_string(),
             target_f0: 0.0,
             formant_shift: 1.0,
+            speaker_id: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("target_f0"));
@@ -284,6 +285,7 @@ mod tests {
             language: "en".to_string(),
             target_f0: 220.0,
             formant_shift: 0.95,
+            speaker_id: Some(0),
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("target_f0"));

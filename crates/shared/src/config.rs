@@ -16,6 +16,10 @@ const DEFAULT_CHUNK_DURATION_MS: u64 = 280;
 const DEFAULT_WHISPER_MODEL: &str = "small-q5_1";
 const DEFAULT_TTS_SPEED: f32 = 1.1;
 
+fn default_enable_voice_conversion() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     /// Language the other person speaks (what the speaker pipeline transcribes)
@@ -58,6 +62,16 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub enable_separation: bool,
 
+    /// Enable OpenVoice v2 tone-color conversion on the TTS output
+    /// (ADR 0011). When true, after Kokoro synthesises a fragment the
+    /// pipeline rewrites its timbre to match the actual speaker's
+    /// voice (extracted from a 6-second reference auto-enrolled from
+    /// live audio). Costs ~150–250 ms / fragment on GPU and ~50 MB
+    /// for the TCC checkpoint. Falls back to raw Kokoro output if
+    /// the bridge fails to start. Default: true.
+    #[serde(default = "default_enable_voice_conversion")]
+    pub enable_voice_conversion: bool,
+
     // NOTE: Earlier versions had `speaker_voice_reference_wav` and
     // `mic_voice_reference_wav` fields used by CosyVoice's zero-shot
     // cloning path. Those are gone now — voice differentiation comes
@@ -81,6 +95,7 @@ impl Default for PipelineConfig {
             mic_device: None,
             virtual_mic_device: None,
             enable_separation: false,
+            enable_voice_conversion: true,
         }
     }
 }

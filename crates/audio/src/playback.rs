@@ -138,10 +138,14 @@ impl AudioPlayback {
 
 // ─── Mixer playback: passthrough + TTS with smooth gain ducking ──────────────
 
-/// Passthrough gain while TTS is speaking. 0.35 keeps the original audio
-/// clearly audible but unmistakably backgrounded — same mix a TV interpreter
-/// produces when talking over the source speaker.
-const PASSTHROUGH_DUCK_GAIN: f32 = 0.35;
+/// Passthrough gain while TTS is speaking. 0.10 leaves the original
+/// audio audible only as a faint texture (enough to still feel the
+/// speaker's emotion / pacing) while the translation clearly dominates.
+/// At a TTS boost of 1.20 this puts the translation roughly 12 dB above
+/// the source — the comfortable separation a TV simultaneous interpreter
+/// gives. Earlier values (0.35, 0.18) left the streams too close in
+/// volume and the listener couldn't easily focus on the translation.
+const PASSTHROUGH_DUCK_GAIN: f32 = 0.10;
 
 /// Linear gain applied to the TTS stream before mixing. 1.20 (+20%) is the
 /// boost the user noticed missing after the streaming pipeline refactor —

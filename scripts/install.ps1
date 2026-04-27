@@ -948,6 +948,77 @@ print('Downloaded')
     }
 }
 
+function Install-OpenVoice {
+    param([string]$PythonExe)
+
+    # OpenVoice v2 Tone Color Converter (ADR 0011). Repo cloned into
+    # `third_party/OpenVoice/`; the bridge adds it to sys.path at boot.
+    # Checkpoint files (~50 MB) live under `models/openvoice/converter/`.
+    Write-Step "OpenVoice v2 Tone Color Converter"
+
+    $thirdPartyDir = Join-Path $ProjectRoot "third_party"
+    $repoDir = Join-Path $thirdPartyDir "OpenVoice"
+
+    if (-not (Test-Path $thirdPartyDir)) {
+        New-Item -Path $thirdPartyDir -ItemType Directory -Force | Out-Null
+    }
+
+    if (-not (Test-Path $repoDir)) {
+        Write-Host "  Cloning OpenVoice repo..." -ForegroundColor Gray
+        try {
+            & git clone https://github.com/myshell-ai/OpenVoice.git $repoDir 2>&1 | Out-Host
+        } catch {
+            Write-Fail "git clone failed: $_"
+            Write-Host "  Clone manually: git clone https://github.com/myshell-ai/OpenVoice.git $repoDir" -ForegroundColor Yellow
+            return
+        }
+    } else {
+        Write-Ok "OpenVoice repo already present at $repoDir"
+    }
+
+    # OpenVoice TCC v2 checkpoint. The myshell-ai/OpenVoiceV2 HF repo
+    # ships the converter under `converter/` — we mirror that layout
+    # so the bridge can find it under `models/openvoice/converter/`.
+    $converterDir = Join-Path $ModelsDir "openvoice\converter"
+    $ckptFile = Join-Path $converterDir "checkpoint.pth"
+    $cfgFile = Join-Path $converterDir "config.json"
+
+    if ((Test-Path $ckptFile) -and (Test-Path $cfgFile)) {
+        $size = [math]::Round((Get-Item $ckptFile).Length / 1MB, 1)
+        Write-Ok "OpenVoice checkpoint already present (${size} MB)"
+        return
+    }
+
+    if (-not (Test-Path $converterDir)) {
+        New-Item -Path $converterDir -ItemType Directory -Force | Out-Null
+    }
+
+    Write-Host "  Downloading OpenVoice v2 converter checkpoint (~50 MB)..." -ForegroundColor Gray
+    $downloadScript = @"
+from huggingface_hub import hf_hub_download
+import shutil, os
+repo = 'myshell-ai/OpenVoiceV2'
+target = r'$converterDir'
+for fname in ['converter/checkpoint.pth', 'converter/config.json']:
+    p = hf_hub_download(repo_id=repo, filename=fname)
+    dst = os.path.join(target, os.path.basename(fname))
+    shutil.copy(p, dst)
+print('Downloaded')
+"@
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $PythonExe -c $downloadScript 2>&1 | Out-Host
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = $prevPref
+
+    if ($exit -eq 0 -and (Test-Path $ckptFile) -and (Test-Path $cfgFile)) {
+        $size = [math]::Round((Get-Item $ckptFile).Length / 1MB, 1)
+        Write-Ok "OpenVoice checkpoint downloaded (${size} MB)"
+    } else {
+        Write-Skip "OpenVoice checkpoint download failed (voice conversion will be disabled at runtime)"
+    }
+}
+
 function Install-SeparationModel {
     param([string]$PythonExe)
 
@@ -1261,6 +1332,7 @@ Install-LlmModel
 Install-KokoroModel
 Install-DiarizationModel -PythonExe $pythonExe
 Install-SeparationModel -PythonExe $pythonExe
+Install-OpenVoice -PythonExe $pythonExe
 
 # 6. Configuration
 Configure-CargoConfig

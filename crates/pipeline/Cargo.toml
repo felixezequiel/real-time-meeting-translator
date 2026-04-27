@@ -10,6 +10,7 @@ stt = { path = "../stt" }
 translation = { path = "../translation" }
 tts = { path = "../tts" }
 diarization = { path = "../diarization" }
+voice_convert = { path = "../voice_convert" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

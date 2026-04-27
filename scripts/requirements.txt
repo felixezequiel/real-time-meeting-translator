@@ -29,3 +29,19 @@ pyworld>=0.3.5
 # Same bridge also runs pyworld DIO to return per-chunk F0 which feeds
 # the per-speaker running mean used by the TTS pitch shifter.
 speechbrain>=1.0.0
+
+# ── Voice conversion (OpenVoice v2 Tone Color Converter) ────────────────────
+# Rewrites Kokoro's timbre to match the actual speaker's voice using a
+# 6-second reference auto-enrolled from live audio. The repo itself is
+# vendored under third_party/OpenVoice (cloned by Install-OpenVoice) — these
+# are the runtime deps the converter needs at import time. ADR 0011.
+librosa>=0.10
+soundfile>=0.12
+pydub>=0.25
+inflect>=7.0
+unidecode>=1.3
+eng-to-ipa>=0.0.2
+pypinyin>=0.50
+cn2an>=0.5
+jieba>=0.42
+wavmark>=0.0.3

@@ -7,8 +7,12 @@ use tokio::sync::mpsc;
 use tracing;
 use translation::OpusMtTranslator;
 use tts::{PiperTts, VoiceProfile};
+use voice_convert::ToneColorConverter;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -26,10 +30,22 @@ const FALLBACK_MIN_RMS_FOR_STT: f32 = 0.003;
 /// translator.
 const MIN_WORDS_FOR_TIMEOUT_FLUSH: usize = 4;
 
+/// Minimum word count required before a *pause-driven* flush is allowed.
+/// Brief pauses inside a sentence (the speaker drawing breath, a small
+/// hesitation, a comma-length silence) used to flush eagerly with as
+/// little as 1–2 words, which fed the translator tiny disconnected
+/// fragments and hurt coherence. Holding until the accumulator has at
+/// least this many words turns those micro-pauses into accumulator
+/// growth instead of premature flushes — punctuation still flushes
+/// immediately regardless, so end-of-sentence latency is unchanged.
+const MIN_WORDS_FOR_PAUSE_FLUSH: usize = 6;
+
 /// Maximum time the text accumulator may hold without flushing. A simultaneous
 /// interpreter waits through long clauses rather than cut mid-thought; we
-/// bound the wait so a stuck accumulator eventually drains.
-const MAX_HOLD_SECONDS: f32 = 6.0;
+/// bound the wait so a stuck accumulator eventually drains. 8 s gives the
+/// pause-flush floor room to accumulate a meaningful chunk of speech
+/// without letting a stuck accumulator (rare) hold forever.
+const MAX_HOLD_SECONDS: f32 = 8.0;
 
 /// How long to keep recent translations for echo detection. STT feedback
 /// typically appears within 2-4 seconds of TTS playback.
@@ -64,6 +80,19 @@ const F0_RUNNING_MEAN_ALPHA: f32 = 0.2;
 const F0_MIN_HZ: f32 = 70.0;
 const F0_MAX_HZ: f32 = 400.0;
 
+/// Seconds of clean speech to collect per speaker before writing a
+/// reference WAV. OpenVoice TCC's SE extractor is happiest with 5–8 s
+/// of voice; less than ~3 s yields a noisy embedding that produces
+/// uneven timbre conversion. 6 s is the empirical sweet spot we used
+/// during the CosyVoice experiment too.
+const REFERENCE_ENROLL_SECONDS: f32 = 6.0;
+
+/// Minimum RMS for a chunk's samples to be admitted into a speaker's
+/// reference buffer. References built from breath, room tone or music
+/// poison the SE extractor — better to wait longer for clean speech
+/// than ship a polluted reference.
+const REFERENCE_INGEST_MIN_RMS: f32 = 0.015;
+
 /// Shared buffer of recent translation outputs, used to detect when the
 /// loopback captures our own TTS audio (feedback loop). Both pipelines
 /// share one buffer so cross-pipeline echo is also detected.
@@ -74,32 +103,59 @@ pub fn new_echo_buffer() -> EchoBuffer {
     Arc::new(Mutex::new(VecDeque::new()))
 }
 
-// ─── Voice profile registry: per-speaker running F0 ─────────────────────────
+// ─── Voice profile registry: per-speaker F0 + reference WAV enrolment ──────
 //
-// Replaces the file-based `SpeakerRegistry` from the CosyVoice era. Instead
-// of materialising a reference WAV on disk, we just track a running F0 mean
-// per speaker_id. The TTS stage reads the profile to bend Piper's output
-// pitch towards the original speaker — same "voices sound different per
-// person" UX the cloned-voice path was meant to provide, at a fraction of
-// the cost (no model, no GPU, ~10 ms of pyworld DSP per chunk).
+// Two responsibilities, one struct:
 //
-// One registry per pipeline branch, shared with the translate worker via
-// `Arc<Mutex<>>` so the TTS stage can read it without crossing the tokio
-// select loop.
+// 1. Per-speaker running F0 mean (used by Kokoro voice routing to pick
+//    a base voice and by the optional pyworld pitch shift).
+// 2. Per-speaker reference-WAV enrolment: as the diariser attributes
+//    chunks to a speaker, we accumulate ~6 s of clean audio and write
+//    it to disk. The OpenVoice TCC bridge then loads that WAV to
+//    extract the speaker's tone-color embedding and rewrites the
+//    Kokoro output's timbre to match — distinguishing speakers in
+//    documentaries beyond what F0 alone can do.
+//
+// One registry per pipeline branch, shared with the translate worker
+// via `Arc<>` so the TTS stage can read references without crossing
+// the tokio select loop.
 
-#[derive(Default)]
 struct VoiceProfileInner {
     f0_by_speaker: HashMap<u32, f32>,
+    /// Audio buffer per speaker; once it reaches `target_samples` we
+    /// flush to disk and stop accumulating for that speaker.
+    audio_buffers: HashMap<u32, Vec<f32>>,
+    /// Disk paths of materialised reference WAVs, keyed by speaker_id.
+    references: HashMap<u32, String>,
+    /// Speakers we've already enrolled — so subsequent ingests for
+    /// them are cheap no-ops instead of growing memory.
+    enrolled: HashSet<u32>,
 }
 
 pub struct VoiceProfileRegistry {
     inner: Mutex<VoiceProfileInner>,
+    pipeline_name: String,
+    sample_rate: u32,
+    target_samples: usize,
+    output_dir: PathBuf,
 }
 
 impl VoiceProfileRegistry {
-    fn new() -> Self {
+    fn new(pipeline_name: impl Into<String>, sample_rate: u32) -> Self {
+        let target_samples = (sample_rate as f32 * REFERENCE_ENROLL_SECONDS) as usize;
+        let output_dir = std::env::temp_dir().join("meeting_translator_refs");
+        let _ = std::fs::create_dir_all(&output_dir);
         Self {
-            inner: Mutex::new(VoiceProfileInner::default()),
+            inner: Mutex::new(VoiceProfileInner {
+                f0_by_speaker: HashMap::new(),
+                audio_buffers: HashMap::new(),
+                references: HashMap::new(),
+                enrolled: HashSet::new(),
+            }),
+            pipeline_name: pipeline_name.into(),
+            sample_rate,
+            target_samples,
+            output_dir,
         }
     }
 
@@ -122,7 +178,7 @@ impl VoiceProfileRegistry {
 
     /// Return the running mean F0 for `speaker_id`, or 0.0 when no F0
     /// has ever been recorded for them. The TTS stage interprets 0.0
-    /// as "use Piper's default voice unchanged".
+    /// as "use the default Kokoro voice unchanged".
     fn f0_for(&self, speaker_id: u32) -> f32 {
         self.inner
             .lock()
@@ -130,6 +186,111 @@ impl VoiceProfileRegistry {
             .and_then(|g| g.f0_by_speaker.get(&speaker_id).copied())
             .unwrap_or(0.0)
     }
+
+    /// Append fresh audio for `speaker_id` to the enrolment buffer.
+    /// Once we have `REFERENCE_ENROLL_SECONDS` of clean speech the
+    /// buffer is flushed to a WAV under the temp directory and the
+    /// resulting path becomes available via `reference_for`. Calls
+    /// after enrolment for the same speaker are cheap no-ops.
+    fn ingest_audio(&self, speaker_id: u32, samples: &[f32]) {
+        // Reject low-energy chunks before they hit the buffer — silence
+        // and music poison the OpenVoice SE extractor far more than a
+        // few extra seconds of waiting cost us.
+        let rms = (samples.iter().map(|s| s * s).sum::<f32>()
+            / samples.len().max(1) as f32)
+            .sqrt();
+        if rms < REFERENCE_INGEST_MIN_RMS {
+            return;
+        }
+
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        if inner.enrolled.contains(&speaker_id) {
+            return;
+        }
+
+        let buffer = inner.audio_buffers.entry(speaker_id).or_default();
+        buffer.extend_from_slice(samples);
+        if buffer.len() < self.target_samples {
+            return;
+        }
+
+        let snapshot: Vec<f32> = buffer[..self.target_samples].to_vec();
+        let path = self.output_dir.join(format!(
+            "ref_{}_{}.wav",
+            self.pipeline_name.to_lowercase(),
+            speaker_id,
+        ));
+
+        match write_mono_pcm_wav(&path, &snapshot, self.sample_rate) {
+            Ok(()) => {
+                let path_str = path.to_string_lossy().to_string();
+                tracing::info!(
+                    "[{}] Enrolled speaker {}: {} ({:.1}s)",
+                    self.pipeline_name,
+                    speaker_id,
+                    path_str,
+                    REFERENCE_ENROLL_SECONDS,
+                );
+                inner.references.insert(speaker_id, path_str);
+                inner.enrolled.insert(speaker_id);
+                inner.audio_buffers.remove(&speaker_id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[{}] Failed to write reference for speaker {}: {}",
+                    self.pipeline_name,
+                    speaker_id,
+                    e,
+                );
+            }
+        }
+    }
+
+    /// Path of the reference WAV for `speaker_id`, if enrolment has
+    /// completed. `None` means "no conversion possible yet — use raw
+    /// Kokoro output for this speaker".
+    fn reference_for(&self, speaker_id: u32) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|g| g.references.get(&speaker_id).cloned())
+    }
+}
+
+/// Mono 16-bit PCM WAV writer — small enough to keep here instead of
+/// pulling a WAV crate just for reference enrolment. Format is fixed
+/// (mono, 16-bit signed) because that's what every downstream consumer
+/// (OpenVoice's SE extractor, our debug tools) expects.
+fn write_mono_pcm_wav(path: &Path, samples: &[f32], sample_rate: u32) -> std::io::Result<()> {
+    let data_bytes = (samples.len() * 2) as u32;
+    let chunk_size = 36 + data_bytes;
+    let byte_rate = sample_rate * 2;
+
+    let mut file = File::create(path)?;
+    file.write_all(b"RIFF")?;
+    file.write_all(&chunk_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?;          // subchunk1 size
+    file.write_all(&1u16.to_le_bytes())?;           // format = PCM
+    file.write_all(&1u16.to_le_bytes())?;           // channels = mono
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&2u16.to_le_bytes())?;           // block align
+    file.write_all(&16u16.to_le_bytes())?;          // bits per sample
+    file.write_all(b"data")?;
+    file.write_all(&data_bytes.to_le_bytes())?;
+
+    for &sample in samples {
+        let clipped = sample.clamp(-1.0, 1.0);
+        let int16 = (clipped * 32767.0) as i16;
+        file.write_all(&int16.to_le_bytes())?;
+    }
+    Ok(())
 }
 
 /// Pipeline modelled after a human simultaneous interpreter, driven by
@@ -160,6 +321,12 @@ pub struct SpeakerPipeline {
     /// because the model is stateful (LSTM) and sharing one would mix
     /// contexts between mic and loopback streams.
     pub vad: Option<Arc<SileroVad>>,
+    /// Optional OpenVoice TCC (ADR 0011). When present AND the pipeline
+    /// has enrolled a reference WAV for the current speaker, every
+    /// fragment of TTS audio is converted to match the speaker's
+    /// timbre before reaching the mixer. Falls back to raw Kokoro
+    /// output when either condition is missing.
+    pub voice_convert: Option<Arc<ToneColorConverter>>,
 }
 
 impl SpeakerPipeline {
@@ -176,6 +343,7 @@ impl SpeakerPipeline {
             source_language, echo_buffer,
             diarizer: None,
             vad: None,
+            voice_convert: None,
         }
     }
 
@@ -186,6 +354,11 @@ impl SpeakerPipeline {
 
     pub fn with_vad(mut self, vad: Arc<SileroVad>) -> Self {
         self.vad = Some(vad);
+        self
+    }
+
+    pub fn with_voice_convert(mut self, vc: Arc<ToneColorConverter>) -> Self {
+        self.voice_convert = Some(vc);
         self
     }
 
@@ -204,7 +377,11 @@ impl SpeakerPipeline {
         let echo_buffer = self.echo_buffer;
         let diarizer = self.diarizer;
         let vad = self.vad;
-        let voice_profiles = Arc::new(VoiceProfileRegistry::new());
+        let voice_profiles = Arc::new(VoiceProfileRegistry::new(
+            pipeline_name.clone(),
+            WHISPER_SAMPLE_RATE,
+        ));
+        let voice_convert = self.voice_convert;
 
         // ── STT worker channel ────────────────────────────────────────────
         let (raw_audio_tx, raw_audio_rx) = mpsc::unbounded_channel::<Vec<f32>>();
@@ -235,6 +412,7 @@ impl SpeakerPipeline {
             echo_buffer.clone(),
             voice_profiles.clone(),
             metrics_tx.clone(),
+            voice_convert.clone(),
         );
 
         let mut is_running = false;
@@ -342,7 +520,7 @@ impl SpeakerPipeline {
                     let speaker_paused = committed.tail_silent && !looks_incomplete;
 
                     let should_flush = has_punctuation
-                        || speaker_paused
+                        || (speaker_paused && word_count >= MIN_WORDS_FOR_PAUSE_FLUSH)
                         || (held_too_long && word_count >= MIN_WORDS_FOR_TIMEOUT_FLUSH);
 
                     if should_flush {
@@ -446,6 +624,15 @@ fn start_stt_worker(
                 voice_profiles.record_f0(sid, f0_hz);
             }
 
+            // Feed audio into the per-speaker enrolment buffer used by
+            // the OpenVoice TCC stage. The registry rejects low-RMS
+            // chunks itself and stops accumulating once the speaker is
+            // enrolled, so calling on every chunk is cheap. We attribute
+            // to the stable speaker for the same reason as F0 above.
+            if let Some(sid) = stable_speaker_id {
+                voice_profiles.ingest_audio(sid, &samples);
+            }
+
             // The streaming session may run zero or one Whisper inference
             // depending on its internal throttle (`MIN_INFERENCE_INTERVAL_MS`).
             // We always tag the stage time, even when the throttle skipped
@@ -500,6 +687,7 @@ fn start_translate_worker(
     echo_buffer: EchoBuffer,
     voice_profiles: Arc<VoiceProfileRegistry>,
     metrics_tx: mpsc::Sender<PipelineMetrics>,
+    voice_convert: Option<Arc<ToneColorConverter>>,
 ) {
     tokio::spawn(async move {
         // Maximum age (in seconds) of a queued utterance before we
@@ -581,6 +769,16 @@ fn start_translate_worker(
             // (for an utterance with N fragments) — the LLM finishes
             // generating while the early fragments are still being
             // spoken.
+            // Resolve the per-speaker reference WAV path once (used by
+            // the OpenVoice TCC stage). Once enrolment has produced a
+            // path it doesn't change, so we read it here on the async
+            // task and hand the Option<String> to the TTS thread.
+            let reference_wav = match speaker_id {
+                Some(sid) => voice_profiles.reference_for(sid),
+                None => None,
+            };
+            let voice_convert_inner = voice_convert.clone();
+
             let _ = tokio::task::spawn_blocking(move || {
                 let segment = TextSegment::new(text.clone(), Language::English);
                 let translate_start = Instant::now();
@@ -599,6 +797,8 @@ fn start_translate_worker(
                 let voice_profile_clone = voice_profile;
                 let speaker_id_clone = speaker_id;
                 let utterance_start = flushed_at;
+                let voice_convert_thread = voice_convert_inner.clone();
+                let reference_wav_thread = reference_wav.clone();
                 let tts_handle = std::thread::spawn(move || {
                     let mut first_audio_emitted = false;
                     let mut fragment_idx: u32 = 0;
@@ -630,6 +830,38 @@ fn start_translate_worker(
                             audio_out.samples.len(),
                             tts_elapsed.as_millis(),
                         );
+
+                        // Optional OpenVoice TCC pass: rewrite Kokoro's
+                        // timbre to match the actual speaker's voice.
+                        // Only fires when (1) the bridge is loaded, and
+                        // (2) the speaker has been enrolled (≥6 s of
+                        // clean speech written to a reference WAV).
+                        // Otherwise we fall straight through with raw
+                        // Kokoro output.
+                        let audio_out = match (voice_convert_thread.as_ref(), reference_wav_thread.as_deref(), speaker_id_clone) {
+                            (Some(vc), Some(ref_path), Some(sid)) => {
+                                let vc_start = Instant::now();
+                                match vc.convert(&audio_out, ref_path, sid) {
+                                    Ok(Some(converted)) => {
+                                        let _ = metrics_clone.try_send(PipelineMetrics::new(
+                                            "voice_convert".to_string(),
+                                            vc_start.elapsed(),
+                                        ));
+                                        AudioChunk::new(
+                                            converted.samples,
+                                            converted.sample_rate,
+                                            1,
+                                        )
+                                    }
+                                    Ok(None) => audio_out,
+                                    Err(e) => {
+                                        tracing::warn!("VC failed (fragment {}): {}", fragment_idx, e);
+                                        audio_out
+                                    }
+                                }
+                            }
+                            _ => audio_out,
+                        };
 
                         let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
                             resampler::resample_to_target(
@@ -906,7 +1138,7 @@ mod tests {
 
     #[test]
     fn voice_profile_registry_records_and_recalls() {
-        let reg = VoiceProfileRegistry::new();
+        let reg = VoiceProfileRegistry::new("test", WHISPER_SAMPLE_RATE);
         reg.record_f0(0, 200.0);
         reg.record_f0(0, 200.0);
         reg.record_f0(0, 200.0);
@@ -916,13 +1148,13 @@ mod tests {
 
     #[test]
     fn voice_profile_registry_returns_zero_for_unknown_speaker() {
-        let reg = VoiceProfileRegistry::new();
+        let reg = VoiceProfileRegistry::new("test", WHISPER_SAMPLE_RATE);
         assert_eq!(reg.f0_for(42), 0.0);
     }
 
     #[test]
     fn voice_profile_registry_clamps_outliers() {
-        let reg = VoiceProfileRegistry::new();
+        let reg = VoiceProfileRegistry::new("test", WHISPER_SAMPLE_RATE);
         reg.record_f0(0, 200.0);
         reg.record_f0(0, 5000.0);  // pyworld noise — must be ignored
         let f0 = reg.f0_for(0);

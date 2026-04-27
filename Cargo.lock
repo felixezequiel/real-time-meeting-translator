@@ -1931,6 +1931,7 @@ dependencies = [
  "translation",
  "tts",
  "ui",
+ "voice_convert",
  "windows-sys 0.59.0",
 ]
 
@@ -2695,6 +2696,7 @@ dependencies = [
  "tracing",
  "translation",
  "tts",
+ "voice_convert",
 ]
 
 [[package]]
@@ -3957,6 +3959,18 @@ dependencies = [
  "pin-project",
  "thiserror 2.0.18",
  "typed-builder",
+]
+
+[[package]]
+name = "voice_convert"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "shared",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
