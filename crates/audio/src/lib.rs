@@ -6,4 +6,7 @@ pub mod ducking;
 pub mod loopback;
 pub mod playback;
 pub mod resampler;
+pub mod silero_vad;
 pub mod vad;
+
+pub use silero_vad::{SileroVad, SileroVadError};

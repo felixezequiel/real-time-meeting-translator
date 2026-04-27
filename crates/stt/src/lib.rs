@@ -7,6 +7,9 @@ use tracing;
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
+pub mod streaming;
+pub use streaming::{CommittedWords, StreamingSession};
+
 #[derive(Debug, Error)]
 pub enum SttError {
     #[error("STT not initialized")]

@@ -20,21 +20,56 @@ pub enum TtsError {
     SynthesisFailed(String),
 }
 
+/// Target voice characteristics for the next synthesis. Resolved per-call
+/// from the speaker's running F0 + formant profile maintained by the
+/// pipeline; `None` means "use Piper's default voice unchanged".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VoiceProfile {
+    /// Target F0 in Hz (mean of voiced frames in the speaker's recent
+    /// audio). Anything <= 0 disables pitch shifting.
+    pub target_f0_hz: f32,
+    /// Spectral-envelope warp ratio. 1.0 = no formant shift; >1 enlarges
+    /// the vocal tract → deeper voice; <1 narrows → thinner.
+    pub formant_shift: f32,
+}
+
+impl VoiceProfile {
+    pub fn is_active(&self) -> bool {
+        self.target_f0_hz > 0.0
+    }
+}
+
 #[derive(Serialize)]
 struct TtsRequest {
     text: String,
     language: String,
+    /// Speaker's running mean F0. Omitted from the JSON when zero so the
+    /// bridge skips analysis-synthesis entirely (Piper output passes
+    /// through, ~150 ms per call instead of ~250-350 ms).
+    #[serde(skip_serializing_if = "f32_is_zero_or_negative")]
+    target_f0: f32,
+    /// Spectral-envelope warp. Always sent — defaults to 1.0 (no warp).
+    formant_shift: f32,
+}
+
+fn f32_is_zero_or_negative(value: &f32) -> bool {
+    *value <= 0.0
 }
 
 /// Header sent by the Python bridge before the raw int16 PCM bytes.
-/// See scripts/tts_bridge.py — the binary-framed protocol avoids a
-/// filesystem round-trip (write WAV → read WAV → delete) per synthesis.
 #[derive(Deserialize)]
 struct TtsResponseHeader {
     sample_rate: u32,
     num_samples: u32,
 }
 
+/// Piper TTS client with optional pitch/formant shifting via the bridge's
+/// pyworld stage. Replaces the previous CosyVoice 2 zero-shot cloner —
+/// see ADR 0006.
+///
+/// One instance owns a single Python subprocess; the `Mutex` serialises
+/// concurrent callers so stdout frames don't interleave. Clone the
+/// `Arc<PiperTts>` to share between pipelines.
 pub struct PiperTts {
     bridge_script_path: PathBuf,
     process: Option<Mutex<TtsBridgeProcess>>,
@@ -56,7 +91,16 @@ impl PiperTts {
         }
     }
 
-    pub fn synthesize(&self, segment: &TextSegment) -> Result<AudioChunk, TtsError> {
+    /// Synthesise `segment` at the configured language, optionally bending
+    /// the output pitch and formants towards `voice_profile`. When the
+    /// profile is the default (zero F0, formant=1.0) the bridge skips
+    /// analysis-synthesis and returns raw Piper output — same path as the
+    /// pre-shift TTS that worked at ~150 ms/call.
+    pub fn synthesize(
+        &self,
+        segment: &TextSegment,
+        voice_profile: VoiceProfile,
+    ) -> Result<AudioChunk, TtsError> {
         let process_mutex = self
             .process
             .as_ref()
@@ -69,8 +113,14 @@ impl PiperTts {
         let request = TtsRequest {
             text: segment.text.clone(),
             language: match self.language {
-                Language::Portuguese => "pt-br".to_string(),
-                Language::English => "en-us".to_string(),
+                Language::Portuguese => "pt".to_string(),
+                Language::English => "en".to_string(),
+            },
+            target_f0: voice_profile.target_f0_hz,
+            formant_shift: if voice_profile.formant_shift > 0.0 {
+                voice_profile.formant_shift
+            } else {
+                1.0
             },
         };
 
@@ -97,18 +147,17 @@ impl PiperTts {
             .map_err(|e| TtsError::SynthesisFailed(format!("Failed to read PCM: {}", e)))?;
 
         tracing::debug!(
-            "TTS synthesized {} samples at {}Hz",
+            "TTS synthesised {} samples at {}Hz (target_f0={:.0}, formant={:.2})",
             samples.len(),
-            header.sample_rate
+            header.sample_rate,
+            voice_profile.target_f0_hz,
+            voice_profile.formant_shift,
         );
 
         Ok(AudioChunk::new(samples, header.sample_rate, MONO_CHANNELS))
     }
 }
 
-/// Read exactly `num_samples` int16 samples from the bridge stdout and
-/// convert to normalized f32. Uses `read_exact` on the BufReader so any
-/// bytes already buffered after the header line are consumed first.
 fn read_pcm_samples<R: Read>(
     reader: &mut BufReader<R>,
     num_samples: usize,
@@ -132,14 +181,14 @@ impl PipelineStage for PiperTts {
 
     async fn initialize(&mut self) -> Result<(), StageError> {
         let script_path = self.bridge_script_path.to_string_lossy().to_string();
-        tracing::info!("Starting TTS bridge: {}", script_path);
+        tracing::info!("Starting Piper TTS bridge: {}", script_path);
 
         let python = shared::find_python();
         let mut child = Command::new(&python)
             .arg(&script_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| StageError::NotInitialized(
                 format!("Failed to start Python (tried '{}'). Is Python 3.10+ installed and in PATH? Error: {}", python, e)
@@ -171,7 +220,7 @@ impl PipelineStage for PiperTts {
             stdout: reader,
         }));
 
-        tracing::info!("TTS bridge ready");
+        tracing::info!("Piper TTS bridge ready");
         Ok(())
     }
 
@@ -182,7 +231,7 @@ impl PipelineStage for PiperTts {
                 let _ = bridge.child.wait();
             }
         }
-        tracing::info!("TTS bridge stopped");
+        tracing::info!("Piper TTS bridge stopped");
         Ok(())
     }
 }
@@ -193,18 +242,41 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn tts_request_serializes_correctly() {
-        let request = TtsRequest {
-            text: "olá mundo".to_string(),
-            language: "pt-br".to_string(),
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("olá mundo"));
-        assert!(json.contains("pt-br"));
+    fn voice_profile_is_active_when_f0_positive() {
+        let profile = VoiceProfile { target_f0_hz: 180.0, formant_shift: 1.0 };
+        assert!(profile.is_active());
+        let default = VoiceProfile::default();
+        assert!(!default.is_active());
     }
 
     #[test]
-    fn tts_header_deserializes_correctly() {
+    fn tts_request_omits_target_f0_when_zero() {
+        let request = TtsRequest {
+            text: "olá".to_string(),
+            language: "pt".to_string(),
+            target_f0: 0.0,
+            formant_shift: 1.0,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("target_f0"));
+        assert!(json.contains("formant_shift"));
+    }
+
+    #[test]
+    fn tts_request_includes_target_f0_when_set() {
+        let request = TtsRequest {
+            text: "hi".to_string(),
+            language: "en".to_string(),
+            target_f0: 220.0,
+            formant_shift: 0.95,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("target_f0"));
+        assert!(json.contains("220"));
+    }
+
+    #[test]
+    fn tts_header_deserialises_correctly() {
         let json = r#"{"sample_rate": 22050, "num_samples": 3}"#;
         let header: TtsResponseHeader = serde_json::from_str(json).unwrap();
         assert_eq!(header.sample_rate, 22050);
@@ -212,12 +284,10 @@ mod tests {
     }
 
     #[test]
-    fn read_pcm_samples_converts_int16_to_normalized_f32() {
-        // 3 samples: 0, i16::MAX, i16::MIN — little-endian.
+    fn read_pcm_samples_converts_int16_to_normalised_f32() {
         let bytes: Vec<u8> = vec![0x00, 0x00, 0xFF, 0x7F, 0x00, 0x80];
         let mut reader = BufReader::new(Cursor::new(bytes));
         let samples = read_pcm_samples(&mut reader, 3).unwrap();
-
         assert_eq!(samples.len(), 3);
         assert!((samples[0] - 0.0).abs() < 1e-6);
         assert!((samples[1] - (i16::MAX as f32 / 32768.0)).abs() < 1e-6);
@@ -226,7 +296,6 @@ mod tests {
 
     #[test]
     fn read_pcm_samples_errors_on_truncated_stream() {
-        // Promise 2 samples (4 bytes) but provide only 2 bytes.
         let bytes: Vec<u8> = vec![0x00, 0x00];
         let mut reader = BufReader::new(Cursor::new(bytes));
         assert!(read_pcm_samples(&mut reader, 2).is_err());
@@ -236,7 +305,7 @@ mod tests {
     fn tts_without_bridge_returns_error() {
         let tts = PiperTts::new(PathBuf::from("nonexistent.py"), Language::Portuguese);
         let segment = TextSegment::new("olá".to_string(), Language::Portuguese);
-        let result = tts.synthesize(&segment);
+        let result = tts.synthesize(&segment, VoiceProfile::default());
         assert!(result.is_err());
     }
 }

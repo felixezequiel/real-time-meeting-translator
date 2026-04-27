@@ -1,5 +1,8 @@
 use anyhow::Result;
-use shared::{Language, PipelineCommand, PipelineConfig, PipelineStage, TranslationDirection};
+use shared::{
+    Language, PipelineCommand, PipelineConfig, PipelineStage, StageMetricsAggregator,
+    TranslationDirection,
+};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -8,11 +11,14 @@ use audio::capture::AudioCapture;
 use audio::device;
 use audio::loopback::LoopbackCapture;
 use audio::playback::{AudioPlayback, MixerPlayback};
+use audio::SileroVad;
 use pipeline::SpeakerPipeline;
 use stt::WhisperStt;
 use translation::OpusMtTranslator;
 use tts::PiperTts;
 use ui::{TrayAction, TrayUi};
+use diarization::OnlineDiarizer;
+use separation::Sepformer;
 
 /// VB-Cable A: used as system default output so meeting audio flows here.
 /// Loopback captures from this device (meeting audio only).
@@ -32,7 +38,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            "meeting_translator=info,pipeline=info,stt=warn,translation=warn,tts=warn,audio=warn",
+            "meeting_translator=info,pipeline=info,stt=warn,translation=warn,tts=warn,\
+             audio=warn,diarization=info",
         )
         .init();
 
@@ -63,10 +70,19 @@ struct LoadedModels {
     translator_en_pt: Arc<OpusMtTranslator>,
     /// Portuguese → English translator (always this direction)
     translator_pt_en: Arc<OpusMtTranslator>,
-    /// Portuguese voice TTS (always Portuguese output)
+    /// Portuguese voice TTS (always Portuguese output). CosyVoice 2 with
+    /// zero-shot cloning — receives a per-speaker reference WAV per call.
     tts_portuguese: Arc<PiperTts>,
-    /// English voice TTS (always English output)
+    /// English voice TTS (always English output).
     tts_english: Arc<PiperTts>,
+    /// Online diariser shared by both pipelines. Each pipeline auto-enrols
+    /// speakers from live audio and routes the cloned voice through TTS.
+    diarizer: Option<Arc<OnlineDiarizer>>,
+    /// Optional Sepformer source separator for the loopback. When set,
+    /// the speaker pipeline is duplicated so two simultaneous speakers
+    /// can be transcribed and rendered separately. Initialised only
+    /// when `config.enable_separation` is true at startup.
+    separator: Option<Arc<Sepformer>>,
 }
 
 // ─── Active audio pipelines (cheap — can be restarted on device change) ──────
@@ -81,15 +97,19 @@ struct ActivePipelines {
     _mic_capture: cpal::Stream,
     /// Keeps the mic TTS playback alive
     _mic_playback: cpal::Stream,
-    /// Send Start/Stop to the speaker pipeline task
-    speaker_cmd_tx: mpsc::Sender<PipelineCommand>,
+    /// Start/Stop senders for every speaker-side pipeline. There's
+    /// always at least one; when source separation is enabled there
+    /// are two, one per separated channel.
+    speaker_cmd_txs: Vec<mpsc::Sender<PipelineCommand>>,
     /// Send Start/Stop to the mic pipeline task
     mic_cmd_tx: mpsc::Sender<PipelineCommand>,
 }
 
 impl ActivePipelines {
     async fn send_command(&self, cmd: PipelineCommand) {
-        let _ = self.speaker_cmd_tx.send(cmd).await;
+        for tx in &self.speaker_cmd_txs {
+            let _ = tx.send(cmd).await;
+        }
         let _ = self.mic_cmd_tx.send(cmd).await;
     }
 }
@@ -107,14 +127,19 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
     let output_device_names = list_output_device_names();
     let input_device_names = list_input_device_names();
 
+    // Shared latency aggregator: every pipeline branch records into it
+    // through a clone of this Arc, and the settings window reads it on
+    // each frame to populate the metrics panel.
+    let metrics_aggregator: Arc<StageMetricsAggregator> = Arc::new(StageMetricsAggregator::new());
+
     // ── Create tray UI ─────────────────────────────────────────────────────────
-    let mut tray = TrayUi::new()
+    let mut tray = TrayUi::new(Arc::clone(&metrics_aggregator))
         .map_err(|e| anyhow::anyhow!("Tray UI failed: {}", e))?;
 
     let audio_switch_script = scripts_dir.join("audio_switch.ps1");
 
     // ── Start both pipelines ───────────────────────────────────────────────────
-    let mut pipelines = start_pipelines(&config, &models).await?;
+    let mut pipelines = start_pipelines(&config, &models, Arc::clone(&metrics_aggregator)).await?;
     // Pipelines start paused; user presses Start via tray to activate
     tracing::info!("Pipelines created — use system tray to start.");
 
@@ -166,7 +191,7 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                                 }
                             }
                             // Recreate pipelines with the new device routing
-                            pipelines = restart_pipelines(pipelines, &config, &models, false).await?;
+                            pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), false).await?;
                             is_active = true;
                             tray.set_active(true);
                             pipelines.send_command(PipelineCommand::Start).await;
@@ -195,7 +220,7 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                         config.speaker_source_language.display_name(),
                         config.speaker_target_language.display_name(),
                     );
-                    pipelines = restart_pipelines(pipelines, &config, &models, is_active).await?;
+                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active).await?;
                 }
 
                 TrayAction::SetMicSourceLanguage(lang) => {
@@ -207,7 +232,7 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                         config.mic_source_language.display_name(),
                         config.mic_target_language.display_name(),
                     );
-                    pipelines = restart_pipelines(pipelines, &config, &models, is_active).await?;
+                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active).await?;
                 }
 
                 TrayAction::SetHeadphonesDevice(name) => {
@@ -215,13 +240,13 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                     // Loopback device is managed automatically (CABLE when active).
                     config.headphones_device = Some(name);
                     save_config(&config);
-                    pipelines = restart_pipelines(pipelines, &config, &models, is_active).await?;
+                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active).await?;
                 }
 
                 TrayAction::SetMicDevice(name) => {
                     config.mic_device = Some(name);
                     save_config(&config);
-                    pipelines = restart_pipelines(pipelines, &config, &models, is_active).await?;
+                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active).await?;
                 }
 
                 TrayAction::Quit => {
@@ -264,6 +289,7 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
     let stt_script = scripts_dir.join("stt_bridge.py");
     let translation_script = scripts_dir.join("translation_bridge.py");
     let tts_script = scripts_dir.join("tts_bridge.py");
+    let diarization_script = scripts_dir.join("diarization_bridge.py");
     let whisper_model: std::path::PathBuf = config.whisper_model.clone().into();
 
     // ── STT: two concurrent processes (both auto-detect language) ────────────
@@ -290,14 +316,40 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
     );
     translator_pt_en.initialize().await?;
 
-    // ── TTS: always load BOTH voices ────────────────────────────────────────
-    tracing::info!("Initializing Portuguese TTS…");
+    // ── TTS: always load BOTH voices (Piper + pyworld pitch shifter) ──────
+    tracing::info!("Initializing Portuguese TTS (Piper)…");
     let mut tts_portuguese = PiperTts::new(tts_script.clone(), Language::Portuguese);
     tts_portuguese.initialize().await?;
 
-    tracing::info!("Initializing English TTS…");
+    tracing::info!("Initializing English TTS (Piper)…");
     let mut tts_english = PiperTts::new(tts_script, Language::English);
     tts_english.initialize().await?;
+
+    // Online diarisation drives per-speaker pitch differentiation. Each
+    // chunk gives us a stable speaker_id plus a pyworld F0 measurement;
+    // the pipeline's VoiceProfileRegistry maintains a running F0 mean
+    // per speaker that the TTS stage uses to bend Piper's output pitch
+    // towards the original speaker (ADR 0006).
+    tracing::info!("Initializing online diariser (SpeechBrain ECAPA-TDNN + pyworld F0)…");
+    let mut diarizer = OnlineDiarizer::new(diarization_script);
+    diarizer.initialize().await?;
+    let diarizer = Some(Arc::new(diarizer));
+
+    // Sepformer is opt-in (config.enable_separation). When off, the
+    // speaker pipeline is single-channel as before — saves the ~120 MB
+    // model download and ~50 ms / chunk runtime cost. When on, the
+    // loopback stream is split into 2 channels and each fed through a
+    // parallel pipeline.
+    let separator = if config.enable_separation {
+        let separation_script = scripts_dir.join("separation_bridge.py");
+        tracing::info!("Initializing source separator (Sepformer-libri2mix)…");
+        let mut sep = Sepformer::new(separation_script);
+        sep.initialize().await?;
+        Some(Arc::new(sep))
+    } else {
+        tracing::info!("Source separation disabled (enable_separation=false)");
+        None
+    };
 
     Ok(LoadedModels {
         stt_a: Arc::new(stt_a),
@@ -306,6 +358,8 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
         translator_pt_en: Arc::new(translator_pt_en),
         tts_portuguese: Arc::new(tts_portuguese),
         tts_english: Arc::new(tts_english),
+        diarizer,
+        separator,
     })
 }
 
@@ -314,6 +368,7 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
 async fn start_pipelines(
     config: &PipelineConfig,
     models: &LoadedModels,
+    metrics: Arc<StageMetricsAggregator>,
 ) -> Result<ActivePipelines> {
     // Shared echo buffer: both pipelines write translations and check STT
     // against it. Prevents mic TTS from being re-translated by the speaker pipeline.
@@ -330,8 +385,6 @@ async fn start_pipelines(
     // ── Speaker pipeline ───────────────────────────────────────────────────────
     let (spk_audio_tx, spk_audio_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
     let (spk_out_tx, spk_out_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
-    let (spk_cmd_tx, spk_cmd_rx) = mpsc::channel::<PipelineCommand>(8);
-    let (spk_metrics_tx, mut spk_metrics_rx) = mpsc::channel::<shared::PipelineMetrics>(64);
 
     let loopback_device = resolve_output_device(config.loopback_device.as_deref(), "loopback")?;
     let loopback_name = cpal::traits::DeviceTrait::name(&loopback_device)
@@ -343,11 +396,6 @@ async fn start_pipelines(
         .unwrap_or_else(|_| "Unknown".to_string());
     tracing::info!("Speaker TTS output to: {}", headphones_name);
 
-    // When loopback is on VB-Cable (different from headphones), split the
-    // loopback into two streams: the existing 16 kHz denoised path for STT
-    // and a pristine native-rate pre-denoise path for the mixer passthrough.
-    // Otherwise (shared-device setup), no passthrough — user hears the meeting
-    // directly on the same device.
     let loopback_is_cable = config.loopback_device.as_deref()
         .map(|d| d.to_lowercase().contains("cable"))
         .unwrap_or(false);
@@ -362,7 +410,6 @@ async fn start_pipelines(
         tracing::info!("Passthrough active: raw meeting audio → mixer");
         capture
     } else {
-        // No passthrough — drop the tx so the mixer's passthrough buffer stays empty.
         drop(passthrough_tx);
         let loopback = LoopbackCapture::new(loopback_device, config.chunk_duration_ms);
         loopback
@@ -375,19 +422,64 @@ async fn start_pipelines(
         .start(passthrough_rx, spk_out_rx)
         .map_err(|e| anyhow::anyhow!("Mixer playback failed: {}", e))?;
 
-    let speaker_pipeline = SpeakerPipeline::new(
-        "Speaker", spk_stt, spk_trans, spk_tts, spk_source_lang, 2.5, echo_buffer.clone(),
-    );
-    tokio::spawn(async move {
-        speaker_pipeline.run(spk_audio_rx, spk_out_tx, spk_cmd_rx, spk_metrics_tx).await;
-    });
-    tokio::spawn(async move {
-        while let Some(metric) = spk_metrics_rx.recv().await {
-            if metric.stage_name == "total" {
-                tracing::info!("[Speaker] latency: {}ms", metric.processing_duration.as_millis());
-            }
+    // Build the list of (name, audio_rx) pairs the speaker side will run.
+    // With separation off it's just one branch ("Speaker") consuming the
+    // raw loopback. With separation on, a separation worker sits between
+    // the loopback and two parallel branches ("Speaker-A" / "Speaker-B"),
+    // one per separated speaker channel; both feed back into the same
+    // `spk_out_tx` so the mixer plays them in the order they finish.
+    let mut speaker_branches: Vec<(&'static str, mpsc::UnboundedReceiver<shared::AudioChunk>)> =
+        Vec::new();
+
+    if let Some(sep) = models.separator.as_ref() {
+        let (ch_a_tx, ch_a_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
+        let (ch_b_tx, ch_b_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
+        start_separation_worker(spk_audio_rx, Arc::clone(sep), ch_a_tx, ch_b_tx);
+        speaker_branches.push(("Speaker-A", ch_a_rx));
+        speaker_branches.push(("Speaker-B", ch_b_rx));
+        tracing::info!("Source separation ON: dual speaker pipelines (A + B)");
+    } else {
+        speaker_branches.push(("Speaker", spk_audio_rx));
+    }
+
+    let mut speaker_cmd_txs: Vec<mpsc::Sender<PipelineCommand>> = Vec::new();
+    for (name, audio_rx) in speaker_branches {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PipelineCommand>(8);
+        let (metrics_tx, mut metrics_rx) =
+            mpsc::channel::<shared::PipelineMetrics>(64);
+
+        let mut pipeline = SpeakerPipeline::new(
+            name,
+            Arc::clone(&spk_stt),
+            Arc::clone(&spk_trans),
+            Arc::clone(&spk_tts),
+            spk_source_lang,
+            echo_buffer.clone(),
+        );
+        if let Some(d) = models.diarizer.as_ref() {
+            pipeline = pipeline.with_diarizer(Arc::clone(d));
         }
-    });
+        if let Some(vad) = try_create_silero_vad(name) {
+            pipeline = pipeline.with_vad(vad);
+        }
+        let out_tx = spk_out_tx.clone();
+        let branch_name = name.to_string();
+        tokio::spawn(async move {
+            pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
+        });
+        let log_name = branch_name.clone();
+        let metrics_for_branch = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            while let Some(metric) = metrics_rx.recv().await {
+                metrics_for_branch.record(&metric.stage_name, metric.processing_duration);
+                if metric.stage_name == "total" {
+                    tracing::info!("[{}] latency: {}ms", log_name, metric.processing_duration.as_millis());
+                }
+            }
+        });
+        speaker_cmd_txs.push(cmd_tx);
+    }
+    drop(spk_out_tx); // remaining clones are inside the spawned pipelines
 
     // ── Mic pipeline ───────────────────────────────────────────────────────────
     let (mic_audio_tx, mic_audio_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
@@ -416,15 +508,22 @@ async fn start_pipelines(
         .start(mic_out_rx)
         .map_err(|e| anyhow::anyhow!("Mic playback failed: {}", e))?;
 
-    // Mic pipeline: 2.5s flush — match speaker pipeline
-    let mic_pipeline = SpeakerPipeline::new(
-        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, 2.5, echo_buffer,
+    let mut mic_pipeline = SpeakerPipeline::new(
+        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, echo_buffer,
     );
+    if let Some(d) = models.diarizer.as_ref() {
+        mic_pipeline = mic_pipeline.with_diarizer(Arc::clone(d));
+    }
+    if let Some(vad) = try_create_silero_vad("Mic") {
+        mic_pipeline = mic_pipeline.with_vad(vad);
+    }
     tokio::spawn(async move {
         mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
     });
+    let metrics_for_mic = Arc::clone(&metrics);
     tokio::spawn(async move {
         while let Some(metric) = mic_metrics_rx.recv().await {
+            metrics_for_mic.record(&metric.stage_name, metric.processing_duration);
             if metric.stage_name == "total" {
                 tracing::info!("[Mic] latency: {}ms", metric.processing_duration.as_millis());
             }
@@ -436,9 +535,58 @@ async fn start_pipelines(
         _speaker_mixer: speaker_mixer,
         _mic_capture: mic_capture,
         _mic_playback: mic_playback,
-        speaker_cmd_tx: spk_cmd_tx,
-        mic_cmd_tx: mic_cmd_tx,
+        speaker_cmd_txs,
+        mic_cmd_tx,
     })
+}
+
+/// Forward audio chunks from the loopback into Sepformer and split each
+/// chunk into two channel streams. When the bridge is dead the worker
+/// falls back to forwarding the original mono onto channel A and silence
+/// onto channel B — a single working pipeline is always better than no
+/// pipeline at all.
+fn start_separation_worker(
+    mut audio_in: mpsc::UnboundedReceiver<shared::AudioChunk>,
+    separator: Arc<Sepformer>,
+    ch_a_tx: mpsc::UnboundedSender<shared::AudioChunk>,
+    ch_b_tx: mpsc::UnboundedSender<shared::AudioChunk>,
+) {
+    // RMS gate per channel — Sepformer always returns two streams, even
+    // when only one speaker is active. The "empty" channel comes back as
+    // low-amplitude residual that would just feed Whisper noise. Drop it
+    // when its RMS is below this threshold.
+    const SILENT_CHANNEL_RMS: f32 = 0.01;
+
+    tokio::task::spawn_blocking(move || {
+        while let Some(chunk) = audio_in.blocking_recv() {
+            match separator.separate(&chunk.samples, chunk.sample_rate) {
+                Ok(Some(separated)) => {
+                    if separated.rms_a >= SILENT_CHANNEL_RMS {
+                        let _ = ch_a_tx.send(shared::AudioChunk::new(
+                            separated.channel_a,
+                            separated.sample_rate,
+                            1,
+                        ));
+                    }
+                    if separated.rms_b >= SILENT_CHANNEL_RMS {
+                        let _ = ch_b_tx.send(shared::AudioChunk::new(
+                            separated.channel_b,
+                            separated.sample_rate,
+                            1,
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    // Bridge dead — keep the show running on channel A.
+                    let _ = ch_a_tx.send(chunk);
+                }
+                Err(e) => {
+                    tracing::warn!("Separation failed, forwarding raw: {}", e);
+                    let _ = ch_a_tx.send(chunk);
+                }
+            }
+        }
+    });
 }
 
 /// Drop old pipelines (streams stop, tasks exit) and start fresh ones.
@@ -446,18 +594,46 @@ async fn restart_pipelines(
     old: ActivePipelines,
     config: &PipelineConfig,
     models: &LoadedModels,
+    metrics: Arc<StageMetricsAggregator>,
     was_active: bool,
 ) -> Result<ActivePipelines> {
     drop(old);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let pipelines = start_pipelines(config, models).await?;
+    let pipelines = start_pipelines(config, models, metrics).await?;
 
     if was_active {
         pipelines.send_command(PipelineCommand::Start).await;
     }
 
     Ok(pipelines)
+}
+
+// ─── Silero VAD loader (one stateful instance per pipeline branch) ───────────
+
+/// Build a fresh `SileroVad` for the given pipeline branch. Each branch
+/// needs its own instance because the model carries LSTM state and
+/// cross-stream sharing would mix mic and loopback contexts.
+///
+/// The model is embedded inside the `voice_activity_detector` crate, so
+/// no on-disk file is required. We still log per-branch creation so a
+/// regression in the underlying crate (e.g. ORT init failure) is
+/// visible. On failure the pipeline falls back to its built-in RMS
+/// energy gate so the app stays usable (ADR 0008).
+fn try_create_silero_vad(branch: &str) -> Option<Arc<SileroVad>> {
+    match SileroVad::with_threshold(audio::silero_vad::DEFAULT_THRESHOLD) {
+        Ok(vad) => {
+            tracing::info!("[{}] Silero VAD ready (embedded model)", branch);
+            Some(Arc::new(vad))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[{}] Silero VAD failed to initialise ({}); falling back to RMS gate.",
+                branch, e
+            );
+            None
+        }
+    }
 }
 
 // ─── Pipeline model helpers ───────────────────────────────────────────────────

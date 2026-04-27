@@ -1,11 +1,12 @@
 pub mod settings_window;
 
-use shared::{Language, PipelineCommand, PipelineConfig};
+use shared::{Language, PipelineCommand, PipelineConfig, StageMetricsAggregator};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use tracing;
 
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 
 const ICON_SIZE: u32 = 32;
 
@@ -38,10 +39,13 @@ pub struct TrayUi {
     settings_thread: Option<std::thread::JoinHandle<()>>,
     /// Sender to signal the persistent settings window to show with updated config
     show_settings_tx: Option<std_mpsc::Sender<settings_window::SettingsInit>>,
+    /// Latency aggregator the settings window reads on each frame to
+    /// populate the metrics panel.
+    metrics: Arc<StageMetricsAggregator>,
 }
 
 impl TrayUi {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(metrics: Arc<StageMetricsAggregator>) -> Result<Self, String> {
         let menu = Menu::new();
 
         let settings_item = MenuItem::new("⚙  Configurações", true, None);
@@ -73,6 +77,7 @@ impl TrayUi {
             window_action_tx,
             settings_thread: None,
             show_settings_tx: None,
+            metrics,
         })
     }
 
@@ -131,7 +136,12 @@ impl TrayUi {
         let (show_tx, show_rx) = std_mpsc::channel();
         self.show_settings_tx = Some(show_tx);
 
-        let handle = settings_window::open(init, self.window_action_tx.clone(), show_rx);
+        let handle = settings_window::open(
+            init,
+            self.window_action_tx.clone(),
+            show_rx,
+            Arc::clone(&self.metrics),
+        );
         self.settings_thread = Some(handle);
         tracing::info!("Settings window opened");
     }

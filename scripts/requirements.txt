@@ -1,10 +1,24 @@
 faster-whisper>=1.0.0
-transformers>=4.40.0
+# transformers 5.x removed helpers some upstream code still uses; pin to
+# the 4.x line so all stages coexist.
+transformers>=4.57,<5.0
 sentencepiece>=0.2.0
-# transformers 4.52+ blocks torch.load on torch<2.6 due to CVE-2025-32434;
-# the NLLB model on HF is pytorch_model.bin (no safetensors) so the load
-# path is exercised during conversion. Keep torch >=2.6 to unblock it.
 torch>=2.6.0
+torchaudio>=2.6.0
 numpy>=1.24.0
-piper-tts>=1.2.0
 ctranslate2>=4.0.0
+
+# ── TTS (Piper + pyworld pitch/formant shift) ────────────────────────────────
+# Piper synthesises with a 25 MB ONNX voice in ~150 ms. pyworld then runs
+# WORLD analysis-synthesis on the output: extract F0 / spectral envelope /
+# aperiodicity, swap F0 for the speaker's running mean, optionally shift
+# the spectral envelope, resynthesise. Total TTS step ~250-350 ms — fast
+# enough for simultaneous translation, with per-speaker pitch
+# differentiation that doesn't need a voice cloning model. (ADR 0006)
+piper-tts>=1.2.0
+pyworld>=0.3.5
+
+# ── Speaker diarisation (SpeechBrain ECAPA-TDNN) ─────────────────────────────
+# Same bridge also runs pyworld DIO to return per-chunk F0, which the
+# pipeline accumulates into a running mean per speaker.
+speechbrain>=1.0.0

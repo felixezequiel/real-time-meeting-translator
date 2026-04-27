@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     This script removes:
-    - Python packages (faster-whisper, transformers, piper-tts, torch, etc.)
+    - Python packages (transformers, torch, speechbrain, ctranslate2, etc.)
     - Downloaded ML models (models/ directory)
     - Whisper GGML models
     - Rust build artifacts (target/ directory)
@@ -76,14 +76,23 @@ function Remove-PythonPackages {
         "torch",
         "torchaudio",
         "torchvision",
-        "piper-tts",
-        "piper-phonemize",
         "numpy",
         "huggingface-hub",
         "tokenizers",
         "safetensors",
         "ctranslate2",
-        "onnxruntime"
+        "onnxruntime",
+        # New stack (CosyVoice 2 + SpeechBrain)
+        "speechbrain",
+        "hyperpyyaml",
+        "omegaconf",
+        "modelscope",
+        "conformer",
+        "diffusers",
+        "lightning",
+        "einops",
+        "inflect",
+        "WeTextProcessing"
     )
 
     Write-Host "  Removing packages..." -ForegroundColor Gray
@@ -118,6 +127,23 @@ function Remove-MLModels {
         } else {
             Write-Skip "HuggingFace cache kept"
         }
+    }
+
+    # SpeechBrain caches ECAPA-TDNN under a separate path that survives
+    # HuggingFace cache cleanup.
+    $sbCache = Join-Path $env:USERPROFILE ".cache\speechbrain"
+    if (Test-Path $sbCache) {
+        $sbSize = [math]::Round((Get-ChildItem $sbCache -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+        Remove-Item $sbCache -Recurse -Force
+        Write-Ok "Removed SpeechBrain cache (${sbSize}MB freed)"
+    }
+
+    # CosyVoice repo lives under third_party/ — added by Install-CosyVoice.
+    $thirdParty = Join-Path $ProjectRoot "third_party"
+    if (Test-Path $thirdParty) {
+        $tpSize = [math]::Round((Get-ChildItem $thirdParty -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+        Remove-Item $thirdParty -Recurse -Force
+        Write-Ok "Removed third_party/ (${tpSize}MB freed)"
     }
 }
 

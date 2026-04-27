@@ -10,11 +10,27 @@ use crate::language::Language;
 pub struct TextSegment {
     pub text: String,
     pub language: Language,
+    /// Identifier of the original speaker as assigned by online diarization.
+    /// `None` means diarization is disabled or the speaker is still being
+    /// bootstrapped; in that case the TTS layer falls back to a built-in voice.
+    #[serde(default)]
+    pub speaker_id: Option<u32>,
 }
 
 impl TextSegment {
     pub fn new(text: String, language: Language) -> Self {
-        Self { text, language }
+        Self {
+            text,
+            language,
+            speaker_id: None,
+        }
+    }
+
+    /// Builder-style setter for the speaker id. Keeps existing call sites
+    /// (`TextSegment::new(...)`) untouched when diarization is not wired yet.
+    pub fn with_speaker_id(mut self, speaker_id: u32) -> Self {
+        self.speaker_id = Some(speaker_id);
+        self
     }
 
     pub fn is_empty(&self) -> bool {

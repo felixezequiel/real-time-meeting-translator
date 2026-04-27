@@ -12,6 +12,14 @@ anyhow = { workspace = true }
 cpal = "0.15"
 rubato = "0.16"
 nnnoiseless = { version = "0.5", default-features = false }
+# Silero VAD via the `voice_activity_detector` crate, which embeds the
+# v5 ONNX model and the ORT bindings together. We tried to call ORT
+# directly first, but the integration produced degenerate probabilities
+# (~0.0006 even on clear speech) and we could not isolate whether it was
+# input shape, state plumbing, or model version. The maintained crate
+# is validated against real audio in its own tests, so we adopt it
+# rather than reimplement. See ADR 0008.
+voice_activity_detector = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

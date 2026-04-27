@@ -1,9 +1,26 @@
 use eframe::egui;
-use shared::{Language, PipelineCommand};
+use shared::{Language, PipelineCommand, StageMetricsAggregator, StageStats};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 
 use crate::TrayAction;
+
+/// Stages displayed in the metrics panel, in pipeline order. Stages
+/// outside this list (none today) are silently ignored — keeps the
+/// panel layout stable when new stages are added later.
+const METRIC_STAGES: &[(&str, &str)] = &[
+    ("vad",       "VAD"),
+    ("stt",       "STT"),
+    ("translate", "Translate"),
+    ("tts",       "TTS"),
+    ("total",     "Total"),
+];
+
+/// How often the settings window is forced to repaint while open. The
+/// metrics panel reads the aggregator on each frame, so without this
+/// the numbers would only refresh when the window receives focus or
+/// the user moves the mouse over it.
+const METRICS_REPAINT_INTERVAL_MS: u64 = 500;
 
 // ─── Win32 helpers for reliable show/hide ────────────────────────────────────
 
@@ -79,14 +96,15 @@ pub fn open(
     init: SettingsInit,
     action_tx: std_mpsc::Sender<TrayAction>,
     show_rx: std_mpsc::Receiver<SettingsInit>,
+    metrics: Arc<StageMetricsAggregator>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let pending_show: Arc<Mutex<Option<SettingsInit>>> = Arc::new(Mutex::new(None));
 
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([460.0, 440.0])
-                .with_min_inner_size([420.0, 400.0])
+                .with_inner_size([460.0, 540.0])
+                .with_min_inner_size([420.0, 500.0])
                 .with_resizable(true)
                 .with_always_on_top(),
             event_loop_builder: Some(Box::new(|builder| {
@@ -118,7 +136,7 @@ pub fn open(
                     }
                 });
 
-                Ok(Box::new(SettingsApp::new(init, tx, pending)))
+                Ok(Box::new(SettingsApp::new(init, tx, pending, metrics)))
             }),
         );
     })
@@ -136,6 +154,7 @@ struct SettingsApp {
     is_active: bool,
     action_tx: std_mpsc::Sender<TrayAction>,
     pending_show: Arc<Mutex<Option<SettingsInit>>>,
+    metrics: Arc<StageMetricsAggregator>,
 }
 
 impl SettingsApp {
@@ -143,6 +162,7 @@ impl SettingsApp {
         init: SettingsInit,
         action_tx: std_mpsc::Sender<TrayAction>,
         pending_show: Arc<Mutex<Option<SettingsInit>>>,
+        metrics: Arc<StageMetricsAggregator>,
     ) -> Self {
         let mic_idx = init
             .input_devices
@@ -165,6 +185,7 @@ impl SettingsApp {
             is_active: init.is_active,
             action_tx,
             pending_show,
+            metrics,
         }
     }
 
@@ -351,9 +372,79 @@ impl eframe::App for SettingsApp {
                             }
                         });
 
+                        ui.add_space(12.0);
+
+                        // ── Métricas card ───────────────────────────────────
+                        let snapshot = self.metrics.snapshot();
+                        shadcn_card(ui, content_width, |ui| {
+                            card_header(ui, "📊  Latência por estágio");
+                            metrics_table(ui, &snapshot);
+                        });
+
                         ui.add_space(8.0);
                     });
             });
+
+        // Schedule a periodic repaint while open so the metrics panel
+        // refreshes without user interaction. egui only repaints on
+        // events otherwise, which would freeze the numbers between
+        // mouse moves.
+        ctx.request_repaint_after(std::time::Duration::from_millis(
+            METRICS_REPAINT_INTERVAL_MS,
+        ));
+    }
+}
+
+fn metrics_table(ui: &mut egui::Ui, snapshot: &std::collections::HashMap<String, StageStats>) {
+    if snapshot.is_empty() {
+        ui.label(
+            egui::RichText::new(
+                "Sem amostras ainda — inicie a tradução para popular as métricas.",
+            )
+            .color(TEXT_SUBTLE)
+            .size(11.5),
+        );
+        return;
+    }
+
+    egui::Grid::new("metrics_grid")
+        .num_columns(4)
+        .spacing(egui::vec2(16.0, 4.0))
+        .striped(false)
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("Estágio").color(TEXT_MUTED).size(11.0));
+            ui.label(egui::RichText::new("P50").color(TEXT_MUTED).size(11.0));
+            ui.label(egui::RichText::new("P95").color(TEXT_MUTED).size(11.0));
+            ui.label(egui::RichText::new("Amostras").color(TEXT_MUTED).size(11.0));
+            ui.end_row();
+
+            for (key, label) in METRIC_STAGES {
+                let stats = match snapshot.get(*key) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let p50_ms = stats.p50.as_secs_f64() * 1000.0;
+                let p95_ms = stats.p95.as_secs_f64() * 1000.0;
+                ui.label(egui::RichText::new(*label).color(TEXT_PRIMARY).size(12.0));
+                ui.label(egui::RichText::new(format_ms(p50_ms)).color(TEXT_PRIMARY).size(12.0));
+                ui.label(egui::RichText::new(format_ms(p95_ms)).color(TEXT_PRIMARY).size(12.0));
+                ui.label(
+                    egui::RichText::new(format!("{}", stats.total_count))
+                        .color(TEXT_SUBTLE)
+                        .size(11.5),
+                );
+                ui.end_row();
+            }
+        });
+}
+
+fn format_ms(value_ms: f64) -> String {
+    if value_ms < 10.0 {
+        format!("{:.1} ms", value_ms)
+    } else if value_ms < 1000.0 {
+        format!("{:.0} ms", value_ms)
+    } else {
+        format!("{:.2} s", value_ms / 1000.0)
     }
 }
 

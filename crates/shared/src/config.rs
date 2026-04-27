@@ -2,7 +2,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::language::Language;
 
-const DEFAULT_CHUNK_DURATION_MS: u64 = 2000;
+/// Audio capture chunk size. With Silero VAD on the front of the pipeline
+/// (ADR 0008), most chunks become a fast no-op when nothing is being said,
+/// so we can afford a tighter cadence. 280 ms is small enough that the
+/// boundary detector in `StreamingSession` reacts quickly to a finished
+/// utterance and large enough that the diarisation bridge still has a
+/// few syllables of content for an embedding. Values <250 ms cause the
+/// streaming STT throttle (`MIN_INFERENCE_INTERVAL_MS = 250`) to drop
+/// every other chunk before it reaches Whisper.
+const DEFAULT_CHUNK_DURATION_MS: u64 = 280;
 /// Small quantized (q5_1) — ~181 MB vs 466 MB fp16, ~2x faster inference
 /// on both CPU and GPU with marginal quality loss for PT/EN.
 const DEFAULT_WHISPER_MODEL: &str = "small-q5_1";
@@ -40,6 +48,22 @@ pub struct PipelineConfig {
     /// Virtual microphone device the meeting app reads from (e.g. "CABLE Input").
     #[serde(default)]
     pub virtual_mic_device: Option<String>,
+
+    /// Enable Sepformer source separation on the speaker pipeline. When
+    /// true, each loopback audio chunk is split into two channels (one
+    /// per simultaneous speaker) and processed by parallel STT branches
+    /// — useful when meeting interruptions matter and the listener
+    /// can't afford a "salad" transcript of overlapping voices. Costs
+    /// ~50–80 ms per chunk + ~120 MB GPU/RAM. Default: false.
+    #[serde(default)]
+    pub enable_separation: bool,
+
+    // NOTE: Earlier versions had `speaker_voice_reference_wav` and
+    // `mic_voice_reference_wav` fields used by CosyVoice's zero-shot
+    // cloning path. Those are gone now — voice differentiation comes
+    // from per-speaker F0 tracking driving Piper's pitch shifter (no
+    // pre-recorded references needed). Old config.toml files with those
+    // keys still parse because we no longer reject unknown fields.
 }
 
 impl Default for PipelineConfig {
@@ -56,6 +80,7 @@ impl Default for PipelineConfig {
             headphones_device: None,
             mic_device: None,
             virtual_mic_device: None,
+            enable_separation: false,
         }
     }
 }
@@ -93,10 +118,10 @@ mod tests {
     }
 
     #[test]
-    fn default_chunk_duration_is_two_seconds() {
+    fn default_chunk_duration_matches_streaming_stt_cadence() {
         let config = PipelineConfig::default();
-        assert_eq!(config.chunk_duration_ms, 2000);
-        assert_eq!(config.chunk_duration_seconds(), 2.0);
+        assert_eq!(config.chunk_duration_ms, 280);
+        assert!((config.chunk_duration_seconds() - 0.28).abs() < 1e-6);
     }
 
     #[test]

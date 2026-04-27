@@ -15,6 +15,8 @@
     - Hi-Fi Cable virtual audio driver (mic TTS output)
     - Python packages (faster-whisper, transformers, piper-tts, etc.)
     - Whisper GGML model download
+    - CosyVoice 2-0.5B clone + weights download (TTS + zero-shot voice cloning)
+    - SpeechBrain ECAPA-TDNN warm-up (online diarisation)
     - Auto-generates .cargo/config.toml with correct MSVC paths
     - Creates default config.toml if not present
     - Builds the Rust project
@@ -479,36 +481,79 @@ function Install-PythonDeps {
         exit 1
     }
 
-    Write-Host "  Upgrading pip..." -ForegroundColor Gray
-    try { & $PythonExe -m pip install --upgrade pip 2>&1 | Out-Host } catch {}
+    Write-Host "  Upgrading pip / wheel and pinning setuptools..." -ForegroundColor Gray
+    # setuptools <75 still ships `pkg_resources.declare_namespace`, which
+    # `lightning` (the version cosyvoice pulls) uses inside its package
+    # __init__. setuptools 75 removed declare_namespace, so without this
+    # pin the bridge crashes with `ModuleNotFoundError: pkg_resources`
+    # the moment lightning is imported.
+    # Newer pip + wheel are still safe to upgrade unconditionally.
+    try { & $PythonExe -m pip install --upgrade pip wheel 2>&1 | Out-Host } catch {}
+    try { & $PythonExe -m pip install "setuptools<75" 2>&1 | Out-Host } catch {}
 
-    Write-Host "  Installing packages (this may take several minutes on first run)..." -ForegroundColor Gray
+    # Install line-by-line so a build failure on one package (typically
+    # pyworld / WeTextProcessing — the C-extension Chinese text deps that
+    # don't have Windows wheels) doesn't make pip's resolver atomic-fail
+    # the whole list. The cosyvoice runtime tolerates several of these
+    # being absent (text normalisers fall back to a default path).
+    Write-Host "  Installing packages (line-by-line; failures are isolated)..." -ForegroundColor Gray
+
     $prevPref = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    $pipOutput = & $PythonExe -m pip install -r $requirementsFile 2>&1
-    $pipExitCode = $LASTEXITCODE
+
+    $failedPackages = @()
+    foreach ($rawLine in (Get-Content $requirementsFile)) {
+        $line = $rawLine.Trim()
+        # Skip blanks and comments.
+        if (-not $line -or $line.StartsWith("#")) { continue }
+
+        # Drop inline comments (`pkg>=1.0  # note`).
+        if ($line.Contains("#")) {
+            $line = ($line -split "#", 2)[0].Trim()
+        }
+        if (-not $line) { continue }
+
+        Write-Host "    -> $line" -ForegroundColor DarkGray
+        & $PythonExe -m pip install --prefer-binary $line 2>&1 |
+            ForEach-Object { Write-Host "       $_" -ForegroundColor DarkGray }
+        if ($LASTEXITCODE -ne 0) {
+            $failedPackages += $line
+            Write-Host "       (failed; will try --no-deps fallback)" -ForegroundColor Yellow
+            & $PythonExe -m pip install --prefer-binary --no-deps $line 2>&1 |
+                ForEach-Object { Write-Host "       $_" -ForegroundColor DarkGray }
+        }
+    }
+
     $ErrorActionPreference = $prevPref
 
-    if ($pipExitCode -eq 0) {
-        $packages = @("faster_whisper", "transformers", "torch", "ctranslate2")
-        $allOk = $true
-        foreach ($pkg in $packages) {
-            $check = & $PythonExe -c "import $pkg; print($pkg.__version__)" 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Ok "$pkg $check"
-            } else {
-                Write-Fail "$pkg not importable"
-                $allOk = $false
-            }
+    # Verify the imports the bridges will actually perform — if any of
+    # these fail the bridges crash on startup with ModuleNotFoundError.
+    # This list reflects the Piper + pyworld + speechbrain stack; the
+    # CosyVoice-era deps (hyperpyyaml, lightning, diffusers, …) were
+    # removed when the TTS path moved back to Piper (ADR 0006).
+    $criticalImports = @(
+        "transformers", "torch", "torchaudio", "ctranslate2",
+        "piper", "pyworld", "speechbrain", "numpy"
+    )
+    $missing = @()
+    foreach ($pkg in $criticalImports) {
+        & $PythonExe -c "import $pkg" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "$pkg importable"
+        } else {
+            Write-Fail "$pkg NOT importable"
+            $missing += $pkg
         }
+    }
 
-        if (-not $allOk) {
-            Write-Host "  Some packages failed to install. Check the output above." -ForegroundColor Yellow
-        }
-    } else {
-        Write-Fail "pip install failed (exit code: $pipExitCode)"
-        Write-Host "  Output: $pipOutput" -ForegroundColor Yellow
-        Write-Host "  Try running manually: $PythonExe -m pip install -r $requirementsFile" -ForegroundColor Yellow
+    if ($missing.Count -gt 0) {
+        Write-Host "  Some critical packages are missing: $($missing -join ', ')" -ForegroundColor Yellow
+        Write-Host "  Try installing them manually with --no-deps:" -ForegroundColor Yellow
+        Write-Host "    $PythonExe -m pip install --no-deps $($missing -join ' ')" -ForegroundColor Yellow
+    }
+
+    if ($failedPackages.Count -gt 0) {
+        Write-Host "  Packages that needed --no-deps fallback: $($failedPackages -join ', ')" -ForegroundColor Yellow
     }
 }
 
@@ -594,6 +639,322 @@ function Install-TranslationModels {
     } else {
         Write-Fail "Conversion failed for $hfName (exit $exit)"
         Write-Host "  Run manually: $PythonExe -m ctranslate2.converters.transformers --model $hfName --output_dir $targetDir --quantization int8" -ForegroundColor Yellow
+    }
+}
+
+function Install-PiperVoices {
+    # Pre-downloads the Piper ONNX voices (Faber pt-BR, Ryan en-US) into
+    # %TEMP%\piper_voices\. The bridge auto-downloads on first start
+    # too, but doing it here means cold-start of the app stays fast.
+    Write-Step "Piper TTS Voices (pt-BR Faber + en-US Ryan)"
+
+    $voicesDir = Join-Path $env:TEMP "piper_voices"
+    if (-not (Test-Path $voicesDir)) {
+        New-Item -Path $voicesDir -ItemType Directory -Force | Out-Null
+    }
+
+    $voices = @(
+        @{
+            name = "en_US-ryan-medium"
+            urls = @(
+                "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx",
+                "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx.json"
+            )
+        },
+        @{
+            name = "en_US-amy-medium"
+            urls = @(
+                "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx",
+                "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json"
+            )
+        },
+        @{
+            name = "pt_BR-faber-medium"
+            urls = @(
+                "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx",
+                "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json"
+            )
+        }
+    )
+
+    foreach ($voice in $voices) {
+        foreach ($url in $voice.urls) {
+            $filename = [System.IO.Path]::GetFileName($url)
+            $localPath = Join-Path $voicesDir $filename
+            if (Test-Path $localPath) {
+                continue
+            }
+            Write-Host "  Downloading $filename..." -ForegroundColor Gray
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $localPath -UseBasicParsing
+                $size = [math]::Round((Get-Item $localPath).Length / 1MB, 1)
+                Write-Ok "$filename (${size} MB)"
+            } catch {
+                Write-Fail "Could not download $filename : $_"
+            }
+        }
+    }
+}
+
+# (Install-TorchCuda was used during the CosyVoice attempt; CPU torch is
+# enough for Piper + pyworld + speechbrain on the current pipeline. Kept
+# here as a no-op stub so the main flow at the bottom of the script
+# stays minimal — call site removed in this revision.)
+function Install-TorchCuda {
+    param([string]$PythonExe)
+    return
+    Write-Step "PyTorch with CUDA support"
+
+    Refresh-Path
+
+    # Quick check: does the currently installed torch see CUDA?
+    $cudaState = (& $PythonExe -c "import torch, sys; sys.stdout.write('1' if torch.cuda.is_available() else '0')" 2>$null)
+    if ($cudaState -eq "1") {
+        $version = & $PythonExe -c "import torch; print(torch.__version__, '-', torch.version.cuda)" 2>&1
+        Write-Ok "PyTorch CUDA already working: $version"
+        return
+    }
+
+    # Pick a CUDA wheel variant that matches the installed CUDA toolkit.
+    # The PyTorch wheels are forward-compatible within a major version,
+    # so cu124 wheels work on top of CUDA 12.x runtimes (the user's setup
+    # has the 12.4 toolkit + a 13.0 driver).
+    $cuVariant = "cu124"
+    $nvccVersion = ""
+    if (Test-Command "nvcc") {
+        $nvccVersion = (& nvcc --version 2>&1 | Select-String "release") -replace ".*release ", "" -replace ",.*", ""
+        if ($nvccVersion -match "^12\.1") { $cuVariant = "cu121" }
+        elseif ($nvccVersion -match "^12\.6") { $cuVariant = "cu126" }
+        elseif ($nvccVersion -match "^12\.8") { $cuVariant = "cu126" }  # cu128 not always available
+        # Anything else 12.x → cu124 (default)
+    }
+
+    $indexUrl = "https://download.pytorch.org/whl/$cuVariant"
+    Write-Host "  Installing PyTorch from $indexUrl (CUDA toolkit: $nvccVersion)..." -ForegroundColor Gray
+
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $PythonExe -m pip uninstall -y torch torchaudio torchvision 2>&1 | Out-Host
+    & $PythonExe -m pip install --upgrade --index-url $indexUrl torch torchaudio 2>&1 | Out-Host
+    $ErrorActionPreference = $prevPref
+
+    $cudaState = (& $PythonExe -c "import torch, sys; sys.stdout.write('1' if torch.cuda.is_available() else '0')" 2>$null)
+    if ($cudaState -eq "1") {
+        $version = & $PythonExe -c "import torch; print(torch.__version__, '-', torch.version.cuda)" 2>&1
+        Write-Ok "PyTorch CUDA installed: $version"
+    } else {
+        Write-Fail "PyTorch still reports no CUDA. Install manually:"
+        Write-Host "    $PythonExe -m pip install --upgrade --index-url $indexUrl torch torchaudio" -ForegroundColor Yellow
+    }
+}
+
+function Install-CosyVoice {
+    param([string]$PythonExe)
+
+    # CosyVoice 2-0.5B is the TTS + zero-shot voice cloner that replaced
+    # Piper + KNN-VC. The PyPI package is unstable, so we clone the
+    # upstream repo into `third_party/CosyVoice/` and let `tts_bridge.py`
+    # add it to sys.path. The 0.5B weights (~600 MB) are downloaded from
+    # HuggingFace into `models/CosyVoice2-0.5B/`.
+    Write-Step "CosyVoice 2-0.5B (TTS + voice cloning)"
+
+    $thirdPartyDir = Join-Path $ProjectRoot "third_party"
+    $repoDir = Join-Path $thirdPartyDir "CosyVoice"
+    $matchaDir = Join-Path $repoDir "third_party\Matcha-TTS"
+
+    if (-not (Test-Path $thirdPartyDir)) {
+        New-Item -Path $thirdPartyDir -ItemType Directory -Force | Out-Null
+    }
+
+    if (-not (Test-Path $repoDir)) {
+        Write-Host "  Cloning CosyVoice repo (with submodules)..." -ForegroundColor Gray
+        try {
+            & git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git $repoDir 2>&1 | Out-Host
+        } catch {
+            Write-Fail "git clone failed: $_"
+            Write-Host "  Clone manually: git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git $repoDir" -ForegroundColor Yellow
+            return
+        }
+    } else {
+        Write-Ok "CosyVoice repo already present at $repoDir"
+        # Make sure submodules are in place — Matcha-TTS is required for
+        # the matcha vocoder used by the cosyvoice package.
+        if (-not (Test-Path "$matchaDir\matcha")) {
+            Write-Host "  Initialising submodules (Matcha-TTS)..." -ForegroundColor Gray
+            Push-Location $repoDir
+            try { & git submodule update --init --recursive 2>&1 | Out-Host } catch {}
+            Pop-Location
+        }
+    }
+
+    # NOTE: We deliberately do NOT run `pip install -r $repoDir/requirements.txt`.
+    # CosyVoice's upstream requirements pin grpcio==1.57.0 (no Python 3.12
+    # wheel on Windows; builds-from-source crash with `ModuleNotFoundError:
+    # pkg_resources`) and pull in heavy unused deps (deepspeed, tensorrt-cu12,
+    # gradio, fastapi). The runtime imports the cosyvoice cli actually does
+    # are listed in `scripts/requirements.txt` and installed by
+    # `Install-PythonDeps`.
+
+    # Install `modelscope` with --no-deps. CosyVoice does
+    # `from modelscope import snapshot_download` at module load time, so
+    # the package must be importable — but we never call it (weights are
+    # downloaded via huggingface_hub below). --no-deps avoids the
+    # grpcio<=1.57 transitive pin that breaks the resolver on Python 3.12.
+    Write-Host "  Installing modelscope (no-deps, import-only)..." -ForegroundColor Gray
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $PythonExe -m pip install --no-deps "modelscope>=1.20" 2>&1 | Out-Host
+    $ErrorActionPreference = $prevPref
+
+    # Best-effort tolerant pass over CosyVoice's upstream requirements.txt.
+    # We deliberately don't trust the file (it has Windows-hostile pins —
+    # grpcio==1.57.0, deepspeed, tensorrt-cu12, pyworld) but installing
+    # line-by-line catches transitive deps we'd otherwise discover one at
+    # a time when the bridge crashes (hydra-core, rootutils, ...). Lines
+    # that fail are dropped silently; cosyvoice handles most of them with
+    # try/except and the bridge tells us if any remaining import fails.
+    $upstreamReq = Join-Path $repoDir "requirements.txt"
+    if (Test-Path $upstreamReq) {
+        Write-Host "  Tolerant pass over CosyVoice's upstream requirements (skipping bad pins)..." -ForegroundColor Gray
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $skipPatterns = @(
+            "grpcio", "deepspeed", "tensorrt", "pyworld",
+            "WeTextProcessing", "wetext", "ttsfrd",
+            # gradio/uvicorn/fastapi are server-side; we don't run that path.
+            "gradio", "uvicorn", "fastapi"
+        )
+        foreach ($rawLine in (Get-Content $upstreamReq)) {
+            $line = $rawLine.Trim()
+            if (-not $line -or $line.StartsWith("#") -or $line.StartsWith("-")) { continue }
+            if ($line.Contains("#")) { $line = ($line -split "#", 2)[0].Trim() }
+            if (-not $line) { continue }
+            $skip = $false
+            foreach ($pat in $skipPatterns) {
+                if ($line -match $pat) { $skip = $true; break }
+            }
+            if ($skip) { continue }
+            & $PythonExe -m pip install --prefer-binary $line 2>&1 | Out-Null
+        }
+        $ErrorActionPreference = $prevPref
+        Write-Ok "Upstream requirements pass complete (failures tolerated)"
+    }
+
+    # Download the 0.5B weights via HuggingFace. Using the python `huggingface_hub`
+    # snapshot_download keeps us off ModelScope (which has flaky Windows support)
+    # and yields a layout that matches what cosyvoice's loader expects.
+    $modelDir = Join-Path $ModelsDir "CosyVoice2-0.5B"
+    $modelMarker = Join-Path $modelDir "cosyvoice2.yaml"
+    if (Test-Path $modelMarker) {
+        Write-Ok "CosyVoice2-0.5B weights already downloaded"
+        return
+    }
+
+    if (-not (Test-Path $ModelsDir)) {
+        New-Item -Path $ModelsDir -ItemType Directory -Force | Out-Null
+    }
+
+    Write-Host "  Downloading CosyVoice2-0.5B weights from HuggingFace (~600 MB)..." -ForegroundColor Gray
+    $downloadScript = @"
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='FunAudioLLM/CosyVoice2-0.5B',
+    local_dir=r'$modelDir',
+)
+print('Downloaded')
+"@
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $PythonExe -c $downloadScript 2>&1 | Out-Host
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = $prevPref
+
+    if ($exit -eq 0 -and (Test-Path $modelMarker)) {
+        $size = [math]::Round((Get-ChildItem $modelDir -Recurse | Measure-Object Length -Sum).Sum / 1MB, 1)
+        Write-Ok "CosyVoice2-0.5B downloaded (${size}MB)"
+    } else {
+        Write-Fail "CosyVoice2-0.5B download failed (exit $exit)"
+        Write-Host "  Run manually: $PythonExe -c ""from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice2-0.5B', local_dir=r'$modelDir')""" -ForegroundColor Yellow
+    }
+}
+
+function Install-SeparationModel {
+    param([string]$PythonExe)
+
+    # Sepformer-libri2mix from SpeechBrain (~120 MB) is the source
+    # separator the speaker pipeline uses when `enable_separation = true`
+    # in config.toml. Pre-fetched here so flipping the flag at runtime
+    # doesn't pay a multi-second model-download stall on the first run.
+    Write-Step "Sepformer-libri2mix (source separation, opt-in)"
+
+    $cacheDir = Join-Path $env:USERPROFILE ".cache\speechbrain\sepformer-libri2mix"
+    if (Test-Path "$cacheDir\masknet.ckpt") {
+        Write-Ok "Sepformer already cached at $cacheDir"
+        return
+    }
+
+    Write-Host "  Pre-downloading Sepformer (~120 MB)..." -ForegroundColor Gray
+    $warmScript = @"
+import os
+os.environ.setdefault('SEPFORMER_PRETRAINED_DIR', r'$cacheDir')
+from speechbrain.inference.separation import SepformerSeparation as Sep
+Sep.from_hparams(
+    source='speechbrain/sepformer-libri2mix',
+    savedir=r'$cacheDir',
+    run_opts={'device': 'cpu'},
+)
+print('Sepformer ready')
+"@
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $PythonExe -c $warmScript 2>&1 | Out-Host
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = $prevPref
+
+    if ($exit -eq 0) {
+        Write-Ok "Sepformer cached at $cacheDir"
+    } else {
+        Write-Skip "Sepformer warm-up failed (will retry on first run)"
+    }
+}
+
+function Install-DiarizationModel {
+    param([string]$PythonExe)
+
+    # SpeechBrain ECAPA-TDNN is the diarisation embedder that replaced
+    # Resemblyzer. Pre-downloading it avoids a stall the first time the
+    # diarization bridge starts up — speechbrain otherwise pulls weights
+    # on-demand and the Rust pipeline times out waiting for "ready".
+    Write-Step "SpeechBrain ECAPA-TDNN (diarisation embeddings)"
+
+    $cacheDir = Join-Path $env:USERPROFILE ".cache\speechbrain\ecapa-tdnn"
+    if (Test-Path "$cacheDir\embedding_model.ckpt") {
+        Write-Ok "ECAPA-TDNN already cached at $cacheDir"
+        return
+    }
+
+    Write-Host "  Pre-downloading ECAPA-TDNN (~22 MB)..." -ForegroundColor Gray
+    $warmScript = @"
+import os
+os.environ.setdefault('SPEECHBRAIN_PRETRAINED_DIR', r'$cacheDir')
+from speechbrain.inference.speaker import EncoderClassifier
+EncoderClassifier.from_hparams(
+    source='speechbrain/spkrec-ecapa-voxceleb',
+    savedir=r'$cacheDir',
+    run_opts={'device': 'cpu'},
+)
+print('ECAPA-TDNN ready')
+"@
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $PythonExe -c $warmScript 2>&1 | Out-Host
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = $prevPref
+
+    if ($exit -eq 0) {
+        Write-Ok "ECAPA-TDNN cached at $cacheDir"
+    } else {
+        Write-Skip "ECAPA-TDNN warm-up failed (will retry on first run)"
     }
 }
 
@@ -693,7 +1054,7 @@ speaker_source_language = "English"
 speaker_target_language = "Portuguese"
 mic_source_language = "Portuguese"
 mic_target_language = "English"
-chunk_duration_ms = 500
+chunk_duration_ms = 280
 whisper_model = "small-q5_1"
 tts_speed = 1.1
 "@
@@ -827,6 +1188,9 @@ Install-HiFiCable
 Install-PythonDeps -PythonExe $pythonExe
 Install-WhisperModel
 Install-TranslationModels -PythonExe $pythonExe
+Install-PiperVoices
+Install-DiarizationModel -PythonExe $pythonExe
+Install-SeparationModel -PythonExe $pythonExe
 
 # 6. Configuration
 Configure-CargoConfig

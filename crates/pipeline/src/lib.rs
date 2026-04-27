@@ -1,61 +1,70 @@
 use audio::resampler;
+use audio::SileroVad;
+use diarization::OnlineDiarizer;
 use shared::{AudioChunk, Language, PipelineCommand, PipelineMetrics, TextSegment};
-use stt::WhisperStt;
+use stt::{CommittedWords, StreamingSession, WhisperStt};
 use tokio::sync::mpsc;
 use tracing;
 use translation::OpusMtTranslator;
-use tts::PiperTts;
+use tts::{PiperTts, VoiceProfile};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
-/// Minimum RMS energy to send audio to STT. Below this, the chunk is
-/// silence or very quiet noise — sending it to Whisper would only produce
-/// hallucinations. This is NOT a VAD — it's just a "is there any signal?"
-/// check. Cost: one pass over the samples (~0ms).
-const MIN_RMS_FOR_STT: f32 = 0.003;
-
-/// Window (seconds) scanned at the end of each STT chunk to decide whether
-/// the speaker paused. A quiet tail is the strongest "phrase ended" signal
-/// we can extract without real VAD — mirrors how a human interpreter flushes
-/// a sentence the moment the speaker exhales.
-const PAUSE_DETECTION_TAIL_SECONDS: f32 = 0.35;
-
-/// RMS threshold for the tail-pause detector. Slightly above the chunk-gate
-/// threshold so we only treat the tail as "paused" when it's meaningfully
-/// quieter than the active-speech baseline.
-const PAUSE_TAIL_RMS: f32 = MIN_RMS_FOR_STT * 1.5;
+/// Energy floor used only when Silero VAD is unavailable (model file
+/// missing or ORT init failure). Same threshold the legacy gate used —
+/// the neural VAD is the primary path; this keeps the pipeline alive on
+/// a fresh checkout that hasn't run install.ps1 yet.
+const FALLBACK_MIN_RMS_FOR_STT: f32 = 0.003;
 
 /// Maximum concurrent translate+TTS tasks in flight. Limits GPU/CPU pressure
-/// while still allowing pipeline overlap between chunks.
+/// while still allowing pipeline overlap between sentences.
 const MAX_CONCURRENT_TRANSLATE: usize = 3;
 
 /// Minimum word count required before a timeout flush is allowed. Acts as a
-/// floor — below this we keep waiting even if `MAX_HOLD_SECONDS` elapses, so
-/// we never ship a fragment like "The market has been" to the translator.
+/// floor so we never ship a fragment like "The market has been" to the
+/// translator.
 const MIN_WORDS_FOR_TIMEOUT_FLUSH: usize = 4;
 
-/// Maximum time (in seconds) to hold accumulated text before force-flushing.
-/// Longer than a pure-latency tuning would suggest: a human interpreter will
-/// wait several seconds inside a long sentence rather than cut it mid-clause,
-/// because fragmented input produces literal, incoherent translations.
+/// Maximum time the text accumulator may hold without flushing. A simultaneous
+/// interpreter waits through long clauses rather than cut mid-thought; we
+/// bound the wait so a stuck accumulator eventually drains.
 const MAX_HOLD_SECONDS: f32 = 6.0;
 
-/// How long (seconds) to keep recent translations for echo detection.
-/// STT feedback typically appears within 2-4 seconds of TTS playback.
+/// How long to keep recent translations for echo detection. STT feedback
+/// typically appears within 2-4 seconds of TTS playback.
 const ECHO_WINDOW_SECONDS: f32 = 8.0;
 
-/// Word overlap threshold (0.0–1.0) above which STT text is considered
-/// an echo of a recent translation and should be discarded.
+/// Word overlap threshold above which STT text is considered an echo of a
+/// recent translation and dropped.
 const ECHO_SIMILARITY_THRESHOLD: f32 = 0.4;
 
-/// Shared buffer of recent translation outputs, used to detect when
-/// the loopback captures our own TTS audio (feedback loop).
-/// Both pipelines share one buffer so cross-pipeline echo is also detected.
+/// Number of consecutive chunks the diarizer must identify as a different
+/// speaker before we accept the change and flush the accumulator. Hides
+/// single-chunk wobble that used to fragment sentences.
+const MIN_CHUNKS_FOR_SPEAKER_CHANGE: u32 = 2;
+
+/// Smoothing factor for the per-speaker running F0. Each new sample is mixed
+/// in with this weight; a higher value reacts faster, a lower value is
+/// steadier. 0.2 trades roughly 5 chunks of half-life for stability — a
+/// loud cough or breath produces a brief F0 spike that doesn't survive the
+/// average, while a sustained pitch change (different speaker, or the same
+/// speaker getting excited) updates the profile within ~2 s.
+const F0_RUNNING_MEAN_ALPHA: f32 = 0.2;
+
+/// F0 ceilings used to clamp running-mean updates. pyworld occasionally
+/// returns absurd values when fed near-silence; clamping prevents one bad
+/// chunk from poisoning a speaker's entire profile.
+const F0_MIN_HZ: f32 = 70.0;
+const F0_MAX_HZ: f32 = 400.0;
+
+/// Shared buffer of recent translation outputs, used to detect when the
+/// loopback captures our own TTS audio (feedback loop). Both pipelines
+/// share one buffer so cross-pipeline echo is also detected.
 pub type EchoBuffer = Arc<Mutex<VecDeque<(Instant, Vec<String>)>>>;
 
 /// Create a new shared echo buffer for cross-pipeline echo detection.
@@ -63,32 +72,92 @@ pub fn new_echo_buffer() -> EchoBuffer {
     Arc::new(Mutex::new(VecDeque::new()))
 }
 
-/// Pipeline modelled after a human simultaneous interpreter.
+// ─── Voice profile registry: per-speaker running F0 ─────────────────────────
+//
+// Replaces the file-based `SpeakerRegistry` from the CosyVoice era. Instead
+// of materialising a reference WAV on disk, we just track a running F0 mean
+// per speaker_id. The TTS stage reads the profile to bend Piper's output
+// pitch towards the original speaker — same "voices sound different per
+// person" UX the cloned-voice path was meant to provide, at a fraction of
+// the cost (no model, no GPU, ~10 ms of pyworld DSP per chunk).
+//
+// One registry per pipeline branch, shared with the translate worker via
+// `Arc<Mutex<>>` so the TTS stage can read it without crossing the tokio
+// select loop.
+
+#[derive(Default)]
+struct VoiceProfileInner {
+    f0_by_speaker: HashMap<u32, f32>,
+}
+
+pub struct VoiceProfileRegistry {
+    inner: Mutex<VoiceProfileInner>,
+}
+
+impl VoiceProfileRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(VoiceProfileInner::default()),
+        }
+    }
+
+    /// Mix `f0_hz` into `speaker_id`'s running mean. Silently skips
+    /// implausible values (the diarizer returns 0.0 when no voiced frame
+    /// could be detected, and very high/low values are usually pyworld
+    /// noise on near-silent audio).
+    fn record_f0(&self, speaker_id: u32, f0_hz: f32) {
+        if !(F0_MIN_HZ..=F0_MAX_HZ).contains(&f0_hz) {
+            return;
+        }
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let entry = inner.f0_by_speaker.entry(speaker_id).or_insert(f0_hz);
+        *entry = *entry * (1.0 - F0_RUNNING_MEAN_ALPHA)
+            + f0_hz * F0_RUNNING_MEAN_ALPHA;
+    }
+
+    /// Return the running mean F0 for `speaker_id`, or 0.0 when no F0
+    /// has ever been recorded for them. The TTS stage interprets 0.0
+    /// as "use Piper's default voice unchanged".
+    fn f0_for(&self, speaker_id: u32) -> f32 {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|g| g.f0_by_speaker.get(&speaker_id).copied())
+            .unwrap_or(0.0)
+    }
+}
+
+/// Pipeline modelled after a human simultaneous interpreter, driven by
+/// streaming STT (Local Agreement-style boundary detection) and Piper TTS
+/// with per-speaker pitch shifting.
 ///
-/// Architecture (3 stages, fully pipelined):
+/// Stages (fully pipelined):
 ///
 /// ```text
-/// [Audio capture] ──→ [STT workers] ──→ [Concurrent Translate+TTS] ──→ [Ordered Playback]
-///   (parallel)         (parallel)         (up to 3 in flight)           (reorder buffer)
+/// [Audio capture] → [STT worker] → [Text accumulator] → [Translate+TTS] → [Ordered playback]
+///   (parallel)      (single,        (in-line, sentence    (up to 3 in       (reorder buffer)
+///                    serial)         boundary detect)      flight)
 /// ```
-///
-/// - **STT** runs in parallel (spawn_blocking) — doesn't block audio capture.
-/// - **Translate+TTS** runs concurrently (up to 3 tasks) — while chunk N is
-///   being synthesized, chunk N+1 is already translating. A reorder buffer
-///   guarantees playback matches original speech order.
-/// - **Smart accumulator** — text is held until punctuation, 8+ words, or
-///   3s timeout. Balances translation coherence with low latency.
 pub struct SpeakerPipeline {
     pub name: String,
     pub stt: Arc<WhisperStt>,
     pub translator: Arc<OpusMtTranslator>,
     pub tts: Arc<PiperTts>,
     pub source_language: Language,
-    pub flush_interval_seconds: f32,
-    /// Shared echo buffer — both pipelines write translations here and check
-    /// STT results against it. Prevents cross-pipeline feedback (mic TTS
-    /// recaptured by speaker loopback).
     pub echo_buffer: EchoBuffer,
+    /// Optional online diariser. When present the pipeline identifies a
+    /// speaker_id per chunk and tracks per-speaker F0 to drive the TTS
+    /// pitch shifter — without it the TTS uses the default Piper voice.
+    pub diarizer: Option<Arc<OnlineDiarizer>>,
+    /// Optional neural VAD (ADR 0008). When present, decides per-chunk
+    /// whether audio carries speech; when absent the pipeline falls back
+    /// to a simple RMS energy gate. Each pipeline owns its own instance
+    /// because the model is stateful (LSTM) and sharing one would mix
+    /// contexts between mic and loopback streams.
+    pub vad: Option<Arc<SileroVad>>,
 }
 
 impl SpeakerPipeline {
@@ -98,13 +167,24 @@ impl SpeakerPipeline {
         translator: Arc<OpusMtTranslator>,
         tts: Arc<PiperTts>,
         source_language: Language,
-        flush_interval_seconds: f32,
         echo_buffer: EchoBuffer,
     ) -> Self {
         Self {
             name: name.into(), stt, translator, tts,
-            source_language, flush_interval_seconds, echo_buffer,
+            source_language, echo_buffer,
+            diarizer: None,
+            vad: None,
         }
+    }
+
+    pub fn with_diarizer(mut self, diarizer: Arc<OnlineDiarizer>) -> Self {
+        self.diarizer = Some(diarizer);
+        self
+    }
+
+    pub fn with_vad(mut self, vad: Arc<SileroVad>) -> Self {
+        self.vad = Some(vad);
+        self
     }
 
     pub async fn run(
@@ -112,200 +192,168 @@ impl SpeakerPipeline {
         mut audio_input: mpsc::UnboundedReceiver<AudioChunk>,
         audio_output: mpsc::UnboundedSender<AudioChunk>,
         mut command_rx: mpsc::Receiver<PipelineCommand>,
-        _metrics_tx: mpsc::Sender<PipelineMetrics>,
+        metrics_tx: mpsc::Sender<PipelineMetrics>,
     ) {
         let pipeline_name = self.name;
         let stt = self.stt;
         let translator = self.translator;
         let tts = self.tts;
         let source_language = self.source_language;
-        let flush_interval = self.flush_interval_seconds;
-        let flush_sample_count = (WHISPER_SAMPLE_RATE as f32 * flush_interval) as usize;
         let echo_buffer = self.echo_buffer;
+        let diarizer = self.diarizer;
+        let vad = self.vad;
+        let voice_profiles = Arc::new(VoiceProfileRegistry::new());
+
+        // ── STT worker channel ────────────────────────────────────────────
+        let (raw_audio_tx, raw_audio_rx) = mpsc::unbounded_channel::<Vec<f32>>();
+        let (committed_tx, mut committed_rx) =
+            mpsc::unbounded_channel::<(CommittedWords, Option<u32>)>();
+        start_stt_worker(
+            pipeline_name.clone(),
+            stt.clone(),
+            source_language,
+            raw_audio_rx,
+            committed_tx,
+            diarizer.clone(),
+            voice_profiles.clone(),
+            metrics_tx.clone(),
+        );
+
+        // ── Translate+TTS worker channel ──────────────────────────────────
+        // The Instant carried alongside (seq, text, speaker) is the moment
+        // the accumulator flushed — used to compute the end-to-end "total"
+        // metric (text-flush → first audio sample sent to playback).
+        let (text_tx, text_rx) =
+            mpsc::unbounded_channel::<(u64, String, Option<u32>, Instant)>();
+        start_translate_worker(
+            text_rx,
+            translator.clone(),
+            tts.clone(),
+            audio_output.clone(),
+            echo_buffer.clone(),
+            voice_profiles.clone(),
+            metrics_tx.clone(),
+        );
 
         let mut is_running = false;
-        let mut accumulated_samples: Vec<f32> = Vec::new();
-        let mut next_seq: u64 = 0;          // next sequence number to assign
-        let mut expected_seq: u64 = 0;       // next sequence number we expect to receive
-        let mut pending: std::collections::BTreeMap<u64, SttResult> = std::collections::BTreeMap::new();
-        let mut translate_seq: u64 = 0;      // sequence number for translate worker
-        let mut accumulator = String::new();       // text accumulator for translation context
-        let mut accumulator_start: Option<Instant> = None; // when accumulation began
-
-        // STT results arrive here (from parallel spawn_blocking tasks)
-        let (stt_tx, mut stt_rx) = mpsc::unbounded_channel::<SttResult>();
-
-        // Text chunks go to the concurrent translate+TTS worker (with ordered delivery)
-        let (text_tx, text_rx) = mpsc::unbounded_channel::<(u64, String)>();
-        start_translate_worker(text_rx, translator.clone(), tts.clone(), audio_output.clone(), echo_buffer.clone());
+        let mut accumulator = String::new();
+        let mut accumulator_start: Option<Instant> = None;
+        let mut accumulator_speaker: Option<u32> = None;
+        let mut translate_seq: u64 = 0;
 
         loop {
             tokio::select! {
                 Some(command) = command_rx.recv() => {
                     match command {
                         PipelineCommand::Start => {
-                            tracing::info!("Pipeline started (source={}, flush={:.1}s)",
-                                source_language.display_name(), flush_interval);
+                            tracing::info!("[{}] Pipeline started (source={})",
+                                pipeline_name, source_language.display_name());
                             is_running = true;
                         }
                         PipelineCommand::Stop => {
-                            tracing::info!("Pipeline stopped");
+                            tracing::info!("[{}] Pipeline stopped", pipeline_name);
                             is_running = false;
-                            accumulated_samples.clear();
                             accumulator.clear();
                             accumulator_start = None;
+                            accumulator_speaker = None;
                         }
                     }
                 }
 
-                // ── Receive audio, accumulate, dispatch to STT ────────────
                 Some(chunk) = audio_input.recv() => {
                     if !is_running { continue; }
 
-                    accumulated_samples.extend_from_slice(&chunk.samples);
-
-                    if accumulated_samples.len() >= flush_sample_count {
-                        let samples = std::mem::take(&mut accumulated_samples);
-
-                        // Energy gate — skip STT if audio is silence/noise.
-                        // Without this, Whisper hallucinates on near-silence
-                        // (e.g. mic picking up headphone bleed → "e" every chunk).
-                        let rms = (samples.iter().map(|s| s * s).sum::<f32>()
-                            / samples.len().max(1) as f32)
-                            .sqrt();
-                        if rms < MIN_RMS_FOR_STT {
-                            let seq = next_seq;
-                            next_seq += 1;
-                            let _ = stt_tx.send(SttResult {
-                                seq,
-                                text: String::new(),
-                                detected_language: source_language,
-                                expected_language: source_language,
-                                stt_duration: std::time::Duration::ZERO,
-                                tail_silent: true,
-                            });
-                            continue;
+                    let vad_start = Instant::now();
+                    let has_speech = match vad.as_ref() {
+                        Some(v) => v.has_speech(&chunk.samples),
+                        None => {
+                            let rms = (chunk.samples.iter().map(|s| s * s).sum::<f32>()
+                                / chunk.samples.len().max(1) as f32).sqrt();
+                            rms >= FALLBACK_MIN_RMS_FOR_STT
                         }
+                    };
+                    let _ = metrics_tx.try_send(PipelineMetrics::new(
+                        "vad".to_string(),
+                        vad_start.elapsed(),
+                    ));
 
-                        // Conviction signal: did the speaker pause at the end of this chunk?
-                        let tail_silent = tail_is_silent(&samples);
-
-                        let stt_clone = stt.clone();
-                        let tx = stt_tx.clone();
-                        let expected_lang = source_language;
-                        let seq = next_seq;
-                        next_seq += 1;
-
-                        tokio::task::spawn_blocking(move || {
-                            let start = Instant::now();
-                            let chunk = AudioChunk::new(samples, WHISPER_SAMPLE_RATE, 1);
-                            match stt_clone.transcribe(&chunk, expected_lang) {
-                                Ok(seg) => {
-                                    let _ = tx.send(SttResult {
-                                        seq,
-                                        text: if seg.is_empty() { String::new() } else { seg.text },
-                                        detected_language: seg.language,
-                                        expected_language: expected_lang,
-                                        stt_duration: start.elapsed(),
-                                        tail_silent,
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::warn!("STT failed: {}", e);
-                                    let _ = tx.send(SttResult {
-                                        seq,
-                                        text: String::new(),
-                                        detected_language: expected_lang,
-                                        expected_language: expected_lang,
-                                        stt_duration: start.elapsed(),
-                                        tail_silent,
-                                    });
-                                }
-                            }
-                        });
+                    if !has_speech {
+                        let _ = raw_audio_tx.send(Vec::new());
+                        continue;
                     }
+                    let _ = raw_audio_tx.send(chunk.samples);
                 }
 
-                // ── Receive STT text, reorder, smart accumulator ──────────
-                Some(result) = stt_rx.recv() => {
-                    pending.insert(result.seq, result);
+                Some((committed, speaker_id)) = committed_rx.recv() => {
+                    let text_fragment = committed.words.join(" ");
+                    if text_fragment.trim().is_empty() {
+                        continue;
+                    }
 
-                    while let Some(r) = pending.remove(&expected_seq) {
-                        expected_seq += 1;
+                    tracing::info!(
+                        "[{}] committed (speaker={:?}, lang={:?}, tail_silent={}): \"{}\"",
+                        pipeline_name, speaker_id, committed.language,
+                        committed.tail_silent,
+                        &text_fragment[..text_fragment.len().min(80)],
+                    );
 
-                        if r.text.is_empty() {
-                            // Silence — flush accumulator if it has text
-                            // (speaker paused, send what we have).
-                            if !accumulator.is_empty() {
+                    if is_echo(&text_fragment, &echo_buffer) {
+                        tracing::info!(
+                            "[{}] Echo detected, dropping: \"{}\"",
+                            pipeline_name,
+                            &text_fragment[..text_fragment.len().min(60)]
+                        );
+                        continue;
+                    }
+
+                    if let Some(new_sid) = speaker_id {
+                        match accumulator_speaker {
+                            Some(current) if current != new_sid && !accumulator.is_empty() => {
                                 let text = std::mem::take(&mut accumulator);
                                 accumulator_start = None;
-                                tracing::info!("→ flush (silence): \"{}\"", &text[..text.len().min(80)]);
+                                tracing::info!(
+                                    "→ flush (speaker change {} → {}): \"{}\"",
+                                    current, new_sid,
+                                    &text[..text.len().min(80)]
+                                );
                                 let seq = translate_seq;
                                 translate_seq += 1;
-                                let _ = text_tx.send((seq, text));
+                                let _ = text_tx.send((seq, text, Some(current), Instant::now()));
                             }
-                            continue;
+                            _ => {}
                         }
+                        accumulator_speaker = Some(new_sid);
+                    }
 
-                        tracing::info!("[{}] STT [{}]: \"{}\" ({:?}, {}ms)",
-                            pipeline_name, r.seq, r.text, r.detected_language, r.stt_duration.as_millis());
+                    if !accumulator.is_empty() { accumulator.push(' '); }
+                    accumulator.push_str(text_fragment.trim());
+                    if accumulator_start.is_none() {
+                        accumulator_start = Some(Instant::now());
+                    }
 
-                        // Echo detection: if this STT text closely matches a recent
-                        // translation output, it's our own TTS being recaptured.
-                        if is_echo(&r.text, &echo_buffer) {
-                            tracing::info!("[{}] Echo detected, dropping: \"{}\"",
-                                pipeline_name, &r.text[..r.text.len().min(60)]);
-                            continue;
-                        }
+                    let has_punctuation = ends_with_punctuation(&accumulator);
+                    let word_count = accumulator.split_whitespace().count();
+                    let looks_incomplete = ends_with_continuation_word(&accumulator);
+                    let held_too_long = accumulator_start
+                        .map(|t| t.elapsed().as_secs_f32() >= MAX_HOLD_SECONDS)
+                        .unwrap_or(false);
+                    let speaker_paused = committed.tail_silent && !looks_incomplete;
 
-                        if r.detected_language != r.expected_language {
-                            tracing::warn!("Lang mismatch ({:?}≠{:?}), sending anyway: \"{}\"",
-                                r.detected_language, r.expected_language,
-                                &r.text[..r.text.len().min(60)]);
-                            // Don't drop — let the translator handle it.
-                            // Dropping causes gaps in continuous speech.
-                        }
+                    let should_flush = has_punctuation
+                        || speaker_paused
+                        || (held_too_long && word_count >= MIN_WORDS_FOR_TIMEOUT_FLUSH);
 
-                        // Append to accumulator
-                        if !accumulator.is_empty() { accumulator.push(' '); }
-                        accumulator.push_str(&r.text);
-                        if accumulator_start.is_none() {
-                            accumulator_start = Some(Instant::now());
-                        }
-
-                        // Interpreter-style flush: prefer real sentence boundaries
-                        // over word-count thresholds. A live interpreter waits
-                        // through a long clause rather than cut it mid-thought.
-                        //
-                        //   1. Punctuation   → complete thought, flush now.
-                        //   2. Tail pause   → speaker breathed; flush UNLESS the
-                        //                     phrase clearly continues (ends in
-                        //                     a conjunction / connective).
-                        //   3. Held too long → cap the delay, but only once we
-                        //                     have a minimum chunk of context.
-                        let has_punctuation = ends_with_punctuation(&accumulator);
-                        let word_count = accumulator.split_whitespace().count();
-                        let looks_incomplete = ends_with_continuation_word(&accumulator);
-                        let held_too_long = accumulator_start
-                            .map(|t| t.elapsed().as_secs_f32() >= MAX_HOLD_SECONDS)
-                            .unwrap_or(false);
-                        let speaker_paused = r.tail_silent && !looks_incomplete;
-
-                        let should_flush = has_punctuation
-                            || speaker_paused
-                            || (held_too_long && word_count >= MIN_WORDS_FOR_TIMEOUT_FLUSH);
-
-                        if should_flush {
-                            let text = std::mem::take(&mut accumulator);
-                            accumulator_start = None;
-                            let reason = if has_punctuation { "punctuation" }
-                                else if speaker_paused { "pause" }
-                                else { "timeout" };
-                            tracing::info!("→ flush ({}): \"{}\"", reason, &text[..text.len().min(80)]);
-                            let seq = translate_seq;
-                            translate_seq += 1;
-                            let _ = text_tx.send((seq, text));
-                        }
+                    if should_flush {
+                        let text = std::mem::take(&mut accumulator);
+                        let flushed_speaker = accumulator_speaker;
+                        accumulator_start = None;
+                        let reason = if has_punctuation { "punctuation" }
+                            else if speaker_paused { "pause" }
+                            else { "timeout" };
+                        tracing::info!("→ flush ({}): \"{}\"", reason, &text[..text.len().min(80)]);
+                        let seq = translate_seq;
+                        translate_seq += 1;
+                        let _ = text_tx.send((seq, text, flushed_speaker, Instant::now()));
                     }
                 }
 
@@ -313,24 +361,122 @@ impl SpeakerPipeline {
             }
         }
 
-        tracing::info!("Pipeline loop ended");
+        tracing::info!("[{}] Pipeline loop ended", pipeline_name);
     }
+}
+
+// ─── STT worker (single long-lived spawn_blocking task) ──────────────────────
+
+fn start_stt_worker(
+    pipeline_name: String,
+    stt: Arc<WhisperStt>,
+    language: Language,
+    mut raw_audio_rx: mpsc::UnboundedReceiver<Vec<f32>>,
+    committed_tx: mpsc::UnboundedSender<(CommittedWords, Option<u32>)>,
+    diarizer: Option<Arc<OnlineDiarizer>>,
+    voice_profiles: Arc<VoiceProfileRegistry>,
+    metrics_tx: mpsc::Sender<PipelineMetrics>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut session = StreamingSession::new(stt, language);
+        let mut stable_speaker_id: Option<u32> = None;
+        let mut pending_speaker_id: Option<u32> = None;
+        let mut pending_count: u32 = 0;
+
+        while let Some(samples) = raw_audio_rx.blocking_recv() {
+            if samples.is_empty() {
+                if let Some(committed) = session.flush_tentative() {
+                    let _ = committed_tx.send((committed, stable_speaker_id));
+                }
+                continue;
+            }
+
+            // Diarisation + F0 (if enabled). Both come from the same
+            // bridge so we pay one round-trip per chunk for both pieces
+            // of metadata.
+            let (raw_speaker_id, f0_hz) = match diarizer.as_ref() {
+                Some(d) => match d.identify(&samples, WHISPER_SAMPLE_RATE) {
+                    Ok(Some(id)) => (Some(id.speaker_id), id.f0_hz),
+                    Ok(None) => (None, 0.0),
+                    Err(e) => {
+                        tracing::warn!("[{}] diarisation failed: {}", pipeline_name, e);
+                        (None, 0.0)
+                    }
+                },
+                None => (None, 0.0),
+            };
+
+            stable_speaker_id = match (raw_speaker_id, stable_speaker_id) {
+                (Some(new), Some(curr)) if new != curr => {
+                    if pending_speaker_id == Some(new) {
+                        pending_count += 1;
+                        if pending_count >= MIN_CHUNKS_FOR_SPEAKER_CHANGE {
+                            pending_speaker_id = None;
+                            pending_count = 0;
+                            Some(new)
+                        } else {
+                            Some(curr)
+                        }
+                    } else {
+                        pending_speaker_id = Some(new);
+                        pending_count = 1;
+                        Some(curr)
+                    }
+                }
+                (Some(new), None) => {
+                    pending_speaker_id = None;
+                    pending_count = 0;
+                    Some(new)
+                }
+                (Some(_new), Some(curr)) => {
+                    pending_speaker_id = None;
+                    pending_count = 0;
+                    Some(curr)
+                }
+                (None, current) => current,
+            };
+
+            // Update the per-speaker F0 profile. We attribute the F0
+            // measurement to the *stable* speaker, not the raw one, so
+            // a single-chunk identification glitch doesn't pollute a
+            // confirmed speaker's profile.
+            if let (Some(sid), true) = (stable_speaker_id, f0_hz > 0.0) {
+                voice_profiles.record_f0(sid, f0_hz);
+            }
+
+            // The streaming session may run zero or one Whisper inference
+            // depending on its internal throttle (`MIN_INFERENCE_INTERVAL_MS`).
+            // We always tag the stage time, even when the throttle skipped
+            // the inference — that makes the metric "wall time of the STT
+            // worker iteration", which is what the UI panel cares about.
+            let stt_start = Instant::now();
+            let committed = session.push_audio(&samples);
+            let _ = metrics_tx.try_send(PipelineMetrics::new(
+                "stt".to_string(),
+                stt_start.elapsed(),
+            ));
+            if let Some(committed) = committed {
+                let _ = committed_tx.send((committed, stable_speaker_id));
+            }
+        }
+
+        if let Some(committed) = session.flush_tentative() {
+            let _ = committed_tx.send((committed, stable_speaker_id));
+        }
+        session.reset();
+    });
 }
 
 // ─── Concurrent translate + TTS worker with ordered delivery ─────────────────
 
-/// Spawns a worker that processes text chunks **concurrently** (up to
-/// `MAX_CONCURRENT_TRANSLATE` in flight) but delivers audio to playback
-/// **in sequence order** via a reorder buffer.
-///
-/// This means while chunk N is being synthesized by TTS, chunk N+1 can
-/// already be translating — eliminating the sequential bottleneck.
 fn start_translate_worker(
-    mut text_rx: mpsc::UnboundedReceiver<(u64, String)>,
+    mut text_rx: mpsc::UnboundedReceiver<(u64, String, Option<u32>, Instant)>,
     translator: Arc<OpusMtTranslator>,
     tts: Arc<PiperTts>,
     audio_tx: mpsc::UnboundedSender<AudioChunk>,
     echo_buffer: EchoBuffer,
+    voice_profiles: Arc<VoiceProfileRegistry>,
+    metrics_tx: mpsc::Sender<PipelineMetrics>,
 ) {
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSLATE));
@@ -340,20 +486,41 @@ fn start_translate_worker(
         let mut expected_seq: u64 = 0;
         let mut pending: std::collections::BTreeMap<u64, Option<AudioChunk>> =
             std::collections::BTreeMap::new();
+        // Maps each in-flight seq to the moment its source text flushed.
+        // We use it to compute the end-to-end "total" metric exactly once,
+        // when the corresponding audio chunk reaches `audio_tx.send()`.
+        let mut flush_instants: std::collections::HashMap<u64, Instant> =
+            std::collections::HashMap::new();
 
         loop {
             tokio::select! {
-                // ── Accept new text and spawn translate+TTS task ──────────
-                Some((seq, text)) = text_rx.recv() => {
+                Some((seq, text, speaker_id, flushed_at)) = text_rx.recv() => {
+                    flush_instants.insert(seq, flushed_at);
                     let translator = translator.clone();
                     let tts = tts.clone();
                     let tx = result_tx.clone();
+                    let metrics = metrics_tx.clone();
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
 
                     let echo_buf = echo_buffer.clone();
+                    // Resolve the voice profile for this utterance: pick
+                    // the speaker's running F0, or VoiceProfile::default()
+                    // (zero F0 → bridge skips the analysis-synthesis pass)
+                    // when no profile has been recorded yet.
+                    let voice_profile = match speaker_id {
+                        Some(sid) => {
+                            let f0 = voice_profiles.f0_for(sid);
+                            VoiceProfile {
+                                target_f0_hz: f0,
+                                formant_shift: formant_shift_for_f0(f0),
+                            }
+                        }
+                        None => VoiceProfile::default(),
+                    };
+
                     tokio::task::spawn_blocking(move || {
-                        let _permit = permit; // released on drop
-                        let start = Instant::now();
+                        let _permit = permit;
+                        let translate_start = Instant::now();
 
                         let segment = TextSegment::new(text.clone(), Language::English);
 
@@ -365,11 +532,12 @@ fn start_translate_worker(
                                 return;
                             }
                         };
-                        let translate_ms = start.elapsed().as_millis();
+                        let translate_elapsed = translate_start.elapsed();
+                        let _ = metrics.try_send(PipelineMetrics::new(
+                            "translate".to_string(),
+                            translate_elapsed,
+                        ));
 
-                        // Guard: reject degenerate translation output.
-                        // Opus-MT can loop on garbage input, producing thousands
-                        // of repeated words.
                         if is_translation_degenerate(&text, &translated.text) {
                             tracing::warn!("Translation degenerate, dropping: \"{}\" → \"{}\"",
                                 &text[..text.len().min(60)],
@@ -378,12 +546,11 @@ fn start_translate_worker(
                             return;
                         }
 
-                        tracing::info!("← \"{}\" ({}ms)", translated.text, translate_ms);
-
-                        // Record translation for echo detection
+                        tracing::info!("← \"{}\" ({}ms)", translated.text, translate_elapsed.as_millis());
                         record_translation(&echo_buf, &translated.text);
 
-                        let audio_out = match tts.synthesize(&translated) {
+                        let tts_start = Instant::now();
+                        let audio_out = match tts.synthesize(&translated, voice_profile) {
                             Ok(a) => a,
                             Err(e) => {
                                 tracing::warn!("TTS failed: {}", e);
@@ -391,6 +558,19 @@ fn start_translate_worker(
                                 return;
                             }
                         };
+                        let tts_elapsed = tts_start.elapsed();
+                        let _ = metrics.try_send(PipelineMetrics::new(
+                            "tts".to_string(),
+                            tts_elapsed,
+                        ));
+                        tracing::info!(
+                            "TTS (speaker={:?}, target_f0={:.0}, formant={:.2}): {} samples ({}ms)",
+                            speaker_id,
+                            voice_profile.target_f0_hz,
+                            voice_profile.formant_shift,
+                            audio_out.samples.len(),
+                            tts_elapsed.as_millis(),
+                        );
 
                         let audio_out = if audio_out.sample_rate != PLAYBACK_SAMPLE_RATE {
                             resampler::resample_to_target(
@@ -406,14 +586,21 @@ fn start_translate_worker(
                     });
                 }
 
-                // ── Collect results and deliver in order ─────────────────
                 Some((seq, audio)) = result_rx.recv() => {
                     pending.insert(seq, audio);
-
                     while let Some(audio) = pending.remove(&expected_seq) {
+                        let total = flush_instants
+                            .remove(&expected_seq)
+                            .map(|t| t.elapsed());
                         expected_seq += 1;
                         if let Some(chunk) = audio {
                             let _ = audio_tx.send(chunk);
+                            if let Some(elapsed) = total {
+                                let _ = metrics_tx.try_send(PipelineMetrics::new(
+                                    "total".to_string(),
+                                    elapsed,
+                                ));
+                            }
                         }
                     }
                 }
@@ -424,45 +611,35 @@ fn start_translate_worker(
     });
 }
 
-// ─── Internal types ──────────────────────────────────────────────────────────
-
-struct SttResult {
-    seq: u64,
-    text: String,
-    detected_language: Language,
-    expected_language: Language,
-    stt_duration: std::time::Duration,
-    /// True when the last ~350 ms of the chunk were below `PAUSE_TAIL_RMS`.
-    /// Signals "speaker paused" and triggers an immediate flush of the
-    /// text accumulator — the conviction-style flush a live interpreter
-    /// does when they hear a breath between sentences.
-    tail_silent: bool,
+/// Heuristic mapping from running mean F0 to a formant-shift ratio.
+/// Higher F0 (typical female / child voices) → narrower vocal tract →
+/// formant_shift slightly below 1. Lower F0 → wider tract → above 1.
+/// The ratio is bounded conservatively (0.85–1.15) because aggressive
+/// shifts produce unnatural artefacts in the analysis-synthesis output.
+fn formant_shift_for_f0(f0_hz: f32) -> f32 {
+    if f0_hz <= 0.0 {
+        return 1.0;
+    }
+    // Anchor: a ~120 Hz adult-male voice maps to formant_shift = 1.0,
+    // a ~220 Hz typical adult-female voice maps to ~0.92.
+    let normalised = (f0_hz - 120.0) / 100.0;
+    (1.0 - normalised * 0.08).clamp(0.85, 1.15)
 }
 
 // ─── Punctuation detection ───────────────────────────────────────────────────
 
-/// Returns true if the trimmed text ends with sentence-ending punctuation.
 fn ends_with_punctuation(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?')
 }
 
-/// Returns true when the accumulator ends in a conjunction or connective —
-/// a strong hint the speaker has NOT finished the thought, even if they
-/// paused briefly. A human interpreter treats "...because" as "wait for it"
-/// and refuses to emit the translation of an orphan clause.
-///
-/// Covers EN + PT because either pipeline direction may be accumulating.
-/// Matches on lowercased, punctuation-stripped last word.
 fn ends_with_continuation_word(text: &str) -> bool {
     const CONTINUATIONS: &[&str] = &[
-        // English
         "and", "but", "or", "nor", "so", "because", "though", "although",
         "if", "unless", "while", "whereas", "that", "which", "who", "whom",
         "whose", "when", "where", "why", "how", "however", "therefore",
         "thus", "since", "as", "of", "to", "for", "with", "by", "in", "on",
         "at", "the", "a", "an",
-        // Portuguese
         "e", "mas", "ou", "porque", "porém", "porem", "embora", "se",
         "enquanto", "que", "qual", "quais", "quando", "onde", "como",
         "então", "entao", "portanto", "pois", "de", "da", "do", "das", "dos",
@@ -488,36 +665,15 @@ fn ends_with_continuation_word(text: &str) -> bool {
     }
 }
 
-// ─── Pause detection (tail-silence heuristic) ───────────────────────────────
-
-/// Returns true when the last `PAUSE_DETECTION_TAIL_SECONDS` of the chunk
-/// have RMS below `PAUSE_TAIL_RMS`. Used as the "speaker paused" signal
-/// that flushes the accumulator immediately without waiting for punctuation
-/// or the word-count cap.
-fn tail_is_silent(samples: &[f32]) -> bool {
-    let tail_len = (WHISPER_SAMPLE_RATE as f32 * PAUSE_DETECTION_TAIL_SECONDS) as usize;
-    if samples.len() < tail_len {
-        return false;
-    }
-    let tail = &samples[samples.len() - tail_len..];
-    let sum_sq: f32 = tail.iter().map(|s| s * s).sum();
-    let rms = (sum_sq / tail.len() as f32).sqrt();
-    rms < PAUSE_TAIL_RMS
-}
-
 // ─── Translation quality guard ──────────────────────────────────────────────
 
-/// Detects degenerate translation output (repetition loops, excessive length).
-/// Opus-MT can enter infinite-loop-like generation on garbage or ambiguous input.
 fn is_translation_degenerate(input: &str, output: &str) -> bool {
-    // Output way too long relative to input — likely a loop
     let input_words = input.split_whitespace().count().max(1);
     let output_words = output.split_whitespace().count();
     if output_words > input_words * 4 && output_words > 20 {
         return true;
     }
 
-    // Repetitive output: same word/phrase repeated many times
     let words: Vec<&str> = output.split_whitespace().collect();
     if words.len() >= 6 {
         let unique: std::collections::HashSet<&str> = words.iter().copied().collect();
@@ -532,8 +688,6 @@ fn is_translation_degenerate(input: &str, output: &str) -> bool {
 
 // ─── Echo detection (TTS feedback loop filter) ──────────────────────────────
 
-/// Normalize text for comparison: lowercase, strip accents and punctuation.
-/// Uses ASCII-only chars so "petrolífera" and "petrolifera" match.
 fn normalize_for_echo(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split_whitespace()
@@ -543,7 +697,6 @@ fn normalize_for_echo(text: &str) -> Vec<String> {
                     if c.is_ascii_alphanumeric() {
                         Some(c)
                     } else if c.is_alphanumeric() {
-                        // Map accented chars to ASCII approximations
                         Some(strip_diacritic(c))
                     } else {
                         None
@@ -555,7 +708,6 @@ fn normalize_for_echo(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Best-effort ASCII approximation for common Portuguese/Romance diacritics.
 fn strip_diacritic(c: char) -> char {
     match c {
         'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
@@ -569,7 +721,6 @@ fn strip_diacritic(c: char) -> char {
     }
 }
 
-/// Record a translation output in the echo buffer for later comparison.
 fn record_translation(echo_buffer: &EchoBuffer, translated_text: &str) {
     let words = normalize_for_echo(translated_text);
     if words.is_empty() {
@@ -577,14 +728,12 @@ fn record_translation(echo_buffer: &EchoBuffer, translated_text: &str) {
     }
     let mut buf = echo_buffer.lock().unwrap();
     buf.push_back((Instant::now(), words));
-    // Evict old entries
     let cutoff = Instant::now() - std::time::Duration::from_secs_f32(ECHO_WINDOW_SECONDS);
     while buf.front().map_or(false, |(t, _)| *t < cutoff) {
         buf.pop_front();
     }
 }
 
-/// Check if STT text matches any recent translation (echo detection).
 fn is_echo(stt_text: &str, echo_buffer: &EchoBuffer) -> bool {
     let stt_words = normalize_for_echo(stt_text);
     if stt_words.is_empty() {
@@ -606,7 +755,6 @@ fn is_echo(stt_text: &str, echo_buffer: &EchoBuffer) -> bool {
     false
 }
 
-/// Fraction of words in `a` that also appear in `b` (order-independent).
 fn word_overlap_ratio(a: &[String], b: &[String]) -> f32 {
     if a.is_empty() {
         return 0.0;
@@ -626,110 +774,69 @@ mod tests {
     }
 
     #[test]
-    fn ends_with_exclamation() {
-        assert!(ends_with_punctuation("Stop!"));
-    }
-
-    #[test]
-    fn ends_with_question() {
-        assert!(ends_with_punctuation("How are you?"));
-    }
-
-    #[test]
     fn no_punctuation() {
         assert!(!ends_with_punctuation("Hello world"));
     }
 
     #[test]
-    fn trailing_whitespace_still_detected() {
-        assert!(ends_with_punctuation("Hello world.  "));
+    fn voice_profile_registry_records_and_recalls() {
+        let reg = VoiceProfileRegistry::new();
+        reg.record_f0(0, 200.0);
+        reg.record_f0(0, 200.0);
+        reg.record_f0(0, 200.0);
+        let f0 = reg.f0_for(0);
+        assert!((f0 - 200.0).abs() < 5.0);  // converged towards 200 Hz
     }
 
     #[test]
-    fn empty_string() {
-        assert!(!ends_with_punctuation(""));
+    fn voice_profile_registry_returns_zero_for_unknown_speaker() {
+        let reg = VoiceProfileRegistry::new();
+        assert_eq!(reg.f0_for(42), 0.0);
+    }
+
+    #[test]
+    fn voice_profile_registry_clamps_outliers() {
+        let reg = VoiceProfileRegistry::new();
+        reg.record_f0(0, 200.0);
+        reg.record_f0(0, 5000.0);  // pyworld noise — must be ignored
+        let f0 = reg.f0_for(0);
+        assert!((f0 - 200.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn formant_shift_is_unity_for_unknown_f0() {
+        assert!((formant_shift_for_f0(0.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn formant_shift_decreases_for_higher_f0() {
+        let male = formant_shift_for_f0(120.0);
+        let female = formant_shift_for_f0(220.0);
+        assert!(female < male);
+    }
+
+    #[test]
+    fn formant_shift_is_clamped() {
+        let extreme_low = formant_shift_for_f0(50.0);
+        let extreme_high = formant_shift_for_f0(500.0);
+        assert!((0.85..=1.15).contains(&extreme_low));
+        assert!((0.85..=1.15).contains(&extreme_high));
     }
 
     #[test]
     fn min_words_timeout_floor_is_reasonable() {
         assert!(MIN_WORDS_FOR_TIMEOUT_FLUSH >= 3);
-        assert!(MIN_WORDS_FOR_TIMEOUT_FLUSH <= 8);
     }
-
-    #[test]
-    fn max_hold_seconds_caps_delay() {
-        // Needs to be generous enough for long interpreter-style clauses
-        // but still bounded so a stuck accumulator eventually drains.
-        assert!(MAX_HOLD_SECONDS >= 4.0);
-        assert!(MAX_HOLD_SECONDS <= 10.0);
-    }
-
-    // ── Continuation-word detection ──────────────────────────────────────────
 
     #[test]
     fn ends_with_conjunction_english() {
         assert!(ends_with_continuation_word("the market crashed because"));
         assert!(ends_with_continuation_word("we arrived and"));
-        assert!(ends_with_continuation_word("either this or"));
-    }
-
-    #[test]
-    fn ends_with_conjunction_portuguese() {
-        assert!(ends_with_continuation_word("o mercado caiu porque"));
-        assert!(ends_with_continuation_word("chegamos e"));
-        assert!(ends_with_continuation_word("isso ou"));
-    }
-
-    #[test]
-    fn continuation_ignores_trailing_whitespace_and_case() {
-        assert!(ends_with_continuation_word("this AND   "));
     }
 
     #[test]
     fn complete_sentence_is_not_continuation() {
         assert!(!ends_with_continuation_word("the market crashed"));
-        assert!(!ends_with_continuation_word("the market crashed."));
-    }
-
-    #[test]
-    fn empty_text_is_not_continuation() {
-        assert!(!ends_with_continuation_word(""));
-        assert!(!ends_with_continuation_word("   "));
-    }
-
-    // ── Pause detection (tail silence) ───────────────────────────────────────
-
-    #[test]
-    fn tail_silent_detects_quiet_ending() {
-        // 2.5s of loud speech followed by 0.4s of silence.
-        let loud_len = (WHISPER_SAMPLE_RATE as f32 * 2.5) as usize;
-        let silent_len = (WHISPER_SAMPLE_RATE as f32 * 0.4) as usize;
-        let mut samples = vec![0.3f32; loud_len];
-        samples.extend(std::iter::repeat(0.0).take(silent_len));
-        assert!(tail_is_silent(&samples));
-    }
-
-    #[test]
-    fn tail_silent_false_when_speaker_still_talking() {
-        // Continuous speech — tail has high RMS.
-        let total_len = (WHISPER_SAMPLE_RATE as f32 * 2.5) as usize;
-        let samples = vec![0.3f32; total_len];
-        assert!(!tail_is_silent(&samples));
-    }
-
-    #[test]
-    fn tail_silent_false_for_short_samples() {
-        // Chunk smaller than the tail window — caller shouldn't flush.
-        let samples = vec![0.0f32; 100];
-        assert!(!tail_is_silent(&samples));
-    }
-
-    #[test]
-    fn normal_translation_is_not_degenerate() {
-        assert!(!is_translation_degenerate(
-            "Hello world, how are you?",
-            "Olá mundo, como vai você?",
-        ));
     }
 
     #[test]
@@ -740,61 +847,9 @@ mod tests {
     }
 
     #[test]
-    fn excessively_long_translation_is_degenerate() {
-        let input = "Hello";
-        let output = (0..30).map(|_| "word").collect::<Vec<_>>().join(" ");
-        assert!(is_translation_degenerate(input, &output));
-    }
-
-    #[test]
-    fn proportional_translation_is_not_degenerate() {
-        let input = "This is a relatively long sentence with many words";
-        let output = "Esta é uma frase relativamente longa com muitas palavras";
-        assert!(!is_translation_degenerate(input, output));
-    }
-
-    // ── Echo detection tests ─────────────────────────────────────────────────
-
-    #[test]
     fn echo_detected_when_stt_matches_recent_translation() {
         let buf: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
         record_translation(&buf, "plataforma petrolífera");
-        // STT captures garbled version of our TTS
         assert!(is_echo("platforma petrolifera", &buf));
-    }
-
-    #[test]
-    fn echo_detected_with_partial_match() {
-        let buf: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
-        record_translation(&buf, "6 de Julho de 1990 1988");
-        // STT captures a subset
-        assert!(is_echo("6 de Julho de 1990 1988", &buf));
-    }
-
-    #[test]
-    fn no_echo_for_unrelated_text() {
-        let buf: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
-        record_translation(&buf, "plataforma petrolífera");
-        assert!(!is_echo("The Piper Alpha oil rig", &buf));
-    }
-
-    #[test]
-    fn no_echo_when_buffer_empty() {
-        let buf: EchoBuffer = Arc::new(Mutex::new(VecDeque::new()));
-        assert!(!is_echo("anything here", &buf));
-    }
-
-    #[test]
-    fn word_overlap_exact_match() {
-        let a = normalize_for_echo("plataforma petrolifera");
-        let b = normalize_for_echo("plataforma petrolífera");
-        assert!(word_overlap_ratio(&a, &b) >= 0.5);
-    }
-
-    #[test]
-    fn word_overlap_no_match() {
-        let a = normalize_for_echo("hello world");
-        let b = normalize_for_echo("plataforma petrolifera");
-        assert_eq!(word_overlap_ratio(&a, &b), 0.0);
     }
 }

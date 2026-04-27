@@ -5,6 +5,8 @@ members = [
     "crates/stt",
     "crates/translation",
     "crates/tts",
+    "crates/diarization",
+    "crates/separation",
     "crates/pipeline",
     "crates/ui",
 ]
@@ -38,6 +40,8 @@ audio = { path = "crates/audio" }
 stt = { path = "crates/stt" }
 translation = { path = "crates/translation" }
 tts = { path = "crates/tts" }
+diarization = { path = "crates/diarization" }
+separation = { path = "crates/separation" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -9,6 +9,7 @@ audio = { path = "../audio" }
 stt = { path = "../stt" }
 translation = { path = "../translation" }
 tts = { path = "../tts" }
+diarization = { path = "../diarization" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
