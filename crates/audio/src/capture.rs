@@ -11,9 +11,16 @@ use crate::resampler;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const MONO_CHANNELS: u16 = 1;
 
-/// Mild gain boost for quiet microphones. Most USB mics already have
-/// adequate levels — 15x was way too aggressive and amplified noise.
-const INPUT_GAIN: f32 = 2.0;
+/// Pre-amplification applied to every captured frame. USB headsets
+/// often deliver speech around -20 to -30 dBFS at the OS slider's max,
+/// because their internal preamp gain is fixed in firmware (Windows'
+/// "Microphone Boost" only affects analog/line-in mics, never USB).
+/// 4.0× lifts that into the -8 to -18 dBFS range the streaming STT
+/// works best on. Anything past ~6× starts to amplify hum and the
+/// user's room tone, hurting Whisper accuracy. The clamp at the end
+/// of the conversion prevents loud peaks from wrapping around — they
+/// just cap at full-scale, which is fine for transcription.
+const INPUT_GAIN: f32 = 4.0;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {

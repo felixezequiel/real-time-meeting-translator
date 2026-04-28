@@ -122,6 +122,30 @@ impl ActivePipelines {
 
 // ─── Application ──────────────────────────────────────────────────────────────
 
+async fn preload_voice_profile(models: &LoadedModels, config: &PipelineConfig) {
+    let path = match config.mic_voice_profile_path.as_deref() {
+        Some(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let vc = match models.voice_convert.as_ref() {
+        Some(v) => Arc::clone(v),
+        None => return,
+    };
+    if !std::path::Path::new(path).exists() {
+        tracing::warn!("Voice profile path does not exist: {}", path);
+        return;
+    }
+    let path_owned = path.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        match vc.preload_reference(&path_owned) {
+            Ok(true) => tracing::info!("Voice profile preloaded: {}", path_owned),
+            Ok(false) => tracing::warn!("Voice profile preload skipped/failed: {}", path_owned),
+            Err(e) => tracing::warn!("Voice profile preload error: {}", e),
+        }
+    })
+    .await;
+}
+
 async fn run_application(mut config: PipelineConfig) -> Result<()> {
     let project_dir = app_dir()?;
     let scripts_dir = project_dir.join("scripts");
@@ -198,6 +222,12 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                             }
                             // Recreate pipelines with the new device routing
                             pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), false).await?;
+                            // Pre-extract the user's voice embedding before
+                            // the first translation arrives — saves ~150 ms
+                            // off the time-to-first-audio of the very first
+                            // mic-side fragment. Cheap and the bridge caches
+                            // the result for the rest of the session.
+                            preload_voice_profile(&models, &config).await;
                             is_active = true;
                             tray.set_active(true);
                             pipelines.send_command(PipelineCommand::Start).await;
@@ -214,7 +244,35 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                 }
 
                 TrayAction::OpenSettings => {
-                    tray.open_settings(&output_device_names, &input_device_names, &config, is_active);
+                    let profile_dir = match app_dir() {
+                        Ok(d) => d.join("voice_profile"),
+                        Err(_) => std::env::temp_dir().join("meeting_translator_voice"),
+                    };
+                    tray.open_settings(
+                        &output_device_names,
+                        &input_device_names,
+                        &config,
+                        is_active,
+                        profile_dir,
+                    );
+                }
+
+                TrayAction::SetVoiceProfile(path) => {
+                    let path_label = path.as_deref().unwrap_or("(removido)");
+                    tracing::info!("Voice profile updated: {}", path_label);
+                    config.mic_voice_profile_path = path;
+                    save_config(&config);
+                    pipelines = restart_pipelines(
+                        pipelines,
+                        &config,
+                        &models,
+                        Arc::clone(&metrics_aggregator),
+                        is_active,
+                    )
+                    .await?;
+                    if is_active {
+                        preload_voice_profile(&models, &config).await;
+                    }
                 }
 
                 TrayAction::SetSpeakerSourceLanguage(lang) => {
@@ -552,14 +610,32 @@ async fn start_pipelines(
     let mut mic_pipeline = SpeakerPipeline::new(
         "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, echo_buffer,
     );
-    if let Some(d) = models.diarizer.as_ref() {
-        mic_pipeline = mic_pipeline.with_diarizer(Arc::clone(d));
+    // Mic pipeline deliberately skips diarisation when the user has
+    // recorded a personal voice profile — only one person ever speaks
+    // into the microphone, so a 50–100 ms speaker-id round-trip per
+    // chunk is wasted work. Without a profile we still attach the
+    // diariser so the auto-enrolment path can run as a fallback.
+    let has_voice_profile = config
+        .mic_voice_profile_path
+        .as_deref()
+        .map(|p| !p.is_empty() && std::path::Path::new(p).exists())
+        .unwrap_or(false);
+    if !has_voice_profile {
+        if let Some(d) = models.diarizer.as_ref() {
+            mic_pipeline = mic_pipeline.with_diarizer(Arc::clone(d));
+        }
     }
     if let Some(vad) = try_create_silero_vad("Mic") {
         mic_pipeline = mic_pipeline.with_vad(vad);
     }
     if let Some(vc) = models.voice_convert.as_ref() {
         mic_pipeline = mic_pipeline.with_voice_convert(Arc::clone(vc));
+    }
+    if let Some(profile_path) = config.mic_voice_profile_path.as_deref() {
+        if has_voice_profile {
+            tracing::info!("Mic pipeline using voice profile: {}", profile_path);
+            mic_pipeline = mic_pipeline.with_fixed_voice_reference(profile_path);
+        }
     }
     tokio::spawn(async move {
         mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;

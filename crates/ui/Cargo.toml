@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 shared = { path = "../shared" }
+audio = { path = "../audio" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -21,6 +21,12 @@ pub enum TrayAction {
     SetMicSourceLanguage(Language),
     SetHeadphonesDevice(String),
     SetMicDevice(String),
+    /// User saved (or cleared) the voice profile. The path points at
+    /// the WAV file the recorder produced, or `None` if the user
+    /// removed the profile. Main loop persists this in `config.toml`
+    /// and restarts the pipelines so the mic side picks up the new
+    /// reference (or falls back to the auto-enrolment path).
+    SetVoiceProfile(Option<String>),
     OpenSettings,
     Quit,
 }
@@ -110,6 +116,7 @@ impl TrayUi {
         input_devices: &[String],
         config: &PipelineConfig,
         is_active: bool,
+        voice_profile_dir: std::path::PathBuf,
     ) {
         let init = settings_window::SettingsInit {
             output_devices: output_devices.to_vec(),
@@ -119,6 +126,8 @@ impl TrayUi {
             mic_source_lang: config.mic_source_language,
             speaker_source_lang: config.speaker_source_language,
             is_active,
+            voice_profile_path: config.mic_voice_profile_path.clone(),
+            voice_profile_dir,
         };
 
         // If the window thread is still alive, send a "show" signal with updated data

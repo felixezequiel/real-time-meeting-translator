@@ -135,16 +135,24 @@ def split_commit_point(buffer: str) -> int:
 
 # ─── Prompt: translation engine, no chatter ─────────────────────────────────
 
-SYSTEM_PROMPT = """You are a translation engine. Output ONLY the translation, nothing else.
+SYSTEM_PROMPT = """You are a simultaneous interpreter. Output ONLY the translation, nothing else.
 
 Rules:
-1. Translate the user input from {source} to {target} verbatim.
-2. NEVER add commentary, explanations, or conversational responses.
-3. Words already in the target language (technical terms, proper nouns) — keep them as-is.
-4. Numbers, code identifiers, version strings — keep verbatim.
-5. Single-word inputs — translate as a fragment, do not expand into a sentence.
-6. Empty or noise input — output an empty string.
-7. Idioms — translate to the natural equivalent in the target language.
+1. Translate the user input from {source} to {target}.
+2. Preserve the original MEANING above all else — if a literal word-for-word
+   translation would distort the sense, prefer a natural equivalent. The
+   listener understands neither the source language nor your reasoning,
+   only the final {target} text.
+3. NEVER add commentary, explanations, or conversational responses.
+4. Words already in the target language (technical terms, proper nouns) — keep them as-is.
+5. Numbers, code identifiers, version strings — keep verbatim.
+6. Single-word inputs — translate as a fragment, do not expand into a sentence.
+7. Empty or noise input — output an empty string.
+8. Idioms — translate to the natural equivalent in the target language.
+9. Sentence-fragment inputs (a clause without a finished thought) — translate
+   the fragment as-is; do not invent words to "complete" it.
+10. Do not omit, summarize, or paraphrase. Every content word must be
+    represented in the output.
 """
 
 LANG_NAMES = {"en": "English", "pt": "Portuguese (Brazilian)"}
@@ -153,18 +161,44 @@ LANG_NAMES = {"en": "English", "pt": "Portuguese (Brazilian)"}
 # even at small sizes. Keeping these short so the prompt fits comfortably
 # in the 4k context window with room for the actual input.
 FEWSHOT = [
-    # PT -> EN
+    # PT -> EN (technical + everyday)
     ("Vou fazer o commit agora.", "I'll commit now.", "pt", "en"),
     ("ok", "ok", "pt", "en"),
     ("Tive um problema com o deploy ontem à noite.",
      "I had a problem with the deploy last night.", "pt", "en"),
     ("Bom dia, pessoal!", "Good morning, everyone!", "pt", "en"),
-    # EN -> PT
+    ("Você pode repetir, por favor? Não consegui ouvir.",
+     "Could you repeat that, please? I didn't catch it.", "pt", "en"),
+    ("Acho que precisamos discutir isso na próxima reunião.",
+     "I think we need to discuss this in the next meeting.", "pt", "en"),
+    # EN -> PT (technical, casual, narration, questions, idiomatic)
     ("Let's merge the pull request.", "Vamos fazer o merge do pull request.", "en", "pt"),
     ("yeah", "sim", "en", "pt"),
     ("I think we should refactor this module.",
      "Acho que deveríamos refatorar este módulo.", "en", "pt"),
     ("Hey, good to meet you.", "Olá, prazer em conhecê-lo.", "en", "pt"),
+    # Narrative / documentary tone
+    ("By the time the war ended, the city had already begun to rebuild itself.",
+     "Quando a guerra acabou, a cidade já tinha começado a se reconstruir.",
+     "en", "pt"),
+    ("What you're seeing here is the result of decades of careful planning.",
+     "O que você está vendo aqui é o resultado de décadas de planejamento cuidadoso.",
+     "en", "pt"),
+    # Question with falling tag
+    ("So you're saying we should just wait, right?",
+     "Então você está dizendo que devemos só esperar, certo?",
+     "en", "pt"),
+    # Idiomatic / colloquial
+    ("That makes sense, but I'm not sold on it yet.",
+     "Faz sentido, mas ainda não estou convencido.",
+     "en", "pt"),
+    ("Long story short, the deal fell through.",
+     "Resumindo, o negócio não foi adiante.",
+     "en", "pt"),
+    # Mid-clause fragment (common in streaming STT)
+    ("which is exactly why we built the system this way",
+     "que é exatamente por isso que construímos o sistema dessa forma",
+     "en", "pt"),
 ]
 
 

@@ -32,6 +32,25 @@ struct VcRequestHeader {
     speaker_id: u32,
 }
 
+/// Preload-only request: the bridge extracts and caches the speaker
+/// embedding for `reference_wav_path` and replies with a single JSON
+/// line, no audio. Used at "Start" time so the first real conversion
+/// fires without paying the SE-extraction cost.
+#[derive(Serialize)]
+struct VcPreloadRequest {
+    action: &'static str,
+    reference_wav_path: String,
+}
+
+#[derive(Deserialize)]
+struct VcPreloadResponse {
+    status: String,
+    #[serde(default)]
+    elapsed_ms: u64,
+    #[serde(default)]
+    reference_wav_path: String,
+}
+
 /// Header the bridge emits before the converted PCM. The output sample
 /// rate is fixed at the TCC's native rate (22050 Hz for OpenVoice v2);
 /// the playback resampler in `crates/audio` lifts it to the device rate.
@@ -78,6 +97,82 @@ impl ToneColorConverter {
             bridge_script_path,
             process: None,
             dead: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Ask the bridge to extract and cache the target speaker
+    /// embedding for `reference_wav_path` *now*, so the first real
+    /// `convert()` call doesn't pay the ~150 ms SE-extraction cost.
+    /// Safe to call before any conversion request.
+    ///
+    /// Returns `Ok(false)` if the bridge is dead or the preload
+    /// failed — both are non-fatal: the next `convert()` will simply
+    /// extract the SE on demand or return the source audio unchanged.
+    pub fn preload_reference(
+        &self,
+        reference_wav_path: &str,
+    ) -> Result<bool, VcError> {
+        if self.dead.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let process_mutex = self
+            .process
+            .as_ref()
+            .ok_or(VcError::BridgeNotStarted)?;
+        let mut bridge = process_mutex.lock().map_err(|e| {
+            VcError::ConversionFailed(format!("Lock poisoned: {}", e))
+        })?;
+
+        let request = VcPreloadRequest {
+            action: "preload",
+            reference_wav_path: reference_wav_path.to_string(),
+        };
+        let header_json = serde_json::to_string(&request)
+            .map_err(|e| VcError::ConversionFailed(e.to_string()))?;
+
+        let result: Result<VcPreloadResponse, VcError> = (|| {
+            writeln!(bridge.stdin, "{}", header_json)
+                .map_err(|e| VcError::ConversionFailed(e.to_string()))?;
+            bridge
+                .stdin
+                .flush()
+                .map_err(|e| VcError::ConversionFailed(e.to_string()))?;
+            let mut header_line = String::new();
+            bridge
+                .stdout
+                .read_line(&mut header_line)
+                .map_err(|e| VcError::ConversionFailed(e.to_string()))?;
+            let response: VcPreloadResponse = serde_json::from_str(header_line.trim())
+                .map_err(|e| VcError::ConversionFailed(format!("Invalid header: {}", e)))?;
+            Ok(response)
+        })();
+
+        match result {
+            Ok(response) => {
+                let ok = response.status == "preloaded";
+                if ok {
+                    tracing::info!(
+                        "Voice-convert SE preloaded for {} ({} ms)",
+                        response.reference_wav_path,
+                        response.elapsed_ms,
+                    );
+                } else {
+                    tracing::warn!(
+                        "Voice-convert preload failed for {} (status={})",
+                        response.reference_wav_path,
+                        response.status,
+                    );
+                }
+                Ok(ok)
+            }
+            Err(e) => {
+                self.dead.store(true, Ordering::Release);
+                tracing::error!(
+                    "Voice-convert bridge marked dead during preload: {}",
+                    e,
+                );
+                Ok(false)
+            }
         }
     }
 

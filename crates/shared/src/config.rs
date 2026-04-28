@@ -62,6 +62,18 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub enable_separation: bool,
 
+    /// Absolute path to the user's recorded voice reference WAV.
+    /// When set, the mic pipeline pre-extracts the speaker embedding
+    /// from this file at startup and uses it for every TTS fragment —
+    /// the auto-enrolment loop (which needs ~6 s of clean speech and
+    /// only kicks in once per session) is skipped entirely on the
+    /// mic side. Recording is driven by the settings UI ("Gravar
+    /// minha voz" button) and the file lives under `<app_dir>/
+    /// voice_profile/user.wav`. None means "no profile yet — fall
+    /// back to the default Kokoro voice for outgoing translations".
+    #[serde(default)]
+    pub mic_voice_profile_path: Option<String>,
+
     /// Enable OpenVoice v2 tone-color conversion on the TTS output
     /// (ADR 0011). When true, after Kokoro synthesises a fragment the
     /// pipeline rewrites its timbre to match the actual speaker's
@@ -95,6 +107,7 @@ impl Default for PipelineConfig {
             mic_device: None,
             virtual_mic_device: None,
             enable_separation: false,
+            mic_voice_profile_path: None,
             enable_voice_conversion: true,
         }
     }

@@ -61,6 +61,15 @@ pub fn list_input_devices() -> Result<Vec<AudioDeviceInfo>, DeviceError> {
 }
 
 pub fn find_output_device_by_name(name_substring: &str) -> Result<cpal::Device, DeviceError> {
+    // Same empty-substring guard as `find_input_device_by_name` — an
+    // empty filter would `contains("")` against every device and
+    // return the first cpal lists, which on Windows is rarely the
+    // device the caller meant.
+    if name_substring.trim().is_empty() {
+        return Err(DeviceError::DeviceNotFound(
+            "(empty device name)".to_string(),
+        ));
+    }
     let host = cpal::default_host();
     let devices = host
         .output_devices()
@@ -84,6 +93,15 @@ pub fn get_default_output_device() -> Result<cpal::Device, DeviceError> {
 }
 
 pub fn find_input_device_by_name(name_substring: &str) -> Result<cpal::Device, DeviceError> {
+    // Empty/whitespace-only `name_substring` would match every device
+    // via `contains("")`, returning whatever cpal lists first — most
+    // likely a virtual cable. That used to silently produce 0-sample
+    // recordings. Reject the empty case at the door.
+    if name_substring.trim().is_empty() {
+        return Err(DeviceError::DeviceNotFound(
+            "(empty device name)".to_string(),
+        ));
+    }
     let host = cpal::default_host();
     let devices = host
         .input_devices()

@@ -5,6 +5,7 @@ pub mod device;
 pub mod ducking;
 pub mod loopback;
 pub mod playback;
+pub mod recorder;
 pub mod resampler;
 pub mod silero_vad;
 pub mod vad;

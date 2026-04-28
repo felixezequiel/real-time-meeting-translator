@@ -216,20 +216,40 @@ def patch_librosa_filters_mel() -> None:
         # [n_freqs, n_mels]. Transpose to match librosa's contract.
         return fb.T.numpy().astype(dtype)
 
-    # Force the real `librosa` package shell to load first — `librosa.load`
-    # and friends are still used elsewhere in OpenVoice (`audio_src_path`
-    # loading) and must keep working. The package-level import is fast
-    # because librosa lazy-imports its submodules; only the deep
-    # `librosa.filters` module is the broken one.
+    # Replacement for `librosa.load` — same semantics OpenVoice uses
+    # (target sample rate via `sr=...`, mono downmix), implemented on
+    # top of `soundfile.read` + torchaudio resample. Avoids librosa's
+    # lazy chain into `audioread`/`soxr` which deadlocks the same way
+    # librosa.filters did on this Python 3.12/Windows combo.
+    def _load_replacement(path, sr=None, mono=True, **_kwargs):
+        import soundfile as sf  # type: ignore
+        import torch  # type: ignore
+        import torchaudio  # type: ignore
+
+        audio, native_sr = sf.read(path, dtype="float32", always_2d=False)
+        if audio.ndim > 1 and mono:
+            audio = audio.mean(axis=1).astype(np.float32, copy=False)
+        if sr is not None and int(native_sr) != int(sr):
+            t = torch.from_numpy(np.ascontiguousarray(audio)).unsqueeze(0)
+            t = torchaudio.functional.resample(
+                t, orig_freq=int(native_sr), new_freq=int(sr)
+            )
+            audio = t.squeeze(0).contiguous().numpy()
+            native_sr = int(sr)
+        return audio, int(native_sr)
+
+    # Force the real `librosa` package shell to load first — its module
+    # object is what `import librosa` resolves to inside OpenVoice.
     import librosa  # noqa: F401
 
     fake = types.ModuleType("librosa.filters")
     fake.mel = _mel_replacement
     sys.modules["librosa.filters"] = fake
-    # Wire the fake into `librosa.filters` attribute access too, so
-    # `import librosa; librosa.filters.mel(...)` finds it without ever
-    # triggering the real submodule load.
     sys.modules["librosa"].filters = fake
+    # Override `librosa.load` with the soundfile-based replacement so
+    # `extract_se` and `convert` don't trigger the audioread/soxr
+    # lazy import that hangs at 100 % CPU on this Windows install.
+    sys.modules["librosa"].load = _load_replacement
 
 
 def add_openvoice_repo_to_path() -> None:
@@ -319,27 +339,26 @@ class TccBridge:
     def get_target_se(self, ref_wav_path: str) -> "torch.Tensor | None":
         """Compute or retrieve the cached speaker embedding for the
         reference WAV. Returns None when the file is missing or the
-        SE extractor failed (caller falls back to no conversion)."""
+        SE extractor failed (caller falls back to no conversion).
+
+        We call `ToneColorConverter.extract_se(path)` directly instead
+        of going through `openvoice.se_extractor.get_se`. The latter
+        segments the WAV with `whisper_timestamped` (an extra ~150 MB
+        dep that is pip-broken on Python 3.12 Windows) and averages
+        SE across short clips. Calling extract_se on the whole 15-30s
+        reference yields a single embedding from the entire utterance
+        — slightly less robust against bad clips, much simpler, no
+        external dependency.
+        """
         cached = _REF_SE_CACHE.get(ref_wav_path)
         if cached is not None:
             return cached
         if not os.path.isfile(ref_wav_path):
             log(f"[se] reference wav not found: {ref_wav_path}")
             return None
-        # OpenVoice's `se_extractor.get_se` segments the WAV with
-        # WhisperX-derived VAD and averages SE across voiced segments.
-        # On a clean ~5 s reference it runs in ~150 ms on GPU. Cached
-        # per path so each speaker pays this once per session.
         try:
-            from openvoice import se_extractor  # type: ignore
-
             t = time.monotonic()
-            se, _ = se_extractor.get_se(
-                ref_wav_path,
-                self._tcc,
-                target_dir=tempfile.gettempdir(),
-                vad=True,
-            )
+            se = self._tcc.extract_se(ref_wav_path)
             log(
                 f"[se] extracted target SE for {os.path.basename(ref_wav_path)} "
                 f"in {(time.monotonic() - t) * 1000:.0f} ms"
@@ -347,26 +366,25 @@ class TccBridge:
             _REF_SE_CACHE[ref_wav_path] = se
             return se
         except Exception as e:  # noqa: BLE001
-            log(f"[se] extractor failed for {ref_wav_path}: {type(e).__name__}: {e}")
+            import traceback
+            log(f"[se] extract_se failed for {ref_wav_path}: {type(e).__name__}: {e}")
+            log(traceback.format_exc())
             return None
 
     def get_source_se(self, kokoro_wav_path: str) -> "torch.Tensor":
         """Return the source-side SE used as the 'from' embedding for
         every conversion. We compute it once from the first Kokoro
         sample we see (Kokoro voices share enough spectral statistics
-        that a single embedding suffices). Subsequent calls reuse."""
+        that a single embedding suffices). Subsequent calls reuse.
+
+        Same `extract_se` shortcut as `get_target_se` above — avoids
+        the whisper_timestamped dependency entirely.
+        """
         global _SOURCE_SE
         if _SOURCE_SE is not None:
             return _SOURCE_SE
-        from openvoice import se_extractor  # type: ignore
-
         t = time.monotonic()
-        se, _ = se_extractor.get_se(
-            kokoro_wav_path,
-            self._tcc,
-            target_dir=tempfile.gettempdir(),
-            vad=True,
-        )
+        se = self._tcc.extract_se(kokoro_wav_path)
         log(
             f"[se] extracted Kokoro source SE in "
             f"{(time.monotonic() - t) * 1000:.0f} ms (cached for the session)"
@@ -397,6 +415,10 @@ class TccBridge:
             _write_mono_wav(src_path, source_pcm_f32, source_sr)
             target_se = self.get_target_se(ref_wav_path)
             if target_se is None:
+                log(
+                    f"[vc] FALLBACK: target SE missing for "
+                    f"{os.path.basename(ref_wav_path)} — playing raw TTS"
+                )
                 return source_pcm_f32, source_sr
             source_se = self.get_source_se(src_path)
 
@@ -450,6 +472,25 @@ def main() -> None:
 
         try:
             request = json.loads(line)
+            action = request.get("action", "convert")
+
+            # Preload requests have no PCM payload — they only ask the
+            # bridge to extract and cache the speaker embedding for the
+            # given reference WAV so the first real conversion fires
+            # without paying the ~150 ms SE-extraction cost. The reply
+            # is a single JSON line, no audio.
+            if action == "preload":
+                ref_path = request.get("reference_wav_path", "")
+                t = time.monotonic()
+                se = bridge.get_target_se(ref_path) if ref_path else None
+                ok = se is not None
+                write_json_line({
+                    "status": "preloaded" if ok else "preload_failed",
+                    "reference_wav_path": ref_path,
+                    "elapsed_ms": int((time.monotonic() - t) * 1000),
+                })
+                continue
+
             source_sr = int(request["source_sr"])
             source_num_samples = int(request["source_num_samples"])
             reference_wav_path = request.get("reference_wav_path", "")

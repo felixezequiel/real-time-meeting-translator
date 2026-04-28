@@ -327,6 +327,18 @@ pub struct SpeakerPipeline {
     /// timbre before reaching the mixer. Falls back to raw Kokoro
     /// output when either condition is missing.
     pub voice_convert: Option<Arc<ToneColorConverter>>,
+    /// Optional **pre-recorded** reference WAV that overrides the
+    /// auto-enrolment loop. Used by the mic pipeline: the user records
+    /// their own voice once via the settings UI and that file becomes
+    /// the timbre target for every outgoing TTS fragment, without
+    /// waiting for diarisation to accumulate ~6 s of clean audio.
+    /// When set, the pipeline:
+    ///   • skips per-speaker `ingest_audio` (no enrolment buffer
+    ///     growth),
+    ///   • forces `speaker_id = 0` for every committed fragment so
+    ///     downstream voice routing stays sticky,
+    ///   • passes this path straight to `vc.convert(...)`.
+    pub fixed_voice_reference: Option<String>,
 }
 
 impl SpeakerPipeline {
@@ -344,6 +356,7 @@ impl SpeakerPipeline {
             diarizer: None,
             vad: None,
             voice_convert: None,
+            fixed_voice_reference: None,
         }
     }
 
@@ -359,6 +372,11 @@ impl SpeakerPipeline {
 
     pub fn with_voice_convert(mut self, vc: Arc<ToneColorConverter>) -> Self {
         self.voice_convert = Some(vc);
+        self
+    }
+
+    pub fn with_fixed_voice_reference(mut self, path: impl Into<String>) -> Self {
+        self.fixed_voice_reference = Some(path.into());
         self
     }
 
@@ -382,6 +400,7 @@ impl SpeakerPipeline {
             WHISPER_SAMPLE_RATE,
         ));
         let voice_convert = self.voice_convert;
+        let fixed_voice_reference = self.fixed_voice_reference;
 
         // ── STT worker channel ────────────────────────────────────────────
         let (raw_audio_tx, raw_audio_rx) = mpsc::unbounded_channel::<Vec<f32>>();
@@ -396,6 +415,7 @@ impl SpeakerPipeline {
             diarizer.clone(),
             voice_profiles.clone(),
             metrics_tx.clone(),
+            fixed_voice_reference.is_some(),
         );
 
         // ── Translate+TTS worker channel ──────────────────────────────────
@@ -413,6 +433,7 @@ impl SpeakerPipeline {
             voice_profiles.clone(),
             metrics_tx.clone(),
             voice_convert.clone(),
+            fixed_voice_reference.clone(),
         );
 
         let mut is_running = false;
@@ -489,16 +510,40 @@ impl SpeakerPipeline {
                     if let Some(new_sid) = speaker_id {
                         match accumulator_speaker {
                             Some(current) if current != new_sid && !accumulator.is_empty() => {
-                                let text = std::mem::take(&mut accumulator);
-                                accumulator_start = None;
-                                tracing::info!(
-                                    "→ flush (speaker change {} → {}): \"{}\"",
-                                    current, new_sid,
-                                    &text[..text.len().min(80)]
-                                );
-                                let seq = translate_seq;
-                                translate_seq += 1;
-                                let _ = text_tx.send((seq, text, Some(current), Instant::now()));
+                                // Speaker change used to flush
+                                // unconditionally — but in fast-paced
+                                // dialogue (panels, documentaries) the
+                                // diariser flips every couple of words
+                                // and the LLM ends up translating
+                                // 1–3-word fragments out of context,
+                                // which produces semantically wrong
+                                // Portuguese. Hold the fragment if
+                                // it's still under MIN_WORDS_FOR_PAUSE_FLUSH —
+                                // it'll either get more material from
+                                // the new speaker (rare; we won't lose
+                                // attribution because punctuation /
+                                // pause flushes attribute it then), or
+                                // it'll flush via the timeout path.
+                                let word_count = accumulator
+                                    .split_whitespace()
+                                    .count();
+                                if word_count >= MIN_WORDS_FOR_PAUSE_FLUSH {
+                                    let text = std::mem::take(&mut accumulator);
+                                    accumulator_start = None;
+                                    tracing::info!(
+                                        "→ flush (speaker change {} → {}, {} words): \"{}\"",
+                                        current, new_sid, word_count,
+                                        &text[..text.len().min(80)]
+                                    );
+                                    let seq = translate_seq;
+                                    translate_seq += 1;
+                                    let _ = text_tx.send((seq, text, Some(current), Instant::now()));
+                                } else {
+                                    tracing::debug!(
+                                        "speaker change {} → {} but only {} words accumulated; holding",
+                                        current, new_sid, word_count,
+                                    );
+                                }
                             }
                             _ => {}
                         }
@@ -556,7 +601,12 @@ fn start_stt_worker(
     diarizer: Option<Arc<OnlineDiarizer>>,
     voice_profiles: Arc<VoiceProfileRegistry>,
     metrics_tx: mpsc::Sender<PipelineMetrics>,
+    fixed_voice: bool,
 ) {
+    // `fixed_voice = true` when the branch has a pre-recorded voice
+    // reference (mic pipeline). Skips per-speaker enrolment buffer
+    // growth and pins speaker_id = 0 for every committed fragment so
+    // the downstream TTS voice routing stays deterministic.
     tokio::task::spawn_blocking(move || {
         let mut session = StreamingSession::new(stt, language);
         let mut stable_speaker_id: Option<u32> = None;
@@ -573,17 +623,23 @@ fn start_stt_worker(
 
             // Diarisation + F0 (if enabled). Both come from the same
             // bridge so we pay one round-trip per chunk for both pieces
-            // of metadata.
-            let (raw_speaker_id, f0_hz) = match diarizer.as_ref() {
-                Some(d) => match d.identify(&samples, WHISPER_SAMPLE_RATE) {
-                    Ok(Some(id)) => (Some(id.speaker_id), id.f0_hz),
-                    Ok(None) => (None, 0.0),
-                    Err(e) => {
-                        tracing::warn!("[{}] diarisation failed: {}", pipeline_name, e);
-                        (None, 0.0)
-                    }
-                },
-                None => (None, 0.0),
+            // of metadata. Skipped entirely when `fixed_voice` is on —
+            // mic side has a single known speaker, so paying ~50–100 ms
+            // per chunk for an answer we already know is wasted.
+            let (raw_speaker_id, f0_hz) = if fixed_voice {
+                (Some(0u32), 0.0)
+            } else {
+                match diarizer.as_ref() {
+                    Some(d) => match d.identify(&samples, WHISPER_SAMPLE_RATE) {
+                        Ok(Some(id)) => (Some(id.speaker_id), id.f0_hz),
+                        Ok(None) => (None, 0.0),
+                        Err(e) => {
+                            tracing::warn!("[{}] diarisation failed: {}", pipeline_name, e);
+                            (None, 0.0)
+                        }
+                    },
+                    None => (None, 0.0),
+                }
             };
 
             stable_speaker_id = match (raw_speaker_id, stable_speaker_id) {
@@ -629,8 +685,13 @@ fn start_stt_worker(
             // chunks itself and stops accumulating once the speaker is
             // enrolled, so calling on every chunk is cheap. We attribute
             // to the stable speaker for the same reason as F0 above.
+            // Skipped when `fixed_voice` is on — the mic side already
+            // has a recorded reference WAV; growing an enrolment buffer
+            // for a speaker we'll never use just wastes memory.
             if let Some(sid) = stable_speaker_id {
-                voice_profiles.ingest_audio(sid, &samples);
+                if !fixed_voice {
+                    voice_profiles.ingest_audio(sid, &samples);
+                }
             }
 
             // The streaming session may run zero or one Whisper inference
@@ -688,6 +749,10 @@ fn start_translate_worker(
     voice_profiles: Arc<VoiceProfileRegistry>,
     metrics_tx: mpsc::Sender<PipelineMetrics>,
     voice_convert: Option<Arc<ToneColorConverter>>,
+    // Pre-recorded voice reference (mic pipeline). When `Some`, the
+    // TTS thread always passes this path to OpenVoice TCC and ignores
+    // the per-speaker auto-enrolled references in `voice_profiles`.
+    fixed_voice_reference: Option<String>,
 ) {
     tokio::spawn(async move {
         // Maximum age (in seconds) of a queued utterance before we
@@ -769,14 +834,15 @@ fn start_translate_worker(
             // (for an utterance with N fragments) — the LLM finishes
             // generating while the early fragments are still being
             // spoken.
-            // Resolve the per-speaker reference WAV path once (used by
-            // the OpenVoice TCC stage). Once enrolment has produced a
-            // path it doesn't change, so we read it here on the async
-            // task and hand the Option<String> to the TTS thread.
-            let reference_wav = match speaker_id {
-                Some(sid) => voice_profiles.reference_for(sid),
-                None => None,
-            };
+            // Resolve the reference WAV path once. Mic pipeline has a
+            // pre-recorded `fixed_voice_reference` set by the user via
+            // the settings UI — it overrides the auto-enrolled
+            // per-speaker reference (which only exists for the speaker
+            // pipeline anyway). When neither is present, we fall
+            // through with raw Kokoro output.
+            let reference_wav = fixed_voice_reference.clone().or_else(|| {
+                speaker_id.and_then(|sid| voice_profiles.reference_for(sid))
+            });
             let voice_convert_inner = voice_convert.clone();
 
             let _ = tokio::task::spawn_blocking(move || {
