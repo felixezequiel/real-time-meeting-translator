@@ -20,6 +20,25 @@ fn default_enable_voice_conversion() -> bool {
     true
 }
 
+/// V2 phrase window upper bound (ADR 0013).
+const DEFAULT_PHRASE_MAX_WINDOW_MS: u64 = 5000;
+/// V2 silence required to close a phrase (ADR 0013).
+const DEFAULT_PHRASE_SILENCE_TAIL_MS: u64 = 400;
+/// V2 minimum speech length before a window is admitted (ADR 0013).
+const DEFAULT_PHRASE_MIN_WINDOW_MS: u64 = 600;
+
+fn default_phrase_max_window_ms() -> u64 {
+    DEFAULT_PHRASE_MAX_WINDOW_MS
+}
+
+fn default_phrase_silence_tail_ms() -> u64 {
+    DEFAULT_PHRASE_SILENCE_TAIL_MS
+}
+
+fn default_phrase_min_window_ms() -> u64 {
+    DEFAULT_PHRASE_MIN_WINDOW_MS
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     /// Language the other person speaks (what the speaker pipeline transcribes)
@@ -84,6 +103,42 @@ pub struct PipelineConfig {
     #[serde(default = "default_enable_voice_conversion")]
     pub enable_voice_conversion: bool,
 
+    /// Use the V2 sliding-window pipeline (ADR 0013). When true, audio
+    /// is segmented by VAD into adaptive phrase windows (closed by
+    /// silence or 5 s cap), each window runs through Whisper / NLLB /
+    /// Piper as a complete phrase, and the legacy streaming local-
+    /// agreement path (ADR 0004) is bypassed. Default: false until
+    /// V2 lands as the default behaviour.
+    #[serde(default)]
+    pub pipeline_v2: bool,
+
+    /// V2 max window in milliseconds. Caps how long a phrase can grow
+    /// before it is force-closed (no speaker keeps a single sentence
+    /// longer than this without flushing). Used only when
+    /// `pipeline_v2 = true`.
+    #[serde(default = "default_phrase_max_window_ms")]
+    pub phrase_max_window_ms: u64,
+
+    /// V2 silence tail required to close a phrase, in milliseconds.
+    /// Lower = lower latency but risk of fragmenting; higher = waits
+    /// longer for the speaker. Used only when `pipeline_v2 = true`.
+    #[serde(default = "default_phrase_silence_tail_ms")]
+    pub phrase_silence_tail_ms: u64,
+
+    /// V2 minimum speech samples before a window is admitted to STT.
+    /// Filters out blips/breaths. Used only when `pipeline_v2 = true`.
+    #[serde(default = "default_phrase_min_window_ms")]
+    pub phrase_min_window_ms: u64,
+
+    /// Show the always-on-top translated-text overlay (ADR 0013, Phase 2).
+    /// Disabled by default because eframe + winit on Windows cannot
+    /// run two event loops simultaneously: when the overlay is up,
+    /// the Configurações window cannot open. Enable only when you
+    /// don't need the settings panel during the session, or wait for
+    /// the multi-viewport refactor.
+    #[serde(default)]
+    pub subtitle_overlay: bool,
+
     // NOTE: Earlier versions had `speaker_voice_reference_wav` and
     // `mic_voice_reference_wav` fields used by CosyVoice's zero-shot
     // cloning path. Those are gone now — voice differentiation comes
@@ -109,6 +164,11 @@ impl Default for PipelineConfig {
             enable_separation: false,
             mic_voice_profile_path: None,
             enable_voice_conversion: true,
+            pipeline_v2: false,
+            phrase_max_window_ms: DEFAULT_PHRASE_MAX_WINDOW_MS,
+            phrase_silence_tail_ms: DEFAULT_PHRASE_SILENCE_TAIL_MS,
+            phrase_min_window_ms: DEFAULT_PHRASE_MIN_WINDOW_MS,
+            subtitle_overlay: false,
         }
     }
 }

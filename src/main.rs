@@ -12,13 +12,14 @@ use audio::device;
 use audio::loopback::LoopbackCapture;
 use audio::playback::{AudioPlayback, MixerPlayback};
 use audio::SileroVad;
-use pipeline::SpeakerPipeline;
+use pipeline::{SpeakerPipeline, SubtitleEvent};
 use stt::WhisperStt;
 use translation::OpusMtTranslator;
 use tts::PiperTts;
+use ui::subtitle_overlay::{spawn_overlay, SubtitleMessage};
 use ui::{TrayAction, TrayUi};
 use diarization::OnlineDiarizer;
-use separation::Sepformer;
+use separation::{PermutationTracker, Sepformer, DEFAULT_TRACKER_TAIL_SAMPLES};
 use voice_convert::ToneColorConverter;
 
 /// VB-Cable A: used as system default output so meeting audio flows here.
@@ -168,8 +169,54 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
 
     let audio_switch_script = scripts_dir.join("audio_switch.ps1");
 
+    // ── Subtitle overlay (V2 only, opt-in) ────────────────────────────────────
+    // Always-on-top window that renders translated phrases in real time
+    // (ADR 0013, Phase 2). Spawned once per session — restart_pipelines
+    // reuses the same sender so the window stays alive across pipeline
+    // restarts.
+    //
+    // Gated by `subtitle_overlay = true`. Default is OFF because
+    // eframe + winit on Windows can't run two event loops in parallel:
+    // when the overlay is up, Configurações fails to open silently.
+    // Multi-viewport refactor pending in ADR 0013 Phase 3.
+    let subtitle_event_tx = if config.pipeline_v2 && config.subtitle_overlay {
+        match spawn_overlay() {
+            Ok(overlay_tx) => {
+                let (event_tx, event_rx) = std::sync::mpsc::channel::<SubtitleEvent>();
+                std::thread::Builder::new()
+                    .name("subtitle-bridge".to_string())
+                    .spawn(move || {
+                        while let Ok(event) = event_rx.recv() {
+                            let msg = SubtitleMessage {
+                                source_text: event.source_text,
+                                translated_text: event.translated_text,
+                                speaker: event.pipeline_name,
+                            };
+                            if overlay_tx.send(msg).is_err() {
+                                break; // overlay window closed
+                            }
+                        }
+                        tracing::debug!("Subtitle bridge thread ended");
+                    })
+                    .map_err(|e| anyhow::anyhow!("Subtitle bridge thread spawn failed: {}", e))?;
+                Some(event_tx)
+            }
+            Err(e) => {
+                tracing::warn!("Subtitle overlay failed to start: {}. Continuing without subtitles.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Start both pipelines ───────────────────────────────────────────────────
-    let mut pipelines = start_pipelines(&config, &models, Arc::clone(&metrics_aggregator)).await?;
+    let mut pipelines = start_pipelines(
+        &config,
+        &models,
+        Arc::clone(&metrics_aggregator),
+        subtitle_event_tx.clone(),
+    ).await?;
     // Pipelines start paused; user presses Start via tray to activate
     tracing::info!("Pipelines created — use system tray to start.");
 
@@ -221,7 +268,7 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                                 }
                             }
                             // Recreate pipelines with the new device routing
-                            pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), false).await?;
+                            pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), false, subtitle_event_tx.clone()).await?;
                             // Pre-extract the user's voice embedding before
                             // the first translation arrives — saves ~150 ms
                             // off the time-to-first-audio of the very first
@@ -268,6 +315,7 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                         &models,
                         Arc::clone(&metrics_aggregator),
                         is_active,
+                        subtitle_event_tx.clone(),
                     )
                     .await?;
                     if is_active {
@@ -284,7 +332,7 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                         config.speaker_source_language.display_name(),
                         config.speaker_target_language.display_name(),
                     );
-                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active).await?;
+                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active, subtitle_event_tx.clone()).await?;
                 }
 
                 TrayAction::SetMicSourceLanguage(lang) => {
@@ -296,7 +344,7 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                         config.mic_source_language.display_name(),
                         config.mic_target_language.display_name(),
                     );
-                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active).await?;
+                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active, subtitle_event_tx.clone()).await?;
                 }
 
                 TrayAction::SetHeadphonesDevice(name) => {
@@ -304,13 +352,13 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                     // Loopback device is managed automatically (CABLE when active).
                     config.headphones_device = Some(name);
                     save_config(&config);
-                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active).await?;
+                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active, subtitle_event_tx.clone()).await?;
                 }
 
                 TrayAction::SetMicDevice(name) => {
                     config.mic_device = Some(name);
                     save_config(&config);
-                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active).await?;
+                    pipelines = restart_pipelines(pipelines, &config, &models, Arc::clone(&metrics_aggregator), is_active, subtitle_event_tx.clone()).await?;
                 }
 
                 TrayAction::Quit => {
@@ -458,6 +506,7 @@ async fn start_pipelines(
     config: &PipelineConfig,
     models: &LoadedModels,
     metrics: Arc<StageMetricsAggregator>,
+    subtitle_event_tx: Option<std::sync::mpsc::Sender<SubtitleEvent>>,
 ) -> Result<ActivePipelines> {
     // Shared echo buffer: both pipelines write translations and check STT
     // against it. Prevents mic TTS from being re-translated by the speaker pipeline.
@@ -541,27 +590,59 @@ async fn start_pipelines(
         let (metrics_tx, mut metrics_rx) =
             mpsc::channel::<shared::PipelineMetrics>(64);
 
-        let mut pipeline = SpeakerPipeline::new(
-            name,
-            Arc::clone(&spk_stt),
-            Arc::clone(&spk_trans),
-            Arc::clone(&spk_tts),
-            spk_source_lang,
-            echo_buffer.clone(),
-        );
-        if let Some(d) = models.diarizer.as_ref() {
-            pipeline = pipeline.with_diarizer(Arc::clone(d));
-        }
-        if let Some(vad) = try_create_silero_vad(name) {
-            pipeline = pipeline.with_vad(vad);
-        }
-        if let Some(vc) = models.voice_convert.as_ref() {
-            pipeline = pipeline.with_voice_convert(Arc::clone(vc));
-        }
         let branch_name = name.to_string();
-        tokio::spawn(async move {
-            pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
-        });
+        if config.pipeline_v2 {
+            // ADR 0013: adaptive sliding-window pipeline.
+            let mut pipeline = pipeline::SpeakerPipelineV2::new(
+                name,
+                Arc::clone(&spk_stt),
+                Arc::clone(&spk_trans),
+                Arc::clone(&spk_tts),
+                spk_source_lang,
+                echo_buffer.clone(),
+            )
+            .with_config(pipeline::V2Config {
+                max_window: std::time::Duration::from_millis(config.phrase_max_window_ms),
+                silence_tail: std::time::Duration::from_millis(config.phrase_silence_tail_ms),
+                min_window: std::time::Duration::from_millis(config.phrase_min_window_ms),
+            });
+            if let Some(vad) = try_create_silero_vad(name) {
+                pipeline = pipeline.with_vad(vad);
+            }
+            if let Some(d) = models.diarizer.as_ref() {
+                pipeline = pipeline.with_diarizer(Arc::clone(d));
+            }
+            if let Some(vc) = models.voice_convert.as_ref() {
+                pipeline = pipeline.with_voice_convert(Arc::clone(vc));
+            }
+            if let Some(tx) = subtitle_event_tx.as_ref() {
+                pipeline = pipeline.with_subtitle_channel(tx.clone());
+            }
+            tokio::spawn(async move {
+                pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
+            });
+        } else {
+            let mut pipeline = SpeakerPipeline::new(
+                name,
+                Arc::clone(&spk_stt),
+                Arc::clone(&spk_trans),
+                Arc::clone(&spk_tts),
+                spk_source_lang,
+                echo_buffer.clone(),
+            );
+            if let Some(d) = models.diarizer.as_ref() {
+                pipeline = pipeline.with_diarizer(Arc::clone(d));
+            }
+            if let Some(vad) = try_create_silero_vad(name) {
+                pipeline = pipeline.with_vad(vad);
+            }
+            if let Some(vc) = models.voice_convert.as_ref() {
+                pipeline = pipeline.with_voice_convert(Arc::clone(vc));
+            }
+            tokio::spawn(async move {
+                pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
+            });
+        }
         let log_name = branch_name.clone();
         let metrics_for_branch = Arc::clone(&metrics);
         tokio::spawn(async move {
@@ -607,39 +688,77 @@ async fn start_pipelines(
         .start(mic_out_rx)
         .map_err(|e| anyhow::anyhow!("Mic playback failed: {}", e))?;
 
-    let mut mic_pipeline = SpeakerPipeline::new(
-        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, echo_buffer,
-    );
-    // Mic pipeline deliberately skips diarisation when the user has
-    // recorded a personal voice profile — only one person ever speaks
-    // into the microphone, so a 50–100 ms speaker-id round-trip per
-    // chunk is wasted work. Without a profile we still attach the
-    // diariser so the auto-enrolment path can run as a fallback.
     let has_voice_profile = config
         .mic_voice_profile_path
         .as_deref()
         .map(|p| !p.is_empty() && std::path::Path::new(p).exists())
         .unwrap_or(false);
-    if !has_voice_profile {
-        if let Some(d) = models.diarizer.as_ref() {
-            mic_pipeline = mic_pipeline.with_diarizer(Arc::clone(d));
+
+    if config.pipeline_v2 {
+        let mut mic_pipeline = pipeline::SpeakerPipelineV2::new(
+            "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, echo_buffer,
+        )
+        .with_config(pipeline::V2Config {
+            max_window: std::time::Duration::from_millis(config.phrase_max_window_ms),
+            silence_tail: std::time::Duration::from_millis(config.phrase_silence_tail_ms),
+            min_window: std::time::Duration::from_millis(config.phrase_min_window_ms),
+        });
+        if let Some(vad) = try_create_silero_vad("Mic") {
+            mic_pipeline = mic_pipeline.with_vad(vad);
         }
-    }
-    if let Some(vad) = try_create_silero_vad("Mic") {
-        mic_pipeline = mic_pipeline.with_vad(vad);
-    }
-    if let Some(vc) = models.voice_convert.as_ref() {
-        mic_pipeline = mic_pipeline.with_voice_convert(Arc::clone(vc));
-    }
-    if let Some(profile_path) = config.mic_voice_profile_path.as_deref() {
-        if has_voice_profile {
-            tracing::info!("Mic pipeline using voice profile: {}", profile_path);
-            mic_pipeline = mic_pipeline.with_fixed_voice_reference(profile_path);
+        // Without a fixed voice profile, attach diariser so V2 can
+        // auto-enrol the user's voice from live audio (mirrors V1
+        // mic-side behaviour).
+        if !has_voice_profile {
+            if let Some(d) = models.diarizer.as_ref() {
+                mic_pipeline = mic_pipeline.with_diarizer(Arc::clone(d));
+            }
         }
+        if let Some(vc) = models.voice_convert.as_ref() {
+            mic_pipeline = mic_pipeline.with_voice_convert(Arc::clone(vc));
+        }
+        if let Some(profile_path) = config.mic_voice_profile_path.as_deref() {
+            if has_voice_profile {
+                tracing::info!("Mic V2 pipeline using voice profile: {}", profile_path);
+                mic_pipeline = mic_pipeline.with_fixed_voice_reference(profile_path);
+            }
+        }
+        if let Some(tx) = subtitle_event_tx.as_ref() {
+            mic_pipeline = mic_pipeline.with_subtitle_channel(tx.clone());
+        }
+        tokio::spawn(async move {
+            mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
+        });
+    } else {
+        let mut mic_pipeline = SpeakerPipeline::new(
+            "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, echo_buffer,
+        );
+        // Mic pipeline deliberately skips diarisation when the user has
+        // recorded a personal voice profile — only one person ever speaks
+        // into the microphone, so a 50–100 ms speaker-id round-trip per
+        // chunk is wasted work. Without a profile we still attach the
+        // diariser so the auto-enrolment path can run as a fallback.
+        if !has_voice_profile {
+            if let Some(d) = models.diarizer.as_ref() {
+                mic_pipeline = mic_pipeline.with_diarizer(Arc::clone(d));
+            }
+        }
+        if let Some(vad) = try_create_silero_vad("Mic") {
+            mic_pipeline = mic_pipeline.with_vad(vad);
+        }
+        if let Some(vc) = models.voice_convert.as_ref() {
+            mic_pipeline = mic_pipeline.with_voice_convert(Arc::clone(vc));
+        }
+        if let Some(profile_path) = config.mic_voice_profile_path.as_deref() {
+            if has_voice_profile {
+                tracing::info!("Mic pipeline using voice profile: {}", profile_path);
+                mic_pipeline = mic_pipeline.with_fixed_voice_reference(profile_path);
+            }
+        }
+        tokio::spawn(async move {
+            mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
+        });
     }
-    tokio::spawn(async move {
-        mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
-    });
     let metrics_for_mic = Arc::clone(&metrics);
     tokio::spawn(async move {
         while let Some(metric) = mic_metrics_rx.recv().await {
@@ -678,20 +797,34 @@ fn start_separation_worker(
     const SILENT_CHANNEL_RMS: f32 = 0.01;
 
     tokio::task::spawn_blocking(move || {
+        // Sepformer is permutation-invariant per chunk: without tracking,
+        // a single speaker's voice ping-pongs between channel A and B
+        // every chunk and the streaming STT context fragments. The
+        // tracker keeps a 50 ms tail of each published channel and
+        // re-aligns each new pair to the previous assignment (ADR 0012).
+        let mut tracker = PermutationTracker::new(DEFAULT_TRACKER_TAIL_SAMPLES);
         while let Some(chunk) = audio_in.blocking_recv() {
             match separator.separate(&chunk.samples, chunk.sample_rate) {
                 Ok(Some(separated)) => {
-                    if separated.rms_a >= SILENT_CHANNEL_RMS {
+                    let sample_rate = separated.sample_rate;
+                    let aligned = tracker.align(separated.channel_a, separated.channel_b);
+                    if aligned.swapped {
+                        tracing::debug!(
+                            "[sep] permutation swap (rms_a={:.4} rms_b={:.4})",
+                            aligned.rms_a, aligned.rms_b,
+                        );
+                    }
+                    if aligned.rms_a >= SILENT_CHANNEL_RMS {
                         let _ = ch_a_tx.send(shared::AudioChunk::new(
-                            separated.channel_a,
-                            separated.sample_rate,
+                            aligned.channel_a,
+                            sample_rate,
                             1,
                         ));
                     }
-                    if separated.rms_b >= SILENT_CHANNEL_RMS {
+                    if aligned.rms_b >= SILENT_CHANNEL_RMS {
                         let _ = ch_b_tx.send(shared::AudioChunk::new(
-                            separated.channel_b,
-                            separated.sample_rate,
+                            aligned.channel_b,
+                            sample_rate,
                             1,
                         ));
                     }
@@ -716,11 +849,12 @@ async fn restart_pipelines(
     models: &LoadedModels,
     metrics: Arc<StageMetricsAggregator>,
     was_active: bool,
+    subtitle_event_tx: Option<std::sync::mpsc::Sender<SubtitleEvent>>,
 ) -> Result<ActivePipelines> {
     drop(old);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let pipelines = start_pipelines(config, models, metrics).await?;
+    let pipelines = start_pipelines(config, models, metrics, subtitle_event_tx).await?;
 
     if was_active {
         pipelines.send_command(PipelineCommand::Start).await;

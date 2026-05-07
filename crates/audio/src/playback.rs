@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleFormat, StreamConfig};
+use rubato::{FftFixedIn, Resampler};
 use shared::AudioChunk;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,8 +8,6 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing;
-
-use crate::resampler;
 
 #[derive(Debug, Error)]
 pub enum PlaybackError {
@@ -143,17 +142,19 @@ impl AudioPlayback {
 /// speaker's emotion / pacing) while the translation clearly dominates.
 /// At a TTS boost of 1.20 this puts the translation roughly 12 dB above
 /// the source — the comfortable separation a TV simultaneous interpreter
-/// gives. Earlier values (0.35, 0.18) left the streams too close in
-/// volume and the listener couldn't easily focus on the translation.
-const PASSTHROUGH_DUCK_GAIN: f32 = 0.10;
+/// gives. Calibrated 2026-05-07 — user reported 0.10 was too aggressive
+/// (original "disappears", listener loses context); 0.22 keeps the
+/// original audible as quiet background while the translation stays
+/// intelligible on top.
+const PASSTHROUGH_DUCK_GAIN: f32 = 0.22;
 
-/// Linear gain applied to the TTS stream before mixing. 1.20 (+20%) is the
-/// boost the user noticed missing after the streaming pipeline refactor —
-/// it makes the translation sit clearly *above* the ducked passthrough
-/// rather than at parity. Applied before the final ±1.0 clamp; loud peaks
-/// clip but TTS output rarely peaks above 0.85, so the audible range
-/// stays intact for normal speech.
-const TTS_GAIN_BOOST: f32 = 1.20;
+/// Linear gain applied to the TTS stream before mixing. Calibrated
+/// 2026-05-07 — earlier 1.20 boost combined with 0.10 ducking made the
+/// translation ~12× louder than the original, fatiguing on long
+/// sessions. 1.0 (no boost) plus the new 0.22 duck gain gives a ~4.5×
+/// ratio, which matches "translator slightly above original" without
+/// drowning it out.
+const TTS_GAIN_BOOST: f32 = 1.0;
 
 /// Time for the passthrough gain to settle (~95%) to its new target when
 /// TTS starts/stops. Slow enough to avoid pumping artifacts on short TTS
@@ -214,7 +215,14 @@ impl MixerPlayback {
             .map(|_| Arc::new(Mutex::new(VecDeque::new())))
             .collect();
 
-        spawn_ingester("passthrough", passthrough_rx, passthrough_buf.clone(), out_rate, out_channels);
+        spawn_ingester(
+            "passthrough",
+            passthrough_rx,
+            passthrough_buf.clone(),
+            out_rate,
+            out_channels,
+            ChunkBoundary::Continuous,
+        );
         for (idx, rx) in tts_rxs.into_iter().enumerate() {
             // Static-name table for up to 4 TTS streams. Beyond that we
             // log them all under "tts-N" via a leaked String (rare; keeps
@@ -226,7 +234,14 @@ impl MixerPlayback {
                 3 => "tts-3",
                 _ => Box::leak(format!("tts-{}", idx).into_boxed_str()),
             };
-            spawn_ingester(name, rx, tts_bufs[idx].clone(), out_rate, out_channels);
+            spawn_ingester(
+                name,
+                rx,
+                tts_bufs[idx].clone(),
+                out_rate,
+                out_channels,
+                ChunkBoundary::PhraseAligned,
+            );
         }
 
         let error_callback = |err: cpal::StreamError| {
@@ -343,25 +358,136 @@ impl MixerPlayback {
 /// every sample produced upstream eventually plays, even if it queues
 /// behind a long backlog. Trade-off chosen deliberately — see comment
 /// above.
+/// FFT chunk size used by the stateful resampler. `FftFixedIn` requires
+/// a fixed input chunk size at construction time and consumes exactly
+/// that many input samples per `process` call.
+const RESAMPLER_CHUNK_SIZE: usize = 1024;
+/// `sub_chunks` parameter of `FftFixedIn`. Higher = larger FFT
+/// = better filter quality at the cost of latency. 2 was the previous
+/// value and is kept for compatibility.
+const RESAMPLER_SUB_CHUNKS: usize = 2;
+/// Fade duration applied to the head and tail of each chunk before
+/// it enters the playback buffer. Smooths the click that would
+/// otherwise be audible at chunk boundaries (V2 sends one chunk per
+/// translated phrase, so any abrupt amplitude change at the start or
+/// end of a chunk produces a tick the listener notices).
+const CHUNK_FADE_MS: u64 = 12;
+
+/// Apply a linear fade-in to the first `fade_frames` frames and a
+/// linear fade-out to the last `fade_frames` frames of an interleaved
+/// PCM buffer. When the chunk is shorter than `2 * fade_frames`, the
+/// fades are clamped to half the chunk so they don't overlap.
+fn apply_chunk_envelope(samples: &mut [f32], channels: u16, fade_frames: usize) {
+    if channels == 0 || samples.is_empty() || fade_frames == 0 {
+        return;
+    }
+    let ch = channels as usize;
+    let total_frames = samples.len() / ch;
+    if total_frames < 2 {
+        return;
+    }
+    let actual_fade = fade_frames.min(total_frames / 2);
+    if actual_fade == 0 {
+        return;
+    }
+    let denom = actual_fade as f32;
+
+    for frame_idx in 0..actual_fade {
+        let gain = frame_idx as f32 / denom;
+        for c in 0..ch {
+            samples[frame_idx * ch + c] *= gain;
+        }
+    }
+    for frame_idx in 0..actual_fade {
+        let gain = frame_idx as f32 / denom;
+        let pos = total_frames - 1 - frame_idx;
+        for c in 0..ch {
+            samples[pos * ch + c] *= gain;
+        }
+    }
+}
+
+/// Whether incoming chunks represent natural phrase boundaries (TTS,
+/// where every chunk is a complete utterance and a fade smooths the
+/// edges) or slices of a continuous stream (passthrough, where any
+/// per-chunk envelope chops a coherent waveform). Passthrough chunks
+/// MUST NOT be enveloped — applying fade-in/out to every captured
+/// slice produces an audible "loose cable" effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkBoundary {
+    PhraseAligned,
+    Continuous,
+}
+
 fn spawn_ingester(
     name: &'static str,
     mut rx: mpsc::UnboundedReceiver<AudioChunk>,
     buffer: Arc<Mutex<VecDeque<f32>>>,
     out_rate: u32,
     out_channels: u16,
+    boundary: ChunkBoundary,
 ) {
     std::thread::Builder::new()
         .name(format!("mixer-ingest-{}", name))
         .spawn(move || {
-            // Per-channel accumulator for the rate-adapt path (resampler needs ≥1024).
+            // Per-channel accumulator for the rate-adapt path.
             let mut resample_accum: Vec<f32> = Vec::new();
             let mut last_input_rate: u32 = 0;
+            // Stateful FFT resampler — kept alive across chunks so
+            // phase continuity is preserved between consecutive 1024-
+            // sample blocks. Recreating it per block produced audible
+            // boundary artifacts ("underwater radio robot" reported by
+            // a user on 2026-05-07): each fresh instance applied its
+            // anti-aliasing filter without warm-up, the per-block phase
+            // jumps fell at a regular ~21 ms cadence at 48 kHz, and the
+            // result was a buzzy/muffled quality on top of any voice.
+            let mut resampler: Option<FftFixedIn<f32>> = None;
 
-            while let Some(chunk) = rx.blocking_recv() {
-                // Reset accumulator if the input rate changed (device hot-swap).
+            while let Some(mut chunk) = rx.blocking_recv() {
+                // Smooth chunk boundaries with a brief linear fade
+                // ONLY for phrase-aligned streams (TTS). Continuous
+                // streams (passthrough loopback) must NOT be enveloped:
+                // each chunk there is an arbitrary slice of an ongoing
+                // recording, and fading every slice chops the waveform
+                // ~3-5 times per second, audible as a loose-cable effect.
+                if boundary == ChunkBoundary::PhraseAligned {
+                    let fade_frames =
+                        (chunk.sample_rate as u64 * CHUNK_FADE_MS / 1000) as usize;
+                    apply_chunk_envelope(
+                        &mut chunk.samples,
+                        chunk.channels,
+                        fade_frames,
+                    );
+                }
+
+                // Reset accumulator AND resampler if the input rate
+                // changed (device hot-swap or first chunk).
                 if chunk.sample_rate != last_input_rate {
                     resample_accum.clear();
                     last_input_rate = chunk.sample_rate;
+                    resampler = if chunk.sample_rate != out_rate {
+                        match FftFixedIn::<f32>::new(
+                            chunk.sample_rate as usize,
+                            out_rate as usize,
+                            RESAMPLER_CHUNK_SIZE,
+                            RESAMPLER_SUB_CHUNKS,
+                            1,
+                        ) {
+                            Ok(r) => Some(r),
+                            Err(e) => {
+                                tracing::error!(
+                                    "Mixer '{}' resampler init failed ({}→{}Hz): {}",
+                                    name,
+                                    chunk.sample_rate,
+                                    out_rate,
+                                    e,
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                 }
 
                 // Fast path: sample rate matches output — just adapt channels.
@@ -372,8 +498,15 @@ fn spawn_ingester(
                     continue;
                 }
 
-                // Resample path: downmix to mono, accumulate, resample in ≥1024-sample
-                // chunks (Rubato FFT requirement), then re-upmix to out_channels.
+                let resampler_handle = match resampler.as_mut() {
+                    Some(r) => r,
+                    None => continue, // init failed earlier; drop this chunk
+                };
+
+                // Resample path: downmix to mono, accumulate, then
+                // process in fixed-size blocks reusing the SAME FFT
+                // instance — this is the fix vs the previous code that
+                // recreated the resampler per block.
                 let mono: Vec<f32> = if chunk.channels == 1 {
                     chunk.samples
                 } else {
@@ -385,13 +518,16 @@ fn spawn_ingester(
                 };
                 resample_accum.extend_from_slice(&mono);
 
-                while resample_accum.len() >= 1024 {
-                    let input_chunk: Vec<f32> = resample_accum.drain(..1024).collect();
-                    match resampler::resample_mono(&input_chunk, chunk.sample_rate, out_rate) {
-                        Ok(resampled) => {
-                            let adapted = adapt_channels(resampled, 1, out_channels);
-                            let mut buf = buffer.lock().unwrap();
-                            buf.extend(adapted);
+                while resample_accum.len() >= RESAMPLER_CHUNK_SIZE {
+                    let input_chunk: Vec<f32> =
+                        resample_accum.drain(..RESAMPLER_CHUNK_SIZE).collect();
+                    match resampler_handle.process(&[input_chunk], None) {
+                        Ok(result) => {
+                            if let Some(channel) = result.into_iter().next() {
+                                let adapted = adapt_channels(channel, 1, out_channels);
+                                let mut buf = buffer.lock().unwrap();
+                                buf.extend(adapted);
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("Mixer '{}' resample failed: {}", name, e);
@@ -465,6 +601,65 @@ mod tests {
     fn duck_gain_is_audible_but_backgrounded() {
         assert!(PASSTHROUGH_DUCK_GAIN > 0.0);
         assert!(PASSTHROUGH_DUCK_GAIN < 1.0);
+    }
+
+    #[test]
+    fn chunk_envelope_zeroes_first_and_last_frame() {
+        let mut buf = vec![1.0_f32; 100]; // mono, 100 frames
+        apply_chunk_envelope(&mut buf, 1, 10);
+        assert_eq!(buf[0], 0.0, "first sample fully attenuated");
+        assert_eq!(buf[99], 0.0, "last sample fully attenuated");
+        // Middle should still be ~1.0 (no fade in the bulk).
+        assert!((buf[50] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chunk_envelope_ramps_linearly() {
+        let mut buf = vec![1.0_f32; 20];
+        apply_chunk_envelope(&mut buf, 1, 10);
+        for i in 0..10 {
+            let expected = i as f32 / 10.0;
+            assert!(
+                (buf[i] - expected).abs() < 1e-6,
+                "fade-in[{}] = {}, expected {}",
+                i,
+                buf[i],
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_envelope_clamps_when_chunk_is_short() {
+        let mut buf = vec![1.0_f32; 10];
+        // Requested fade longer than half the chunk — should clamp.
+        apply_chunk_envelope(&mut buf, 1, 100);
+        assert_eq!(buf[0], 0.0);
+        assert_eq!(buf[9], 0.0);
+        // No panics, no NaN.
+        for &s in &buf {
+            assert!(s.is_finite());
+        }
+    }
+
+    #[test]
+    fn chunk_envelope_handles_stereo() {
+        // 4 frames stereo = 8 samples. Fade 2 frames at each end.
+        let mut buf = vec![1.0_f32; 8];
+        apply_chunk_envelope(&mut buf, 2, 2);
+        // Frame 0 (samples 0,1) fully attenuated.
+        assert_eq!(buf[0], 0.0);
+        assert_eq!(buf[1], 0.0);
+        // Frame 3 (samples 6,7) fully attenuated.
+        assert_eq!(buf[6], 0.0);
+        assert_eq!(buf[7], 0.0);
+    }
+
+    #[test]
+    fn chunk_envelope_noop_on_empty() {
+        let mut buf: Vec<f32> = Vec::new();
+        apply_chunk_envelope(&mut buf, 1, 10);
+        assert!(buf.is_empty());
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod denoise;
 pub mod device;
 pub mod ducking;
 pub mod loopback;
+pub mod phrase_segmenter;
 pub mod playback;
 pub mod recorder;
 pub mod resampler;

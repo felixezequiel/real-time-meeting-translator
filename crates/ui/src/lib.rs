@@ -1,4 +1,5 @@
 pub mod settings_window;
+pub mod subtitle_overlay;
 
 use shared::{Language, PipelineCommand, PipelineConfig, StageMetricsAggregator};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};

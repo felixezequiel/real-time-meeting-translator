@@ -1,0 +1,268 @@
+# ADR 0013 — Hybrid sliding-window pipeline with diariser-first routing
+
+- **Status:** Accepted (Phase 1 + Phase 2 landed 2026-05-07; Phase 3 deferred)
+- **Date:** 2026-05-07
+- **Deciders:** felix
+- **Supersedes:** ADR 0004 (streaming STT local-agreement), ADR 0012 (permutation tracker)
+- **Amends:** ADR 0007 (Sepformer — becomes conditional opt-in), ADR 0009 (Qwen streaming — reduced role)
+- **Related:** ADR 0005 (ECAPA diarisation — becomes central), ADR 0008 (Silero VAD), ADR 0010/0006 (TTS), ADR 0011 (OpenVoice TCC)
+
+## Context
+
+The current pipeline streams audio chunk-by-chunk (~500 ms) through
+Whisper using local-agreement (ADR 0004) and triggers Qwen streaming
+translation per fragment (ADR 0009). When the user enabled Sepformer
+(ADR 0007) for source separation, the system collapsed:
+
+- **Streaming STT fragility** — local-agreement requires consecutive
+  chunks with consistent re-transcription. Sepformer outputs are
+  permutation-invariant (ADR 0012 attempted to mitigate this) and
+  every chunk-boundary perturbation breaks the agreement window.
+- **GPU contention** — three Whisper-small instances + Sepformer +
+  OpenVoice TCC + ECAPA on a 6–8 GB GPU caused intermittent stalls
+  of 10–60 seconds, destroying the real-time budget.
+- **Translation quality** — Qwen receives 3–8 word fragments out of
+  context, produces semantically wrong Portuguese.
+- **Wrong premise** — Sepformer separates *simultaneous* speakers,
+  but in real meetings the dominant case is *alternating* speakers.
+  Diarisation (ADR 0005) is the right primitive for that.
+
+Field testing showed only ~1 STT commit per 8 seconds of speech
+during a 70-second test, with audible translation quality "horrível".
+The user described the desired UX as a **live news interpreter**:
+3–5 s tolerable delay, coherent sentence-level output, voice
+distinction, audible-quality translation.
+
+## Decision
+
+Refactor the pipeline around three principles:
+
+### 1. Adaptive VAD-driven phrase windows
+
+Replace fixed 500 ms streaming chunks with **adaptive phrase windows**:
+
+- A window opens when Silero VAD detects speech onset.
+- The window grows while VAD reports continuous speech, up to
+  `MAX_WINDOW_MS = 5000`.
+- The window closes when VAD reports `SILENCE_TAIL_MS = 400` of
+  silence, or when the max cap is reached.
+- Closed windows are dispatched downstream for STT/translate/TTS
+  as a complete unit.
+- Windows of the same speaker that overlap in *playback time* (because
+  TTS for window N is still finishing when window N+1's TTS arrives)
+  are blended by the crossfade mixer (V3 of the design space — audio
+  always fluid).
+
+This eliminates local-agreement entirely. Each window is a
+syntactically meaningful chunk of speech, processed once.
+
+### 2. Diariser-first routing
+
+- The ECAPA diariser runs over each window and assigns a `speaker_id`.
+- Per-speaker buffers accumulate windows for the **same** speaker, so
+  consecutive phrases by the same person reuse OpenVoice TCC voice
+  state and stay tonally consistent.
+- A single Whisper instance services all speakers via a FIFO queue.
+  No more parallel STT instances, no more GPU contention.
+
+### 3. Sepformer as a conditional surgical tool
+
+Sepformer (ADR 0007) is no longer always-on when the flag is set.
+It runs **only when** the diariser reports ≥2 distinct speaker IDs
+within the same window with comparable energy (overlap detection
+threshold: |rms_a − rms_b| < `OVERLAP_RMS_DELTA`). On true overlap
+it splits the window into two channels for parallel pipelines; on
+single-speaker windows the audio bypasses Sepformer entirely.
+
+### 4. Subtitle overlay UI
+
+A new transparent always-on-top window renders translated text
+incrementally (faster updates than audio). The user reads while the
+TTS catches up, addressing the "delay para fazer sentido" requirement
+without sacrificing audio quality.
+
+## Architecture
+
+```
+[Loopback / Mic]
+        │
+        ▼
+[Silero VAD continuous] ──signals──┐
+        │                           ▼
+        ▼                  [PhraseSegmenter]
+                          (adaptive window, max 5 s)
+                                    │
+                                    ▼
+                          [ECAPA diariser per window]
+                                    │
+                                    ▼
+                          [Overlap detector]
+                          ├── 1 speaker → mono path
+                          └── ≥2 with similar energy → Sepformer (opt-in)
+                                    │
+                                    ▼
+                          [Per-speaker buffers]
+                                    │
+                                    ▼
+                          [PhraseModeStt — single Whisper, FIFO queue]
+                                    │
+                                    ▼
+                          [TranslationStage (NLLB or Qwen, full window)]
+                                    │
+                          ┌─────────┴─────────┐
+                          ▼                   ▼
+              [SubtitleOverlay]      [TTS + OpenVoice TCC]
+              (text streaming UI)    (audio per window)
+                                              │
+                                              ▼
+                                  [CrossfadeMixer + ducking]
+                                              │
+                                              ▼
+                                          [Output]
+```
+
+## Alternatives considered
+
+1. **V1 — Texto speculativo, áudio só por frase.** Latency 3–5 s on
+   audio. Rejected: user wants audio fluid, not gated.
+2. **V2 — TTS em sub-frases com correção mid-sentence.** Risks
+   audible cuts. Rejected: degrades the listening experience.
+3. **Keep current streaming + patch Sepformer further.** Rejected:
+   we've stacked two patches (RMS gate, permutation tracker) and the
+   underlying premise is wrong.
+4. **Drop Sepformer entirely.** Tempting, but real meetings do have
+   overlap. Conditional opt-in keeps the option without the cost.
+
+## Consequences
+
+### Positive
+- **Single Whisper instance** — GPU is no longer thrashed; STT
+  latency becomes deterministic.
+- **Coherent translation** — Qwen/NLLB receives a complete phrase,
+  produces grammatical Portuguese.
+- **No more permutation problem** — diarisation tracks identity by
+  voice fingerprint, immune to Sepformer's chunk-level invariance.
+- **Voice consistency** — same speaker keeps the same TCC reference
+  across consecutive windows.
+- **Faster perceived feedback** — subtitle overlay updates within ~1 s
+  even when audio takes 3–4 s.
+- **Simpler debug** — windows are units that can be logged, replayed,
+  and inspected end-to-end.
+
+### Negative / Limits
+- **Audio latency floor of ~1.5–3 s** — adaptive window adds
+  `SILENCE_TAIL_MS` + STT + translate + TTS. Not "live", but matches
+  professional interpreter pacing.
+- **Major refactor** — `SpeakerPipeline` is rewritten; ADR 0004
+  streaming code goes away.
+- **New components** — `PhraseSegmenter`, `PhraseModeStt`,
+  `CrossfadeMixer`, `SubtitleOverlay`. Each is small but together it's
+  a substantial diff.
+- **Feature parity gap during rollout** — until the migration is
+  complete, the user runs either the old pipeline (current) or the
+  new (after refactor). No half-state.
+
+### Neutral
+- The hexagonal layering is preserved: domain code (the new
+  `PhraseSegmenter`, `PhraseModeStt`, `SpeakerPipelineV2`) doesn't
+  know anything about the audio adapter or the UI overlay.
+
+## Migration plan (PR sequence)
+
+PRs are ordered by dependency and can be reviewed independently.
+
+1. **ADR 0013** — this document (lands first to anchor reviews).
+2. **`PhraseSegmenter`** in `crates/audio` — pure logic, fully unit-
+   tested, no integration yet. Idempotent addition.
+3. **`PhraseModeStt`** wrapper around the existing Whisper STT —
+   accepts a complete segment, returns a single string. Reuses the
+   STT process; just changes the call shape.
+4. **`SpeakerPipelineV2`** in `crates/pipeline` — new pipeline using
+   segmenter + phrase-mode STT + diariser-first routing. Introduced
+   side-by-side with the existing `SpeakerPipeline` (feature flag
+   `pipeline_v2 = true` in `config.toml`).
+5. **`CrossfadeMixer`** — extends `crates/audio/src/playback.rs` with
+   a per-source crossfade buffer when chunks of the same source
+   collide. Doesn't break the current contract.
+6. **`SubtitleOverlay`** — new module in `crates/ui` using eframe.
+   Receives `(speaker_id, text)` over an MPSC channel. Toggle in
+   tray menu.
+7. **Conditional Sepformer** — `start_separation_worker` becomes a
+   diariser-aware router (Sepformer only on overlap windows).
+8. **Cleanup** — once `pipeline_v2 = true` is the default, remove the
+   streaming local-agreement code (ADR 0004 path), remove
+   `PermutationTracker` (ADR 0012), mark those ADRs Superseded.
+
+## Rollback
+
+Set `pipeline_v2 = false` in `config.toml`. The legacy
+`SpeakerPipeline` and the streaming local-agreement code remain
+available until step 8 (cleanup). After cleanup, rollback is `git
+revert` of the cleanup PR plus disabling the flag.
+
+## Implementation status (2026-05-07)
+
+### Phase 1 — landed
+- `PhraseSegmenter` in `crates/audio/src/phrase_segmenter.rs` with
+  9 unit tests.
+- `SpeakerPipelineV2` in `crates/pipeline/src/v2.rs`.
+- `pipeline_v2`, `phrase_max_window_ms`, `phrase_silence_tail_ms`,
+  `phrase_min_window_ms` config fields.
+- `main.rs` branches V1/V2 on the flag for both Speaker and Mic.
+
+### Phase 2 — landed
+- Diariser-first routing in V2: ECAPA runs per closed window,
+  `VoiceProfileRegistry` (reused from V1, methods raised to
+  `pub(crate)`) auto-enrols ~6 s of clean audio per speaker.
+- Voice cloning: V2 picks a sticky Kokoro voice per `speaker_id`,
+  feeds the running-mean F0 to the bridge, applies OpenVoice TCC
+  with the auto-enrolled WAV (or `mic_voice_profile_path` when set).
+- `SubtitleOverlay` in `crates/ui/src/subtitle_overlay.rs` —
+  transparent always-on-top eframe window. Pipeline pushes
+  `SubtitleEvent` into a `std::sync::mpsc` channel; a bridge thread
+  in `main.rs` converts to `SubtitleMessage` for the overlay.
+  **Opt-in via `subtitle_overlay = true` in config.toml** (default
+  off). Field-confirmed limitation 2026-05-07: eframe + winit on
+  Windows cannot run two `run_native` event loops in parallel — when
+  the overlay is up, the Configurações window silently fails to open.
+  Multi-viewport refactor scheduled for Phase 3.
+- Per-chunk fade envelope in `MixerPlayback::spawn_ingester` (12 ms
+  linear fade-in/fade-out) — smooths the click at phrase boundaries
+  that V2's once-per-phrase chunks would otherwise produce.
+- **Resampler fix** (separate ADR-worthy bug, captured as memory):
+  `FftFixedIn` is now constructed once per stream and reused across
+  blocks. The previous code recreated it every 1024 samples, which
+  produced ~47 Hz boundary artifacts audible as "underwater radio
+  robot". Affects both V1 and V2.
+
+### Phase 3 — deferred
+- **Multi-viewport eframe refactor.** Combine `settings_window` and
+  `subtitle_overlay` into a single `eframe::App` declaring multiple
+  viewports via `ctx.show_viewport_deferred(...)`. Lifts the
+  one-event-loop-at-a-time constraint that currently forces overlay
+  to be opt-in. See `memory/project_winit_thread_gotcha.md` for the
+  field diagnosis.
+- Cleanup: remove V1 streaming local-agreement (ADR 0004 path),
+  remove `PermutationTracker` (ADR 0012). Only after V2 validates
+  in production and becomes the default.
+- Conditional Sepformer (only when diariser sees overlap with
+  comparable energy). With diariser-first routing in V2 already
+  covering ~95 % of meeting audio, Sepformer's marginal benefit
+  shrank — re-evaluate after V2 telemetry.
+- Equal-power crossfade between consecutive same-speaker phrases
+  (true overlap mixing, not just per-chunk envelope). Only needed
+  if listeners report perceptible gaps.
+
+## Configuration additions
+
+```toml
+# config.toml — new fields with defaults
+pipeline_v2 = true                  # use the new sliding-window pipeline
+phrase_max_window_ms = 5000         # adaptive window upper bound
+phrase_silence_tail_ms = 400        # silence required to close window
+phrase_min_window_ms = 600          # below this, treat as noise
+overlap_rms_delta = 0.05            # threshold for true overlap detection
+subtitle_overlay = true             # show translation as on-screen subtitles
+subtitle_position = "bottom"        # bottom | top
+crossfade_ms = 150                  # equal-power crossfade between TTS chunks
+```

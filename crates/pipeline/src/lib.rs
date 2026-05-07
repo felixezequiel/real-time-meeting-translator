@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+pub mod v2;
+pub use v2::{SpeakerPipelineV2, SubtitleEvent, V2Config};
+
 const PLAYBACK_SAMPLE_RATE: u32 = 48_000;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
@@ -141,7 +144,7 @@ pub struct VoiceProfileRegistry {
 }
 
 impl VoiceProfileRegistry {
-    fn new(pipeline_name: impl Into<String>, sample_rate: u32) -> Self {
+    pub(crate) fn new(pipeline_name: impl Into<String>, sample_rate: u32) -> Self {
         let target_samples = (sample_rate as f32 * REFERENCE_ENROLL_SECONDS) as usize;
         let output_dir = std::env::temp_dir().join("meeting_translator_refs");
         let _ = std::fs::create_dir_all(&output_dir);
@@ -163,7 +166,7 @@ impl VoiceProfileRegistry {
     /// implausible values (the diarizer returns 0.0 when no voiced frame
     /// could be detected, and very high/low values are usually pyworld
     /// noise on near-silent audio).
-    fn record_f0(&self, speaker_id: u32, f0_hz: f32) {
+    pub(crate) fn record_f0(&self, speaker_id: u32, f0_hz: f32) {
         if !(F0_MIN_HZ..=F0_MAX_HZ).contains(&f0_hz) {
             return;
         }
@@ -179,7 +182,7 @@ impl VoiceProfileRegistry {
     /// Return the running mean F0 for `speaker_id`, or 0.0 when no F0
     /// has ever been recorded for them. The TTS stage interprets 0.0
     /// as "use the default Kokoro voice unchanged".
-    fn f0_for(&self, speaker_id: u32) -> f32 {
+    pub(crate) fn f0_for(&self, speaker_id: u32) -> f32 {
         self.inner
             .lock()
             .ok()
@@ -192,7 +195,7 @@ impl VoiceProfileRegistry {
     /// buffer is flushed to a WAV under the temp directory and the
     /// resulting path becomes available via `reference_for`. Calls
     /// after enrolment for the same speaker are cheap no-ops.
-    fn ingest_audio(&self, speaker_id: u32, samples: &[f32]) {
+    pub(crate) fn ingest_audio(&self, speaker_id: u32, samples: &[f32]) {
         // Reject low-energy chunks before they hit the buffer — silence
         // and music poison the OpenVoice SE extractor far more than a
         // few extra seconds of waiting cost us.
@@ -253,7 +256,7 @@ impl VoiceProfileRegistry {
     /// Path of the reference WAV for `speaker_id`, if enrolment has
     /// completed. `None` means "no conversion possible yet — use raw
     /// Kokoro output for this speaker".
-    fn reference_for(&self, speaker_id: u32) -> Option<String> {
+    pub(crate) fn reference_for(&self, speaker_id: u32) -> Option<String> {
         self.inner
             .lock()
             .ok()

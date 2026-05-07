@@ -104,7 +104,17 @@ class SeparationBridge:
         from speechbrain.inference.separation import SepformerSeparation as Sep
 
         self._torch = torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Force CPU by default: Sepformer competes with Whisper STT
+        # (×3 instances) and OpenVoice TCC for GPU memory, and that
+        # contention occasionally stalls a chunk for tens of seconds —
+        # killing the streaming-STT real-time guarantee. Libri2mix on
+        # CPU runs ~150–250 ms / 500 ms chunk, well under the cadence.
+        # Override via SEPFORMER_DEVICE env var if a dedicated GPU is
+        # available. See ADR 0012.
+        device = os.environ.get("SEPFORMER_DEVICE", "cpu").strip() or "cpu"
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            log("CUDA requested but unavailable — falling back to CPU")
+            device = "cpu"
         cache_dir = os.environ.get(
             "SEPFORMER_PRETRAINED_DIR",
             os.path.join(
