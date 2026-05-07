@@ -1,9 +1,16 @@
 # ADR 0004 — Streaming STT via Local Agreement-2
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR 0013 (Phase 3.4 cleanup, 2026-05-07)
 - **Date:** 2026-04-26
 - **Deciders:** felix
-- **Related:** ADR 0003 (CosyVoice TTS migration)
+- **Related:** ADR 0003 (CosyVoice TTS migration), ADR 0013 (replacement)
+
+> **Historical record only.** The streaming local-agreement code
+> (`crates/stt/src/streaming.rs`, `start_stt_worker`,
+> `start_translate_worker`, accumulator/punctuation flush logic in the
+> pipeline crate) was removed in ADR 0013 Phase 3.4. The current
+> pipeline calls `WhisperStt::transcribe` once per closed phrase
+> window — see `crates/pipeline/src/v2.rs::SpeakerPipelineV2`.
 
 ## Context
 

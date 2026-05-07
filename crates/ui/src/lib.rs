@@ -1,3 +1,4 @@
+pub mod combined_window;
 pub mod settings_window;
 pub mod subtitle_overlay;
 
@@ -154,6 +155,15 @@ impl TrayUi {
         );
         self.settings_thread = Some(handle);
         tracing::info!("Settings window opened");
+    }
+
+    /// Returns a clone of the action sender so external hosts (e.g.
+    /// `combined_window`) can dispatch `TrayAction`s without going
+    /// through the tray menu — Save/Cancel from the embedded settings
+    /// viewport flow back through this channel just like clicks from
+    /// the tray icon do.
+    pub fn window_action_tx(&self) -> &std_mpsc::Sender<TrayAction> {
+        &self.window_action_tx
     }
 
     pub fn set_active(&self, active: bool) {

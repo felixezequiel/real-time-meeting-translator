@@ -1,6 +1,6 @@
 # ADR 0013 — Hybrid sliding-window pipeline with diariser-first routing
 
-- **Status:** Accepted (Phase 1 + Phase 2 landed 2026-05-07; Phase 3 deferred)
+- **Status:** Accepted (Phase 1 + Phase 2 + Phase 3 all landed 2026-05-07)
 - **Date:** 2026-05-07
 - **Deciders:** felix
 - **Supersedes:** ADR 0004 (streaming STT local-agreement), ADR 0012 (permutation tracker)
@@ -235,23 +235,39 @@ revert` of the cleanup PR plus disabling the flag.
   produced ~47 Hz boundary artifacts audible as "underwater radio
   robot". Affects both V1 and V2.
 
-### Phase 3 — deferred
-- **Multi-viewport eframe refactor.** Combine `settings_window` and
-  `subtitle_overlay` into a single `eframe::App` declaring multiple
-  viewports via `ctx.show_viewport_deferred(...)`. Lifts the
-  one-event-loop-at-a-time constraint that currently forces overlay
-  to be opt-in. See `memory/project_winit_thread_gotcha.md` for the
-  field diagnosis.
-- Cleanup: remove V1 streaming local-agreement (ADR 0004 path),
-  remove `PermutationTracker` (ADR 0012). Only after V2 validates
-  in production and becomes the default.
-- Conditional Sepformer (only when diariser sees overlap with
-  comparable energy). With diariser-first routing in V2 already
-  covering ~95 % of meeting audio, Sepformer's marginal benefit
-  shrank — re-evaluate after V2 telemetry.
-- Equal-power crossfade between consecutive same-speaker phrases
-  (true overlap mixing, not just per-chunk envelope). Only needed
-  if listeners report perceptible gaps.
+### Phase 3 — landed
+- **3.1 Multi-viewport eframe app** (`crates/ui/src/combined_window.rs`):
+  one `eframe::run_native` hosts the subtitle overlay as the primary
+  viewport AND Configurações as a `show_viewport_immediate` secondary
+  viewport. `SettingsApp::render_ui` was extracted from `update`
+  (`pub(crate)`) so the host can drive it without owning a separate
+  Frame. `subtitle_overlay::SubtitleState` exposes pure rendering
+  state for the same reason. Settings + overlay coexist, fixing the
+  field-confirmed two-event-loop conflict on Windows.
+  `subtitle_overlay = true` is now safe to enable.
+- **3.2 Conditional Sepformer.** `start_separation_worker` consults
+  the diariser per chunk; Sepformer fires only when ≥2 distinct
+  speaker IDs appeared in the last 2.5 s, with a 1.5 s
+  hysteresis hold. Single-speaker meetings pay zero Sepformer cost.
+  `PermutationTracker` (ADR 0012) is still used inside the armed
+  window — it stays.
+- **3.3 Equal-power crossfade** in `apply_chunk_envelope`:
+  fade-in via `sin(t·π/2)`, fade-out via `cos(t·π/2)`. When two
+  phrase chunks of the same speaker overlap sample-by-sample, total
+  power = sin² + cos² = 1 — no audible loudness dip at the boundary.
+- **3.4 V1 cleanup.** Removed: `crates/stt/src/streaming.rs`
+  (StreamingSession), V1 `SpeakerPipeline` + worker functions in
+  `crates/pipeline/src/lib.rs` (~795 lines), V1-only constants and
+  the `pipeline_v2` config flag. ADR 0004 marked Superseded. V2 is
+  now the only pipeline path; the legacy fallback is gone.
+
+### What is still TODO (post-Phase-3)
+- Field-validate combined window UX on multi-monitor setups (the
+  initial overlay position assumes a 1080p primary display; user
+  drags it where they want for now).
+- Settings save/cancel flow inside the secondary viewport — confirm
+  TrayAction-based saves still propagate correctly when the panel is
+  embedded rather than standalone.
 
 ## Configuration additions
 

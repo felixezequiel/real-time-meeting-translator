@@ -63,33 +63,38 @@ impl DisplayedLine {
     }
 }
 
-struct SubtitleApp {
-    rx: mpsc::Receiver<SubtitleMessage>,
+/// Pure rendering state for the subtitle overlay. Extracted so the
+/// combined multi-viewport host (`combined_window.rs`) can render it
+/// in a primary viewport without owning an eframe::App per overlay.
+pub struct SubtitleState {
     lines: VecDeque<DisplayedLine>,
 }
 
-impl SubtitleApp {
-    fn new(rx: mpsc::Receiver<SubtitleMessage>) -> Self {
+impl Default for SubtitleState {
+    fn default() -> Self {
         Self {
-            rx,
             lines: VecDeque::new(),
         }
     }
+}
 
-    fn drain_messages(&mut self) {
-        while let Ok(msg) = self.rx.try_recv() {
-            self.lines.push_back(DisplayedLine {
-                speaker: msg.speaker,
-                text: msg.translated_text,
-                arrived_at: Instant::now(),
-            });
-            while self.lines.len() > MAX_VISIBLE_LINES {
-                self.lines.pop_front();
-            }
+impl SubtitleState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, msg: SubtitleMessage) {
+        self.lines.push_back(DisplayedLine {
+            speaker: msg.speaker,
+            text: msg.translated_text,
+            arrived_at: Instant::now(),
+        });
+        while self.lines.len() > MAX_VISIBLE_LINES {
+            self.lines.pop_front();
         }
     }
 
-    fn prune_invisible(&mut self) {
+    pub fn prune_invisible(&mut self) {
         while let Some(line) = self.lines.front() {
             if line.alpha() <= 0.0 {
                 self.lines.pop_front();
@@ -98,22 +103,8 @@ impl SubtitleApp {
             }
         }
     }
-}
 
-impl eframe::App for SubtitleApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Fully transparent — the per-frame painter draws its own
-        // semi-opaque background only behind text.
-        [0.0, 0.0, 0.0, 0.0]
-    }
-
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_messages();
-        self.prune_invisible();
-
-        // Repaint at ~30 Hz so fades stay smooth.
-        ctx.request_repaint_after(Duration::from_millis(33));
-
+    pub fn render(&self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
@@ -147,6 +138,39 @@ impl eframe::App for SubtitleApp {
                     }
                 });
             });
+    }
+}
+
+/// Standalone overlay app — kept for the legacy `spawn_overlay` path.
+/// The combined-window path uses `SubtitleState` directly.
+struct SubtitleApp {
+    rx: mpsc::Receiver<SubtitleMessage>,
+    state: SubtitleState,
+}
+
+impl SubtitleApp {
+    fn new(rx: mpsc::Receiver<SubtitleMessage>) -> Self {
+        Self {
+            rx,
+            state: SubtitleState::new(),
+        }
+    }
+}
+
+impl eframe::App for SubtitleApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Fully transparent — the per-frame painter draws its own
+        // semi-opaque background only behind text.
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.state.push(msg);
+        }
+        self.state.prune_invisible();
+        ctx.request_repaint_after(Duration::from_millis(33));
+        self.state.render(ctx);
     }
 }
 

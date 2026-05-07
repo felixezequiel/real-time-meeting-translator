@@ -373,10 +373,15 @@ const RESAMPLER_SUB_CHUNKS: usize = 2;
 /// end of a chunk produces a tick the listener notices).
 const CHUNK_FADE_MS: u64 = 12;
 
-/// Apply a linear fade-in to the first `fade_frames` frames and a
-/// linear fade-out to the last `fade_frames` frames of an interleaved
-/// PCM buffer. When the chunk is shorter than `2 * fade_frames`, the
-/// fades are clamped to half the chunk so they don't overlap.
+/// Apply an equal-power fade-in / fade-out envelope to the first and
+/// last `fade_frames` frames of an interleaved PCM buffer. Uses a
+/// quarter-sine curve (`sin(t · π/2)` for fade-in, `cos(t · π/2)` for
+/// fade-out) so consecutive chunks played back-to-back keep constant
+/// perceived loudness at the boundary — `sin² + cos² = 1`. Linear
+/// curves dipped audibly in the middle of the boundary.
+///
+/// When the chunk is shorter than `2 * fade_frames`, the fades are
+/// clamped to half the chunk so they don't overlap.
 fn apply_chunk_envelope(samples: &mut [f32], channels: u16, fade_frames: usize) {
     if channels == 0 || samples.is_empty() || fade_frames == 0 {
         return;
@@ -391,18 +396,21 @@ fn apply_chunk_envelope(samples: &mut [f32], channels: u16, fade_frames: usize) 
         return;
     }
     let denom = actual_fade as f32;
+    let half_pi = std::f32::consts::FRAC_PI_2;
+    let fade_out_start = total_frames - actual_fade;
 
-    for frame_idx in 0..actual_fade {
-        let gain = frame_idx as f32 / denom;
+    // True equal-power pair: fade-in uses sin, fade-out uses cos.
+    // For any relative position k inside a fade region of length
+    // `actual_fade`, sin²(k/N · π/2) + cos²(k/N · π/2) = 1, so when
+    // chunk A's fade-out tail and chunk B's fade-in head overlap
+    // sample-by-sample, the perceived loudness stays constant.
+    for k in 0..actual_fade {
+        let t = k as f32 / denom;
+        let fade_in_gain = (t * half_pi).sin();
+        let fade_out_gain = (t * half_pi).cos();
         for c in 0..ch {
-            samples[frame_idx * ch + c] *= gain;
-        }
-    }
-    for frame_idx in 0..actual_fade {
-        let gain = frame_idx as f32 / denom;
-        let pos = total_frames - 1 - frame_idx;
-        for c in 0..ch {
-            samples[pos * ch + c] *= gain;
+            samples[k * ch + c] *= fade_in_gain;
+            samples[(fade_out_start + k) * ch + c] *= fade_out_gain;
         }
     }
 }
@@ -604,21 +612,30 @@ mod tests {
     }
 
     #[test]
-    fn chunk_envelope_zeroes_first_and_last_frame() {
+    fn chunk_envelope_attenuates_first_and_last_frame() {
         let mut buf = vec![1.0_f32; 100]; // mono, 100 frames
         apply_chunk_envelope(&mut buf, 1, 10);
-        assert_eq!(buf[0], 0.0, "first sample fully attenuated");
-        assert_eq!(buf[99], 0.0, "last sample fully attenuated");
+        // sin(0) = 0 — first frame fully attenuated.
+        assert_eq!(buf[0], 0.0, "first sample at sin(0) = 0");
+        // cos((fade-1)/fade · π/2) ≠ 0 exactly with discrete steps,
+        // but stays small. We require it to be well below the
+        // unfaded amplitude.
+        assert!(buf[99] < 0.2, "last sample heavily attenuated: {}", buf[99]);
+        assert!(buf[99] >= 0.0);
         // Middle should still be ~1.0 (no fade in the bulk).
         assert!((buf[50] - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn chunk_envelope_ramps_linearly() {
+    fn chunk_envelope_uses_equal_power_curve() {
+        // Equal-power fade-in: gain[i] = sin(i/N · π/2). At the
+        // midpoint (i = N/2) this is sin(π/4) ≈ 0.707, NOT 0.5 —
+        // that's the whole point of switching off linear.
         let mut buf = vec![1.0_f32; 20];
         apply_chunk_envelope(&mut buf, 1, 10);
         for i in 0..10 {
-            let expected = i as f32 / 10.0;
+            let t = i as f32 / 10.0;
+            let expected = (t * std::f32::consts::FRAC_PI_2).sin();
             assert!(
                 (buf[i] - expected).abs() < 1e-6,
                 "fade-in[{}] = {}, expected {}",
@@ -627,16 +644,47 @@ mod tests {
                 expected,
             );
         }
+        // At i = 5 (midpoint), gain ≈ 0.707, much higher than the
+        // 0.5 a linear ramp would give.
+        assert!(buf[5] > 0.69 && buf[5] < 0.72);
+    }
+
+    #[test]
+    fn chunk_envelope_preserves_constant_power_across_overlap() {
+        // True equal-power crossfade: when chunk A's fade-out tail
+        // and chunk B's fade-in head are overlapped sample-by-sample,
+        // the sum of squares stays exactly 1 because A uses cos and
+        // B uses sin at the SAME relative position k.
+        let fade = 8;
+        let mut a = vec![1.0_f32; 16];
+        let mut b = vec![1.0_f32; 16];
+        apply_chunk_envelope(&mut a, 1, fade);
+        apply_chunk_envelope(&mut b, 1, fade);
+        let fade_out_start = a.len() - fade;
+        for k in 0..fade {
+            let tail = a[fade_out_start + k]; // cos(k/fade · π/2)
+            let head = b[k];                  // sin(k/fade · π/2)
+            let power = tail * tail + head * head;
+            assert!(
+                (power - 1.0).abs() < 1e-5,
+                "power at overlap k={} = {} (expected ≈1.0)",
+                k,
+                power,
+            );
+        }
     }
 
     #[test]
     fn chunk_envelope_clamps_when_chunk_is_short() {
         let mut buf = vec![1.0_f32; 10];
-        // Requested fade longer than half the chunk — should clamp.
+        // Requested fade longer than half the chunk — should clamp
+        // to actual_fade = 5 (half the chunk).
         apply_chunk_envelope(&mut buf, 1, 100);
+        // First sample: sin(0) = 0.
         assert_eq!(buf[0], 0.0);
-        assert_eq!(buf[9], 0.0);
-        // No panics, no NaN.
+        // Last sample: cos((4/5) · π/2) ≈ 0.309 — not zero, but
+        // the envelope still tapers and doesn't blow up.
+        assert!(buf[9] < 0.4 && buf[9] >= 0.0);
         for &s in &buf {
             assert!(s.is_finite());
         }
@@ -647,12 +695,13 @@ mod tests {
         // 4 frames stereo = 8 samples. Fade 2 frames at each end.
         let mut buf = vec![1.0_f32; 8];
         apply_chunk_envelope(&mut buf, 2, 2);
-        // Frame 0 (samples 0,1) fully attenuated.
+        // Frame 0 (samples 0,1): fade-in at sin(0) = 0.
         assert_eq!(buf[0], 0.0);
         assert_eq!(buf[1], 0.0);
-        // Frame 3 (samples 6,7) fully attenuated.
-        assert_eq!(buf[6], 0.0);
-        assert_eq!(buf[7], 0.0);
+        // Frame 3 (samples 6,7): fade-out at cos((1/2)·π/2) =
+        // cos(π/4) ≈ 0.707 — attenuated but not zero.
+        assert!(buf[6] > 0.6 && buf[6] < 0.8);
+        assert!((buf[6] - buf[7]).abs() < 1e-6, "stereo channels match");
     }
 
     #[test]

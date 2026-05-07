@@ -7,8 +7,9 @@ use tracing;
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
-pub mod streaming;
-pub use streaming::{CommittedWords, StreamingSession};
+// streaming local-agreement (ADR 0004) was superseded by V2 in
+// ADR 0013 Phase 3.4 cleanup. WhisperStt::transcribe is now the only
+// entry point — V2 calls it once per closed phrase window.
 
 #[derive(Debug, Error)]
 pub enum SttError {

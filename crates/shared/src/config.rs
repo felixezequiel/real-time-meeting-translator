@@ -2,14 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::language::Language;
 
-/// Audio capture chunk size. With Silero VAD on the front of the pipeline
-/// (ADR 0008), most chunks become a fast no-op when nothing is being said,
-/// so we can afford a tighter cadence. 280 ms is small enough that the
-/// boundary detector in `StreamingSession` reacts quickly to a finished
-/// utterance and large enough that the diarisation bridge still has a
-/// few syllables of content for an embedding. Values <250 ms cause the
-/// streaming STT throttle (`MIN_INFERENCE_INTERVAL_MS = 250`) to drop
-/// every other chunk before it reaches Whisper.
+/// Audio capture chunk size. With Silero VAD on the front of the
+/// pipeline (ADR 0008), most chunks become a fast no-op when nothing
+/// is being said, so we can afford a tighter cadence. 280 ms is small
+/// enough that V2's PhraseSegmenter (ADR 0013) reacts quickly to a
+/// finished utterance, large enough that the diarisation bridge still
+/// has a few syllables of content for an embedding.
 const DEFAULT_CHUNK_DURATION_MS: u64 = 280;
 /// Small quantized (q5_1) — ~181 MB vs 466 MB fp16, ~2x faster inference
 /// on both CPU and GPU with marginal quality loss for PT/EN.
@@ -103,39 +101,22 @@ pub struct PipelineConfig {
     #[serde(default = "default_enable_voice_conversion")]
     pub enable_voice_conversion: bool,
 
-    /// Use the V2 sliding-window pipeline (ADR 0013). When true, audio
-    /// is segmented by VAD into adaptive phrase windows (closed by
-    /// silence or 5 s cap), each window runs through Whisper / NLLB /
-    /// Piper as a complete phrase, and the legacy streaming local-
-    /// agreement path (ADR 0004) is bypassed. Default: false until
-    /// V2 lands as the default behaviour.
-    #[serde(default)]
-    pub pipeline_v2: bool,
-
-    /// V2 max window in milliseconds. Caps how long a phrase can grow
-    /// before it is force-closed (no speaker keeps a single sentence
-    /// longer than this without flushing). Used only when
-    /// `pipeline_v2 = true`.
+    /// Phrase window upper bound in milliseconds (ADR 0013).
     #[serde(default = "default_phrase_max_window_ms")]
     pub phrase_max_window_ms: u64,
 
-    /// V2 silence tail required to close a phrase, in milliseconds.
-    /// Lower = lower latency but risk of fragmenting; higher = waits
-    /// longer for the speaker. Used only when `pipeline_v2 = true`.
+    /// Silence tail required to close a phrase, in milliseconds (ADR 0013).
     #[serde(default = "default_phrase_silence_tail_ms")]
     pub phrase_silence_tail_ms: u64,
 
-    /// V2 minimum speech samples before a window is admitted to STT.
-    /// Filters out blips/breaths. Used only when `pipeline_v2 = true`.
+    /// Minimum speech length before a window is admitted to STT (ADR 0013).
     #[serde(default = "default_phrase_min_window_ms")]
     pub phrase_min_window_ms: u64,
 
-    /// Show the always-on-top translated-text overlay (ADR 0013, Phase 2).
-    /// Disabled by default because eframe + winit on Windows cannot
-    /// run two event loops simultaneously: when the overlay is up,
-    /// the Configurações window cannot open. Enable only when you
-    /// don't need the settings panel during the session, or wait for
-    /// the multi-viewport refactor.
+    /// Show the always-on-top translated-text overlay (ADR 0013).
+    /// Now hosted as a secondary viewport of the unified eframe app
+    /// (Phase 3.1), so it coexists with Configurações. Default off so
+    /// the user opts into the screen real-estate cost.
     #[serde(default)]
     pub subtitle_overlay: bool,
 
@@ -164,7 +145,6 @@ impl Default for PipelineConfig {
             enable_separation: false,
             mic_voice_profile_path: None,
             enable_voice_conversion: true,
-            pipeline_v2: false,
             phrase_max_window_ms: DEFAULT_PHRASE_MAX_WINDOW_MS,
             phrase_silence_tail_ms: DEFAULT_PHRASE_SILENCE_TAIL_MS,
             phrase_min_window_ms: DEFAULT_PHRASE_MIN_WINDOW_MS,
@@ -206,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn default_chunk_duration_matches_streaming_stt_cadence() {
+    fn default_chunk_duration_matches_segmenter_cadence() {
         let config = PipelineConfig::default();
         assert_eq!(config.chunk_duration_ms, 280);
         assert!((config.chunk_duration_seconds() - 0.28).abs() < 1e-6);

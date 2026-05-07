@@ -12,11 +12,13 @@ use audio::device;
 use audio::loopback::LoopbackCapture;
 use audio::playback::{AudioPlayback, MixerPlayback};
 use audio::SileroVad;
-use pipeline::{SpeakerPipeline, SubtitleEvent};
+use pipeline::SubtitleEvent;
 use stt::WhisperStt;
 use translation::OpusMtTranslator;
 use tts::PiperTts;
-use ui::subtitle_overlay::{spawn_overlay, SubtitleMessage};
+use ui::combined_window::spawn_combined;
+use ui::settings_window::SettingsInit;
+use ui::subtitle_overlay::SubtitleMessage;
 use ui::{TrayAction, TrayUi};
 use diarization::OnlineDiarizer;
 use separation::{PermutationTracker, Sepformer, DEFAULT_TRACKER_TAIL_SAMPLES};
@@ -169,19 +171,49 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
 
     let audio_switch_script = scripts_dir.join("audio_switch.ps1");
 
-    // ── Subtitle overlay (V2 only, opt-in) ────────────────────────────────────
-    // Always-on-top window that renders translated phrases in real time
-    // (ADR 0013, Phase 2). Spawned once per session — restart_pipelines
-    // reuses the same sender so the window stays alive across pipeline
-    // restarts.
+    // ── Combined UI host (V2 only) ─────────────────────────────────────────────
+    // Single eframe::App that hosts both the subtitle overlay (primary
+    // viewport, transparent always-on-top) and Configurações (secondary
+    // deferred viewport, shown on demand). Resolves the field-confirmed
+    // limitation that two `eframe::run_native` event loops cannot
+    // coexist on Windows. ADR 0013 Phase 3.1.
     //
-    // Gated by `subtitle_overlay = true`. Default is OFF because
-    // eframe + winit on Windows can't run two event loops in parallel:
-    // when the overlay is up, Configurações fails to open silently.
-    // Multi-viewport refactor pending in ADR 0013 Phase 3.
-    let subtitle_event_tx = if config.pipeline_v2 && config.subtitle_overlay {
-        match spawn_overlay() {
-            Ok(overlay_tx) => {
+    // When V2 is off, the legacy settings_window standalone path stays
+    // active (via TrayUi::open_settings).
+    let combined_settings_tx: Option<std::sync::mpsc::Sender<SettingsInit>>;
+    // V2 is the only pipeline now (Phase 3.4 cleanup). Always spawn
+    // the combined window — it hosts both Configurações and the
+    // optional subtitle overlay.
+    let subtitle_event_tx = {
+        // Build the initial SettingsInit so the combined app starts
+        // with up-to-date device lists / current config.
+        let profile_dir = match app_dir() {
+            Ok(d) => d.join("voice_profile"),
+            Err(_) => std::env::temp_dir().join("meeting_translator_voice"),
+        };
+        let initial_init = SettingsInit {
+            output_devices: output_device_names.clone(),
+            input_devices: input_device_names.clone(),
+            selected_mic: config.mic_device.clone().unwrap_or_default(),
+            selected_headphones: config.headphones_device.clone().unwrap_or_default(),
+            mic_source_lang: config.mic_source_language,
+            speaker_source_lang: config.speaker_source_language,
+            is_active: false,
+            voice_profile_path: config.mic_voice_profile_path.clone(),
+            voice_profile_dir: profile_dir,
+        };
+
+        let action_tx_for_combined = tray.window_action_tx().clone();
+        match spawn_combined(
+            initial_init,
+            action_tx_for_combined,
+            Arc::clone(&metrics_aggregator),
+            config.subtitle_overlay,
+        ) {
+            Ok((_handle, show_tx, overlay_tx)) => {
+                combined_settings_tx = Some(show_tx);
+
+                // Bridge SubtitleEvent (pipeline) → SubtitleMessage (overlay).
                 let (event_tx, event_rx) = std::sync::mpsc::channel::<SubtitleEvent>();
                 std::thread::Builder::new()
                     .name("subtitle-bridge".to_string())
@@ -202,12 +234,13 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                 Some(event_tx)
             }
             Err(e) => {
-                tracing::warn!("Subtitle overlay failed to start: {}. Continuing without subtitles.", e);
+                tracing::warn!(
+                    "Combined UI failed to start: {}. Falling back to legacy settings path.", e,
+                );
+                combined_settings_tx = None;
                 None
             }
         }
-    } else {
-        None
     };
 
     // ── Start both pipelines ───────────────────────────────────────────────────
@@ -295,6 +328,29 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                         Ok(d) => d.join("voice_profile"),
                         Err(_) => std::env::temp_dir().join("meeting_translator_voice"),
                     };
+                    if let Some(combined_tx) = combined_settings_tx.as_ref() {
+                        let init = SettingsInit {
+                            output_devices: output_device_names.clone(),
+                            input_devices: input_device_names.clone(),
+                            selected_mic: config.mic_device.clone().unwrap_or_default(),
+                            selected_headphones: config
+                                .headphones_device
+                                .clone()
+                                .unwrap_or_default(),
+                            mic_source_lang: config.mic_source_language,
+                            speaker_source_lang: config.speaker_source_language,
+                            is_active,
+                            voice_profile_path: config.mic_voice_profile_path.clone(),
+                            voice_profile_dir: profile_dir,
+                        };
+                        if let Err(e) = combined_tx.send(init) {
+                            tracing::warn!(
+                                "Combined UI settings channel closed ({}); falling back to legacy.",
+                                e,
+                            );
+                        }
+                        continue;
+                    }
                     tray.open_settings(
                         &output_device_names,
                         &input_device_names,
@@ -572,7 +628,13 @@ async fn start_pipelines(
     if let Some(sep) = models.separator.as_ref() {
         let (ch_a_tx, ch_a_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
         let (ch_b_tx, ch_b_rx) = mpsc::unbounded_channel::<shared::AudioChunk>();
-        start_separation_worker(spk_audio_rx, Arc::clone(sep), ch_a_tx, ch_b_tx);
+        start_separation_worker(
+            spk_audio_rx,
+            Arc::clone(sep),
+            models.diarizer.clone(),
+            ch_a_tx,
+            ch_b_tx,
+        );
         speaker_branches.push(("Speaker-A", ch_a_rx));
         speaker_branches.push(("Speaker-B", ch_b_rx));
         tracing::info!("Source separation ON: dual speaker pipelines (A + B), parallel mix");
@@ -591,58 +653,37 @@ async fn start_pipelines(
             mpsc::channel::<shared::PipelineMetrics>(64);
 
         let branch_name = name.to_string();
-        if config.pipeline_v2 {
-            // ADR 0013: adaptive sliding-window pipeline.
-            let mut pipeline = pipeline::SpeakerPipelineV2::new(
-                name,
-                Arc::clone(&spk_stt),
-                Arc::clone(&spk_trans),
-                Arc::clone(&spk_tts),
-                spk_source_lang,
-                echo_buffer.clone(),
-            )
-            .with_config(pipeline::V2Config {
-                max_window: std::time::Duration::from_millis(config.phrase_max_window_ms),
-                silence_tail: std::time::Duration::from_millis(config.phrase_silence_tail_ms),
-                min_window: std::time::Duration::from_millis(config.phrase_min_window_ms),
-            });
-            if let Some(vad) = try_create_silero_vad(name) {
-                pipeline = pipeline.with_vad(vad);
-            }
-            if let Some(d) = models.diarizer.as_ref() {
-                pipeline = pipeline.with_diarizer(Arc::clone(d));
-            }
-            if let Some(vc) = models.voice_convert.as_ref() {
-                pipeline = pipeline.with_voice_convert(Arc::clone(vc));
-            }
-            if let Some(tx) = subtitle_event_tx.as_ref() {
-                pipeline = pipeline.with_subtitle_channel(tx.clone());
-            }
-            tokio::spawn(async move {
-                pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
-            });
-        } else {
-            let mut pipeline = SpeakerPipeline::new(
-                name,
-                Arc::clone(&spk_stt),
-                Arc::clone(&spk_trans),
-                Arc::clone(&spk_tts),
-                spk_source_lang,
-                echo_buffer.clone(),
-            );
-            if let Some(d) = models.diarizer.as_ref() {
-                pipeline = pipeline.with_diarizer(Arc::clone(d));
-            }
-            if let Some(vad) = try_create_silero_vad(name) {
-                pipeline = pipeline.with_vad(vad);
-            }
-            if let Some(vc) = models.voice_convert.as_ref() {
-                pipeline = pipeline.with_voice_convert(Arc::clone(vc));
-            }
-            tokio::spawn(async move {
-                pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
-            });
+        // ADR 0013: V2 sliding-window pipeline is the only path now.
+        // The V1 streaming local-agreement code (ADR 0004) was
+        // superseded and removed in Phase 3.4 cleanup.
+        let mut pipeline = pipeline::SpeakerPipelineV2::new(
+            name,
+            Arc::clone(&spk_stt),
+            Arc::clone(&spk_trans),
+            Arc::clone(&spk_tts),
+            spk_source_lang,
+            echo_buffer.clone(),
+        )
+        .with_config(pipeline::V2Config {
+            max_window: std::time::Duration::from_millis(config.phrase_max_window_ms),
+            silence_tail: std::time::Duration::from_millis(config.phrase_silence_tail_ms),
+            min_window: std::time::Duration::from_millis(config.phrase_min_window_ms),
+        });
+        if let Some(vad) = try_create_silero_vad(name) {
+            pipeline = pipeline.with_vad(vad);
         }
+        if let Some(d) = models.diarizer.as_ref() {
+            pipeline = pipeline.with_diarizer(Arc::clone(d));
+        }
+        if let Some(vc) = models.voice_convert.as_ref() {
+            pipeline = pipeline.with_voice_convert(Arc::clone(vc));
+        }
+        if let Some(tx) = subtitle_event_tx.as_ref() {
+            pipeline = pipeline.with_subtitle_channel(tx.clone());
+        }
+        tokio::spawn(async move {
+            pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
+        });
         let log_name = branch_name.clone();
         let metrics_for_branch = Arc::clone(&metrics);
         tokio::spawn(async move {
@@ -694,71 +735,40 @@ async fn start_pipelines(
         .map(|p| !p.is_empty() && std::path::Path::new(p).exists())
         .unwrap_or(false);
 
-    if config.pipeline_v2 {
-        let mut mic_pipeline = pipeline::SpeakerPipelineV2::new(
-            "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, echo_buffer,
-        )
-        .with_config(pipeline::V2Config {
-            max_window: std::time::Duration::from_millis(config.phrase_max_window_ms),
-            silence_tail: std::time::Duration::from_millis(config.phrase_silence_tail_ms),
-            min_window: std::time::Duration::from_millis(config.phrase_min_window_ms),
-        });
-        if let Some(vad) = try_create_silero_vad("Mic") {
-            mic_pipeline = mic_pipeline.with_vad(vad);
-        }
-        // Without a fixed voice profile, attach diariser so V2 can
-        // auto-enrol the user's voice from live audio (mirrors V1
-        // mic-side behaviour).
-        if !has_voice_profile {
-            if let Some(d) = models.diarizer.as_ref() {
-                mic_pipeline = mic_pipeline.with_diarizer(Arc::clone(d));
-            }
-        }
-        if let Some(vc) = models.voice_convert.as_ref() {
-            mic_pipeline = mic_pipeline.with_voice_convert(Arc::clone(vc));
-        }
-        if let Some(profile_path) = config.mic_voice_profile_path.as_deref() {
-            if has_voice_profile {
-                tracing::info!("Mic V2 pipeline using voice profile: {}", profile_path);
-                mic_pipeline = mic_pipeline.with_fixed_voice_reference(profile_path);
-            }
-        }
-        if let Some(tx) = subtitle_event_tx.as_ref() {
-            mic_pipeline = mic_pipeline.with_subtitle_channel(tx.clone());
-        }
-        tokio::spawn(async move {
-            mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
-        });
-    } else {
-        let mut mic_pipeline = SpeakerPipeline::new(
-            "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, echo_buffer,
-        );
-        // Mic pipeline deliberately skips diarisation when the user has
-        // recorded a personal voice profile — only one person ever speaks
-        // into the microphone, so a 50–100 ms speaker-id round-trip per
-        // chunk is wasted work. Without a profile we still attach the
-        // diariser so the auto-enrolment path can run as a fallback.
-        if !has_voice_profile {
-            if let Some(d) = models.diarizer.as_ref() {
-                mic_pipeline = mic_pipeline.with_diarizer(Arc::clone(d));
-            }
-        }
-        if let Some(vad) = try_create_silero_vad("Mic") {
-            mic_pipeline = mic_pipeline.with_vad(vad);
-        }
-        if let Some(vc) = models.voice_convert.as_ref() {
-            mic_pipeline = mic_pipeline.with_voice_convert(Arc::clone(vc));
-        }
-        if let Some(profile_path) = config.mic_voice_profile_path.as_deref() {
-            if has_voice_profile {
-                tracing::info!("Mic pipeline using voice profile: {}", profile_path);
-                mic_pipeline = mic_pipeline.with_fixed_voice_reference(profile_path);
-            }
-        }
-        tokio::spawn(async move {
-            mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
-        });
+    let mut mic_pipeline = pipeline::SpeakerPipelineV2::new(
+        "Mic", mic_stt, mic_trans, mic_tts, mic_source_lang, echo_buffer,
+    )
+    .with_config(pipeline::V2Config {
+        max_window: std::time::Duration::from_millis(config.phrase_max_window_ms),
+        silence_tail: std::time::Duration::from_millis(config.phrase_silence_tail_ms),
+        min_window: std::time::Duration::from_millis(config.phrase_min_window_ms),
+    });
+    if let Some(vad) = try_create_silero_vad("Mic") {
+        mic_pipeline = mic_pipeline.with_vad(vad);
     }
+    // Without a fixed voice profile, attach the diariser so V2 can
+    // auto-enrol the user's voice from live audio. With a profile,
+    // skip diariser — only one person speaks into the mic.
+    if !has_voice_profile {
+        if let Some(d) = models.diarizer.as_ref() {
+            mic_pipeline = mic_pipeline.with_diarizer(Arc::clone(d));
+        }
+    }
+    if let Some(vc) = models.voice_convert.as_ref() {
+        mic_pipeline = mic_pipeline.with_voice_convert(Arc::clone(vc));
+    }
+    if let Some(profile_path) = config.mic_voice_profile_path.as_deref() {
+        if has_voice_profile {
+            tracing::info!("Mic V2 pipeline using voice profile: {}", profile_path);
+            mic_pipeline = mic_pipeline.with_fixed_voice_reference(profile_path);
+        }
+    }
+    if let Some(tx) = subtitle_event_tx.as_ref() {
+        mic_pipeline = mic_pipeline.with_subtitle_channel(tx.clone());
+    }
+    tokio::spawn(async move {
+        mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
+    });
     let metrics_for_mic = Arc::clone(&metrics);
     tokio::spawn(async move {
         while let Some(metric) = mic_metrics_rx.recv().await {
@@ -784,9 +794,25 @@ async fn start_pipelines(
 /// falls back to forwarding the original mono onto channel A and silence
 /// onto channel B — a single working pipeline is always better than no
 /// pipeline at all.
+/// Sliding window in which we count distinct diariser-reported
+/// speakers to decide if there is *active overlap* worth firing
+/// Sepformer for. Empirically, two people volleying interruptions in
+/// real meetings cycle their IDs every 1–2 s, so a 2.5 s window
+/// catches the pattern without locking Sepformer on after a single
+/// stray ID.
+const OVERLAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// How long Sepformer stays "armed" after the last overlap-positive
+/// chunk. Without hysteresis the worker would flip in and out of
+/// separation mode at every chunk boundary, fragmenting both speaker
+/// streams. 1.5 s lets a brief silence inside an overlap pass without
+/// dropping back to mono.
+const OVERLAP_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+
 fn start_separation_worker(
     mut audio_in: mpsc::UnboundedReceiver<shared::AudioChunk>,
     separator: Arc<Sepformer>,
+    diarizer: Option<Arc<OnlineDiarizer>>,
     ch_a_tx: mpsc::UnboundedSender<shared::AudioChunk>,
     ch_b_tx: mpsc::UnboundedSender<shared::AudioChunk>,
 ) {
@@ -803,7 +829,50 @@ fn start_separation_worker(
         // tracker keeps a 50 ms tail of each published channel and
         // re-aligns each new pair to the previous assignment (ADR 0012).
         let mut tracker = PermutationTracker::new(DEFAULT_TRACKER_TAIL_SAMPLES);
+        // (timestamp, speaker_id) — we keep only entries within
+        // OVERLAP_WINDOW. ≥2 distinct IDs in the window = overlap.
+        let mut recent_speakers: std::collections::VecDeque<(std::time::Instant, u32)> =
+            std::collections::VecDeque::new();
+        let mut last_overlap_seen: Option<std::time::Instant> = None;
+
         while let Some(chunk) = audio_in.blocking_recv() {
+            // Probe the diariser first. If it can't speak (no bridge,
+            // dead, or returns None), default to "no overlap" — the
+            // worker forwards mono to channel A.
+            let now = std::time::Instant::now();
+            if let Some(d) = diarizer.as_ref() {
+                if let Ok(Some(ident)) = d.identify(&chunk.samples, chunk.sample_rate) {
+                    recent_speakers.push_back((now, ident.speaker_id));
+                }
+            }
+            while let Some((t, _)) = recent_speakers.front() {
+                if now.duration_since(*t) > OVERLAP_WINDOW {
+                    recent_speakers.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            let distinct_ids: std::collections::HashSet<u32> =
+                recent_speakers.iter().map(|(_, id)| *id).collect();
+            let overlap_now = distinct_ids.len() >= 2;
+            if overlap_now {
+                last_overlap_seen = Some(now);
+            }
+            let armed = match last_overlap_seen {
+                Some(t) => now.duration_since(t) <= OVERLAP_HOLD,
+                None => false,
+            };
+
+            if !armed {
+                // No overlap → mono pipeline. Skip Sepformer entirely
+                // and reset the permutation tracker so the next time
+                // we arm we start with a clean slate.
+                let _ = ch_a_tx.send(chunk);
+                continue;
+            }
+
+            // Overlap window — fire Sepformer and route both channels.
             match separator.separate(&chunk.samples, chunk.sample_rate) {
                 Ok(Some(separated)) => {
                     let sample_rate = separated.sample_rate;
@@ -830,7 +899,6 @@ fn start_separation_worker(
                     }
                 }
                 Ok(None) => {
-                    // Bridge dead — keep the show running on channel A.
                     let _ = ch_a_tx.send(chunk);
                 }
                 Err(e) => {

@@ -179,7 +179,7 @@ pub fn open(
 
 // ─── App state ────────────────────────────────────────────────────────────────
 
-struct SettingsApp {
+pub(crate) struct SettingsApp {
     output_devices: Vec<String>,
     input_devices: Vec<String>,
     mic_idx: usize,
@@ -213,7 +213,7 @@ enum VoiceProfileState {
 }
 
 impl SettingsApp {
-    fn new(
+    pub(crate) fn new(
         init: SettingsInit,
         action_tx: std_mpsc::Sender<TrayAction>,
         pending_show: Arc<Mutex<Option<SettingsInit>>>,
@@ -249,7 +249,7 @@ impl SettingsApp {
         }
     }
 
-    fn apply_init(&mut self, init: SettingsInit) {
+    pub(crate) fn apply_init(&mut self, init: SettingsInit) {
         self.mic_idx = init
             .input_devices
             .iter()
@@ -298,6 +298,16 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_ui(ctx);
+    }
+}
+
+impl SettingsApp {
+    /// Render the entire settings UI for one frame. Split out from
+    /// `update()` so the multi-viewport host (`combined_window.rs`)
+    /// can call it from a `show_viewport_deferred` closure where
+    /// `eframe::Frame` is not available.
+    pub(crate) fn render_ui(&mut self, ctx: &egui::Context) {
         // Check for pending "show" signal set by the watcher thread
         let pending_init = self.pending_show.lock().unwrap().take();
         if let Some(init) = pending_init {
@@ -975,7 +985,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 // ─── Global theme ─────────────────────────────────────────────────────────────
 
-fn configure_style(ctx: &egui::Context) {
+pub(crate) fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
 
     style.spacing.item_spacing = egui::vec2(8.0, 5.0);
