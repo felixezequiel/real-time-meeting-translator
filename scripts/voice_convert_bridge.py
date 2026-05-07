@@ -121,11 +121,23 @@ def read_line_binary(stream) -> bytes | None:
         buf.extend(ch)
 
 
-def write_pcm_response(samples_np: np.ndarray, sample_rate: int) -> None:
+def write_pcm_response(
+    samples_np: np.ndarray,
+    sample_rate: int,
+    converted: bool = True,
+) -> None:
     samples_np = np.clip(samples_np, -1.0, 1.0)
     int16 = (samples_np * 32767.0).astype(np.int16)
     pcm_bytes = int16.tobytes()
-    header = {"sample_rate": int(sample_rate), "num_samples": int(int16.size)}
+    header = {
+        "sample_rate": int(sample_rate),
+        "num_samples": int(int16.size),
+        # Tells Rust whether this was a real conversion or the
+        # graceful fallback (source audio, conversion skipped or
+        # internal failure). Rust uses it to disable TCC after a
+        # streak of failures.
+        "converted": bool(converted),
+    }
     stdout_bin.write((json.dumps(header) + "\n").encode("utf-8"))
     stdout_bin.write(pcm_bytes)
     stdout_bin.flush()
@@ -419,7 +431,7 @@ class TccBridge:
                     f"[vc] FALLBACK: target SE missing for "
                     f"{os.path.basename(ref_wav_path)} — playing raw TTS"
                 )
-                return source_pcm_f32, source_sr
+                return source_pcm_f32, source_sr, False
             source_se = self.get_source_se(src_path)
 
             t = time.monotonic()
@@ -436,10 +448,10 @@ class TccBridge:
                 f"{len(out_audio)} out samples in "
                 f"{(time.monotonic() - t) * 1000:.0f} ms"
             )
-            return np.asarray(out_audio, dtype=np.float32), TCC_SAMPLE_RATE
+            return np.asarray(out_audio, dtype=np.float32), TCC_SAMPLE_RATE, True
         except Exception as e:  # noqa: BLE001
             log(f"[vc] conversion failed: {type(e).__name__}: {e}")
-            return source_pcm_f32, source_sr
+            return source_pcm_f32, source_sr, False
         finally:
             try:
                 os.remove(src_path)
@@ -502,11 +514,13 @@ def main() -> None:
             )
 
             if not reference_wav_path:
-                write_pcm_response(source_np, source_sr)
+                write_pcm_response(source_np, source_sr, converted=False)
                 continue
 
-            converted, out_sr = bridge.convert(source_np, source_sr, reference_wav_path)
-            write_pcm_response(converted, out_sr)
+            converted_audio, out_sr, ok = bridge.convert(
+                source_np, source_sr, reference_wav_path
+            )
+            write_pcm_response(converted_audio, out_sr, converted=ok)
 
         except Exception as e:  # noqa: BLE001 — bridge must stay alive
             log(f"VC error: {type(e).__name__}: {e}")
@@ -514,7 +528,9 @@ def main() -> None:
             log(traceback.format_exc())
             # Send a single-sample silence frame so the Rust client
             # doesn't block on stdin.read_exact for the PCM payload.
-            write_pcm_response(np.zeros(1, dtype=np.float32), TCC_SAMPLE_RATE)
+            write_pcm_response(
+                np.zeros(1, dtype=np.float32), TCC_SAMPLE_RATE, converted=False,
+            )
 
 
 if __name__ == "__main__":

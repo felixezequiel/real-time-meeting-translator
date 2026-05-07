@@ -18,12 +18,17 @@ fn default_enable_voice_conversion() -> bool {
     true
 }
 
-/// V2 phrase window upper bound (ADR 0013).
+/// V2 phrase window upper bound (ADR 0013). Caps how long a single
+/// phrase can grow without flushing.
 const DEFAULT_PHRASE_MAX_WINDOW_MS: u64 = 5000;
-/// V2 silence required to close a phrase (ADR 0013).
-const DEFAULT_PHRASE_SILENCE_TAIL_MS: u64 = 400;
+/// V2 silence required to close a phrase (ADR 0013). Lowered from
+/// 400 → 280 ms after field testing showed end-to-end latency at
+/// 2.5–3 s; the silence tail is the only knob that directly affects
+/// the perceived gap between the speaker stopping and the
+/// translation arriving.
+const DEFAULT_PHRASE_SILENCE_TAIL_MS: u64 = 280;
 /// V2 minimum speech length before a window is admitted (ADR 0013).
-const DEFAULT_PHRASE_MIN_WINDOW_MS: u64 = 600;
+const DEFAULT_PHRASE_MIN_WINDOW_MS: u64 = 500;
 
 fn default_phrase_max_window_ms() -> u64 {
     DEFAULT_PHRASE_MAX_WINDOW_MS

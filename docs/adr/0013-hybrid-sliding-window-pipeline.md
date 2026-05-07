@@ -269,6 +269,51 @@ revert` of the cleanup PR plus disabling the flag.
   TrayAction-based saves still propagate correctly when the panel is
   embedded rather than standalone.
 
+## Amendment 2026-05-07 — Inter-window phrase accumulator
+
+Field testing exposed a quality regression after we shrank
+`phrase_silence_tail_ms` from 400 → 280 ms (latency tuning). The
+shorter tail closes a window on natural mid-sentence pauses (breath,
+word search), so Whisper hands the translator fragments like
+*"for this conversation is to try to figure out what that future"*
+or *"of the future Mark Zuckerberg is trying to build so that you"*.
+Qwen translates faithfully but the output is incoherent because the
+input is incoherent.
+
+The accumulator restores phrase-level coherence WITHOUT walking back
+the latency improvement. `Accumulator` struct in `v2.rs` holds an
+in-progress phrase across multiple closed windows. `process_segment`
+now does only diariser + STT + echo check, then merges the new text
+into the accumulator. Translation, TTS and audio output happen in a
+new `flush_phrase` helper that fires on three conditions:
+
+1. **Punctuation reached** — `ends_with_punctuation` matches `.!?;。；`.
+   The natural ending of a sentence.
+2. **Speaker changed** — early-flush the previous speaker's pending
+   text, then start fresh with the new speaker's contribution.
+3. **Hard caps** — `ACCUMULATOR_MAX_HOLD_MS = 3000` (3 s wall-clock)
+   or `ACCUMULATOR_MAX_WORDS = 35`. Protect against monologues that
+   never produce a clean punctuation boundary.
+
+When none of these fire, the new text stays in the accumulator and
+the function logs `V2 STT (held): "..."` for diagnostics; no audio
+is emitted yet. Effective per-sentence latency stays similar for
+short utterances but rises moderately on longer ones — the trade
+the user explicitly asked for ("um pouco mais de delay para fazer
+sentido na frase").
+
+The accumulator is reset on `PipelineCommand::Stop` so leftover
+text doesn't leak across sessions. Each accumulator caches the
+F0 / speaker_id / TCC reference path observed when the speaker last
+contributed, so `flush_phrase` can pick the right voice profile and
+TCC reference without re-querying the diariser.
+
+This is a refinement of the V2 design, not a return to V1 streaming.
+V1 accumulated PER-WORD across the streaming-STT local-agreement
+path; V2 accumulates PER-PHRASE-WINDOW (the whole adaptive segment
+is the unit of merge). No `MIN_WORDS_FOR_PAUSE_FLUSH` heuristics,
+no streaming partial-text logic — just sentence boundary detection.
+
 ## Configuration additions
 
 ```toml

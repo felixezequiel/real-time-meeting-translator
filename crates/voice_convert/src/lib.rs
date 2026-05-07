@@ -52,12 +52,22 @@ struct VcPreloadResponse {
 }
 
 /// Header the bridge emits before the converted PCM. The output sample
-/// rate is fixed at the TCC's native rate (22050 Hz for OpenVoice v2);
-/// the playback resampler in `crates/audio` lifts it to the device rate.
+/// rate is fixed at the TCC's native rate (22050 Hz for OpenVoice v2)
+/// when `converted = true`; the playback resampler in `crates/audio`
+/// lifts it to the device rate. When `converted = false` the bridge
+/// silently fell back to the source audio (TCC failure or skipped
+/// conversion) — the Rust client uses that to count consecutive
+/// failures and disarm TCC after a streak.
 #[derive(Deserialize)]
 struct VcResponseHeader {
     sample_rate: u32,
     num_samples: u32,
+    #[serde(default = "default_true")]
+    converted: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Client for `scripts/voice_convert_bridge.py`. Same architectural
@@ -70,10 +80,20 @@ struct VcResponseHeader {
 /// happens, `dead` flips to true and every subsequent `convert()`
 /// returns the source audio unchanged. The Rust pipeline then plays
 /// raw Kokoro output — no fancy timbre conversion, but no crash.
+/// Number of consecutive `converted=false` responses (i.e. silent
+/// fallbacks from the bridge — OpenVoice preprocessing returning empty
+/// tensors is the canonical failure mode, see logs in 2026-05-07
+/// session) before we mark the bridge dead and stop trying. Spends
+/// ~150 ms each call on the way down to fallback; disabling after
+/// MAX_CONSECUTIVE_FALLBACKS removes that latency tax once it's clear
+/// the bridge can't help.
+const MAX_CONSECUTIVE_FALLBACKS: u32 = 5;
+
 pub struct ToneColorConverter {
     bridge_script_path: PathBuf,
     process: Option<Mutex<VcBridgeProcess>>,
     dead: Arc<AtomicBool>,
+    consecutive_fallbacks: std::sync::atomic::AtomicU32,
 }
 
 struct VcBridgeProcess {
@@ -97,6 +117,7 @@ impl ToneColorConverter {
             bridge_script_path,
             process: None,
             dead: Arc::new(AtomicBool::new(false)),
+            consecutive_fallbacks: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -209,7 +230,7 @@ impl ToneColorConverter {
         let header_json = serde_json::to_string(&header)
             .map_err(|e| VcError::ConversionFailed(e.to_string()))?;
 
-        let result: Result<ConvertedAudio, VcError> = (|| {
+        let result: Result<(ConvertedAudio, bool), VcError> = (|| {
             writeln!(bridge.stdin, "{}", header_json)
                 .map_err(|e| VcError::ConversionFailed(e.to_string()))?;
 
@@ -236,22 +257,43 @@ impl ToneColorConverter {
                 .map_err(|e| VcError::ConversionFailed(format!("PCM read: {}", e)))?;
 
             tracing::debug!(
-                "VC: speaker={} {} samples @ {}Hz → {} samples @ {}Hz",
+                "VC: speaker={} {} samples @ {}Hz → {} samples @ {}Hz (converted={})",
                 speaker_id,
                 source.samples.len(),
                 source.sample_rate,
                 samples.len(),
                 response.sample_rate,
+                response.converted,
             );
 
-            Ok(ConvertedAudio {
+            Ok((ConvertedAudio {
                 samples,
                 sample_rate: response.sample_rate,
-            })
+            }, response.converted))
         })();
 
         match result {
-            Ok(audio) => Ok(Some(audio)),
+            Ok((audio, converted_ok)) => {
+                if converted_ok {
+                    self.consecutive_fallbacks.store(0, Ordering::Release);
+                } else {
+                    let count = self
+                        .consecutive_fallbacks
+                        .fetch_add(1, Ordering::AcqRel)
+                        + 1;
+                    if count >= MAX_CONSECUTIVE_FALLBACKS {
+                        self.dead.store(true, Ordering::Release);
+                        tracing::warn!(
+                            "Voice-convert bridge disabled for the session: \
+                             {} consecutive silent fallbacks (likely \
+                             OpenVoice preprocessing returning empty tensors). \
+                             Pipeline continues with raw TTS output.",
+                            count,
+                        );
+                    }
+                }
+                Ok(Some(audio))
+            }
             Err(e) => {
                 // One bad request kills the bridge for the rest of the
                 // session — pyworld errors and CUDA OOMs leave the

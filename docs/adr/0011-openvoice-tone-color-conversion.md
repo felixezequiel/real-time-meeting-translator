@@ -141,5 +141,34 @@ Components added:
 - HF checkpoint: https://huggingface.co/myshell-ai/OpenVoiceV2
 - Bridge: `scripts/voice_convert_bridge.py`
 - Rust client: `crates/voice_convert/src/lib.rs`
-- Pipeline integration: `crates/pipeline/src/lib.rs`
-  (`VoiceProfileRegistry::ingest_audio`, TTS thread VC call site)
+- Pipeline integration: `crates/pipeline/src/v2.rs::process_segment`
+  (post-TTS, after `VoiceProfileRegistry::reference_for` resolves a
+  reference path).
+
+## Amendment 2026-05-07 — `converted` flag and auto-disable
+
+Field testing surfaced a failure mode in OpenVoice's preprocessing:
+on certain Kokoro+pyworld outputs it raises `ValueError: could not
+broadcast input array from shape (0,) into shape (0,8)` inside its
+internal mel/posterior code, even on healthy multi-second phrases.
+Root cause unidentified (suspect: sample-rate mismatch between
+Kokoro 22.05/24 kHz and TCC's expected rate, or empty F0 contour).
+
+The bridge already swallowed the exception and returned the source
+audio unchanged so the pipeline keeps moving — but Rust had no way
+to tell a real conversion from a silent fallback, so it kept paying
+the ~150 ms round-trip on every phrase even when TCC could never
+help.
+
+The protocol now carries a `converted: bool` field on the response
+header (defaults to `true` for backward compatibility). The Rust
+client counts consecutive `converted=false` responses; after
+`MAX_CONSECUTIVE_FALLBACKS = 5` it flips the bridge to `dead` for
+the rest of the session, so subsequent calls return `None` instantly
+and the pipeline pays zero TCC tax. A V2 pre-call guard
+(`TCC_MIN_DURATION_MS = 500`) also skips the bridge for very short
+phrases that historically triggered the same error.
+
+Reset semantics: a single successful conversion zeroes the failure
+counter, so an intermittent bad input doesn't accumulate towards
+disable.

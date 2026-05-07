@@ -17,6 +17,7 @@
 //! viable even when the user does not want subtitles.
 
 use eframe::egui;
+use tracing;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -85,6 +86,26 @@ impl eframe::App for CombinedApp {
         if self.overlay_enabled {
             self.subtitle.prune_invisible();
             self.subtitle.render(ctx);
+            // Always-on heartbeat indicator so the user can SEE the
+            // window exists even when there are no subtitles yet.
+            // A purely transparent eframe window with no painted UI
+            // is effectively invisible on Windows — without this the
+            // user reasonably reports "the overlay didn't open".
+            egui::Area::new(egui::Id::new("subtitle-heartbeat"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-8.0, 8.0))
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160))
+                        .rounding(egui::Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("● Legenda ativa")
+                                    .color(egui::Color32::from_rgb(120, 220, 120))
+                                    .size(11.0),
+                            );
+                        });
+                });
             ctx.request_repaint_after(OVERLAY_REPAINT_INTERVAL);
         } else {
             // Without an active overlay we still need to wake up
@@ -142,6 +163,11 @@ pub fn spawn_combined(
 ), String> {
     let (show_settings_tx, show_settings_rx) = std_mpsc::channel::<SettingsInit>();
     let (subtitle_tx, subtitle_rx) = std_mpsc::channel::<SubtitleMessage>();
+
+    tracing::info!(
+        "Spawning combined UI (overlay_enabled={})",
+        overlay_enabled,
+    );
 
     let handle = std::thread::Builder::new()
         .name("combined-ui".to_string())
