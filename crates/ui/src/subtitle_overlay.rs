@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 /// One subtitle event delivered to the overlay.
 #[derive(Debug, Clone)]
 pub struct SubtitleMessage {
+    /// Same id across every event of one streamed phrase. The overlay
+    /// updates the existing line in place when it sees a repeat,
+    /// instead of stacking each fragment on top of the previous one.
+    pub phrase_id: u64,
     pub source_text: String,
     pub translated_text: String,
     pub speaker: String,
@@ -42,6 +46,7 @@ const INITIAL_X: f32 = 410.0;
 
 #[derive(Clone)]
 struct DisplayedLine {
+    phrase_id: u64,
     speaker: String,
     text: String,
     arrived_at: Instant,
@@ -83,8 +88,22 @@ impl SubtitleState {
         Self::default()
     }
 
+    /// Ingest one subtitle event. If the most recent line already
+    /// belongs to the same `phrase_id` (i.e. this is another fragment
+    /// of the streaming translation already on screen), update its
+    /// text and refresh the timestamp instead of stacking a new line.
+    /// New `phrase_id` becomes a fresh line at the bottom.
     pub fn push(&mut self, msg: SubtitleMessage) {
+        if let Some(last) = self.lines.back_mut() {
+            if last.phrase_id == msg.phrase_id {
+                last.text = msg.translated_text;
+                last.speaker = msg.speaker;
+                last.arrived_at = Instant::now();
+                return;
+            }
+        }
         self.lines.push_back(DisplayedLine {
+            phrase_id: msg.phrase_id,
             speaker: msg.speaker,
             text: msg.translated_text,
             arrived_at: Instant::now(),
@@ -108,6 +127,20 @@ impl SubtitleState {
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
+                // Whole-panel drag handle: clicking-and-dragging
+                // anywhere on the overlay (including the text and
+                // empty space) repositions the window via winit's
+                // StartDrag. This makes the frameless transparent
+                // window feel like a free-floating widget the user
+                // can move out of their content area at will.
+                let drag_response = ui.interact(
+                    ui.max_rect(),
+                    egui::Id::new("subtitle-overlay-drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag_response.dragged() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
                 ui.set_min_height(WINDOW_HEIGHT);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     for line in self.lines.iter().rev() {
@@ -223,4 +256,66 @@ pub fn spawn_overlay() -> Result<mpsc::Sender<SubtitleMessage>, String> {
         .map_err(|e| format!("Failed to spawn subtitle overlay thread: {}", e))?;
 
     Ok(tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(phrase_id: u64, text: &str) -> SubtitleMessage {
+        SubtitleMessage {
+            phrase_id,
+            source_text: String::new(),
+            translated_text: text.to_string(),
+            speaker: "Speaker".to_string(),
+        }
+    }
+
+    #[test]
+    fn push_replaces_line_when_phrase_id_matches() {
+        let mut state = SubtitleState::new();
+        state.push(msg(1, "Bem-vindo"));
+        state.push(msg(1, "Bem-vindo ao primeiro"));
+        state.push(msg(1, "Bem-vindo ao primeiro episódio"));
+        // Three streaming fragments of the SAME phrase must collapse
+        // to ONE line on screen — not stack three growing copies on
+        // top of each other.
+        assert_eq!(state.lines.len(), 1);
+        assert_eq!(state.lines[0].text, "Bem-vindo ao primeiro episódio");
+    }
+
+    #[test]
+    fn push_starts_new_line_when_phrase_id_changes() {
+        let mut state = SubtitleState::new();
+        state.push(msg(1, "Primeira frase."));
+        state.push(msg(2, "Segunda frase."));
+        assert_eq!(state.lines.len(), 2);
+        assert_eq!(state.lines[0].text, "Primeira frase.");
+        assert_eq!(state.lines[1].text, "Segunda frase.");
+    }
+
+    #[test]
+    fn push_caps_total_lines_to_max_visible() {
+        let mut state = SubtitleState::new();
+        for id in 1..=10 {
+            state.push(msg(id, &format!("Phrase {}", id)));
+        }
+        assert_eq!(state.lines.len(), MAX_VISIBLE_LINES);
+        // Oldest evict first — most recent IDs survive.
+        assert_eq!(state.lines.back().unwrap().text, "Phrase 10");
+    }
+
+    #[test]
+    fn push_refreshes_arrived_at_on_update() {
+        // The replace path must reset the timestamp so the line
+        // doesn't fade out mid-stream while fresh fragments are
+        // still being delivered.
+        let mut state = SubtitleState::new();
+        state.push(msg(7, "first chunk"));
+        let initial_ts = state.lines[0].arrived_at;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        state.push(msg(7, "first chunk + more"));
+        let updated_ts = state.lines[0].arrived_at;
+        assert!(updated_ts > initial_ts);
+    }
 }

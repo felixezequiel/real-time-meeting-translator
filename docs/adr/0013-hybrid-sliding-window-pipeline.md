@@ -314,6 +314,115 @@ path; V2 accumulates PER-PHRASE-WINDOW (the whole adaptive segment
 is the unit of merge). No `MIN_WORDS_FOR_PAUSE_FLUSH` heuristics,
 no streaming partial-text logic — just sentence boundary detection.
 
+## Amendment 2026-05-07 — Streaming translation in `flush_phrase`
+
+Once the accumulator restored translation coherence, the natural
+next bottleneck became time-to-first-audio (TTFA). Atomic translate
++ atomic TTS per phrase meant the listener heard nothing for
+~translate (300–500 ms) + ~tts (600–1500 ms) = ~900–2000 ms after
+the speaker stopped, even when the rest of the pipeline ran fast.
+
+`flush_phrase` now uses `OpusMtTranslator::translate_stream` (already
+exposed by the translation bridge — used to be V1's streaming path
+under ADR 0009, dormant after the V1 cleanup). The translator emits
+one `TranslationFragment` per commit-eligible clause boundary
+(comma, period, semicolon). Per fragment we:
+
+1. **Update the subtitle channel** with the cumulative text — UI
+   reflects translation progress at clause granularity.
+2. **Synthesise + dispatch THIS fragment alone** through TTS and
+   `audio_output`. The mixer's per-source FIFO buffer naturally
+   serialises consecutive fragments into a single playback line,
+   while later fragments are still being generated.
+3. **Apply TCC** via `apply_tcc_if_eligible` (extracted helper) —
+   the `TCC_MIN_DURATION_MS = 500` guard skips the bridge for very
+   short fragments that historically tripped OpenVoice
+   preprocessing (see ADR 0011 amendment).
+
+Quality is preserved because the LLM **sees the full phrase at
+once** — the accumulator delivers the complete sentence as a single
+prompt. Streaming only changes when output starts flowing back; the
+underlying decoder context is unchanged.
+
+The `translate_first_fragment` metric was added to the metrics
+aggregator so the operator can verify the win in the settings panel:
+typical value should drop from ~translate-full-time to ~50–150 ms.
+
+Trade-off: the post-stream `is_translation_degenerate` check now
+runs *after* the audio has already played. If the translator
+produces a degenerate output, the bad audio leaked. Mitigation:
+Qwen at temperature 0.0 + few-shot prompt rarely produces
+degenerate output for normal input; when it does, we still suppress
+the echo-buffer record so the bad text doesn't pollute future echo
+detection. Acceptable cost for the TTFA improvement.
+
+## Amendment 2026-05-07 — Internal sentence splitting in the accumulator
+
+Field logs revealed a 9-second TTFA spike on multi-sentence speech
+like *"I'd love to tell you what my goal is of this conversation.
+Go for it. So we have"*. The accumulator only flushed when the
+ENTIRE buffer ended in punctuation, so a buffer with two complete
+sentences plus an open trailing fragment held all three until the
+fragment finally closed.
+
+The accumulator now uses `split_complete_sentences(text) →
+(complete, remaining)`. After every ingest:
+- Pull all sentences from the front that end in `.!?;` followed by
+  whitespace or EOL — those flush immediately.
+- Keep the trailing in-progress fragment in the accumulator with a
+  fresh `started_at` so MAX_HOLD applies to the fragment alone.
+- If no complete sentences exist but a hard cap fires (`aged_out`
+  or `long_enough`), the whole buffer flushes anyway.
+
+Boundary rule guards against false positives: periods inside
+acronyms ("U.S.A is") or numbers ("3.14") are NOT boundaries
+because the next byte is alphanumeric, not whitespace. Byte-level
+scan is UTF-8-safe — Portuguese accents on the *next* word don't
+trip it because the byte right after the period is the ASCII space.
+
+Multi-sentence flush behaviour: a single ingest can now produce
+TWO flushes (early on speaker change, then main on internal
+boundary), and `process_segment` already handled multiple flush
+returns from the lock-scoped block.
+
+Seven unit tests in `v2.rs::tests::split_*` lock the boundary
+behaviour, including the acronym false-positive case and the
+Portuguese-accent UTF-8 case.
+
+## Amendment 2026-05-07 — Subtitle `phrase_id` and draggable overlay
+
+Two related UX issues from the streaming subtitle path:
+
+**Stacking.** The streaming translator emits N `SubtitleEvent`s per
+phrase (one per clause boundary), each carrying the cumulative
+translation so far. The overlay was `push`ing every event as a new
+line, so a 3-clause phrase produced 3 stacked lines — overflowing
+the visible area.
+
+**Fix.** `SubtitleEvent` and `SubtitleMessage` carry a `phrase_id:
+u64` generated once per `flush_phrase` invocation (atomic counter
+in `v2.rs::PHRASE_ID_COUNTER`). `SubtitleState::push` now updates
+the most recent line in place when the new event's `phrase_id`
+matches; it only opens a new line when the id changes. Streaming
+within one phrase becomes a single growing line; new phrase = new
+line at the bottom.
+
+**Fixed-position window.** The overlay was created with
+`decorations(false)` so the user couldn't drag it. Field complaint:
+the overlay sometimes covered the speaker's slides.
+
+**Fix.** `SubtitleState::render` allocates an interaction area
+covering the central panel with `Sense::click_and_drag()`. On
+drag, it issues `ctx.send_viewport_cmd(ViewportCommand::StartDrag)`
+which delegates window movement to winit. The user can now grab
+the overlay anywhere (text, empty space, heartbeat indicator) and
+move it to any screen position.
+
+Tests in `subtitle_overlay::tests::push_*` cover the new
+update-in-place semantics, including the cap on visible lines and
+the timestamp refresh on update so a streaming phrase doesn't fade
+out mid-flow.
+
 ## Configuration additions
 
 ```toml

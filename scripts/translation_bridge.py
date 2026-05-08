@@ -135,24 +135,23 @@ def split_commit_point(buffer: str) -> int:
 
 # ─── Prompt: translation engine, no chatter ─────────────────────────────────
 
-SYSTEM_PROMPT = """You are a simultaneous interpreter. Output ONLY the translation, nothing else.
+SYSTEM_PROMPT = """You are a professional simultaneous interpreter (the kind a TV news channel hires for live political speeches). Output ONLY the translation, nothing else.
+
+Your job is NOT literal word-by-word translation. It is to convey what the speaker MEANS in fluent {target}, the way a human interpreter would in real time — concisely, naturally, without the filler.
 
 Rules:
-1. Translate the user input from {source} to {target}.
-2. Preserve the original MEANING above all else — if a literal word-for-word
-   translation would distort the sense, prefer a natural equivalent. The
-   listener understands neither the source language nor your reasoning,
-   only the final {target} text.
-3. NEVER add commentary, explanations, or conversational responses.
-4. Words already in the target language (technical terms, proper nouns) — keep them as-is.
-5. Numbers, code identifiers, version strings — keep verbatim.
-6. Single-word inputs — translate as a fragment, do not expand into a sentence.
-7. Empty or noise input — output an empty string.
-8. Idioms — translate to the natural equivalent in the target language.
-9. Sentence-fragment inputs (a clause without a finished thought) — translate
-   the fragment as-is; do not invent words to "complete" it.
-10. Do not omit, summarize, or paraphrase. Every content word must be
-    represented in the output.
+1. Translate from {source} to {target}.
+2. **Preserve meaning, not words.** Drop filler words and verbal tics that carry no meaning ("uh", "um", "you know", "like", "I mean", "tipo", "sabe", "né", "é tipo"). The listener doesn't need them.
+3. **Collapse repetition.** "yeah yeah yeah" → "sim". "no, no, wait wait" → "espera". "I I I think" → "Acho que".
+4. **Compress disfluencies.** Restarts ("we should — we should do") and self-corrections ("the meeting, I mean, the call") become clean output that says the final intended thought.
+5. **Be concise.** A verbose 15-word source with filler can legitimately become a clean 8-word translation. Real interpreters do this constantly. Do not invent content, but do trim what adds no information.
+6. **Match the register.** Casual stays casual; formal stays formal. Don't elevate sloppy speech to polished prose, and don't dumb down formal speech.
+7. **Keep proper nouns and brand names verbatim** — names of people, companies, products, show titles ("Huge Conversations", "Apple Vision Pro", "Snapchat").
+8. **Keep technical jargon when already in the target language** (deploy, commit, pull request, headset, holograms).
+9. **Numbers, code identifiers, version strings** — verbatim.
+10. **Sentence fragments** — translate the fragment as-is, do not invent words to complete it.
+11. **Empty or noise input** — output an empty string.
+12. NEVER add commentary, explanations, or conversational responses. Output is ONLY the translation.
 """
 
 LANG_NAMES = {"en": "English", "pt": "Portuguese (Brazilian)"}
@@ -199,6 +198,48 @@ FEWSHOT = [
     ("which is exactly why we built the system this way",
      "que é exatamente por isso que construímos o sistema dessa forma",
      "en", "pt"),
+
+    # ─── Interpreter-style compression (added 2026-05-07) ───────────────────
+    # The prompt now asks the model to drop fillers, collapse
+    # repetition, and trim disfluencies the way a live interpreter
+    # would. These few-shots demonstrate the behaviour with realistic
+    # casual speech taken from podcast transcripts. Without these
+    # examples, a 1.5B model will default to literal word-for-word
+    # output even with the verbal instruction.
+
+    # EN -> PT: filler removal
+    ("So, uh, yeah, I think, like, what we should do is, you know, just go ahead.",
+     "Acho que devemos seguir em frente.", "en", "pt"),
+    ("It's, uh, it's really nice to, you know, finally meet you in person.",
+     "É um prazer finalmente te conhecer pessoalmente.", "en", "pt"),
+    # EN -> PT: repetition collapse
+    ("yeah yeah yeah, totally, yeah, sure, no problem at all.",
+     "Claro, sem problemas.", "en", "pt"),
+    ("Welcome, welcome to the first, the very first episode of our new series.",
+     "Bem-vindo ao primeiro episódio da nossa nova série.", "en", "pt"),
+    # EN -> PT: self-correction / restart
+    ("I I I think we — we should — we should wait a bit longer.",
+     "Acho que devemos esperar mais um pouco.", "en", "pt"),
+    ("The meeting, I mean, the call — the call starts at three.",
+     "A call começa às três.", "en", "pt"),
+    # EN -> PT: the show-name / proper-noun case the user reported
+    ("Welcome to the first episode of our new series, Huge Conversations.",
+     "Bem-vindo ao primeiro episódio da nossa nova série, Huge Conversations.",
+     "en", "pt"),
+    ("Good to meet you. Yeah, looking forward to it.",
+     "Prazer em te conhecer. Estou ansioso por isso.", "en", "pt"),
+
+    # PT -> EN: filler removal
+    ("Tipo, eu acho que, sabe, a gente devia, tipo, fazer isso assim mesmo.",
+     "I think we should do it this way.", "pt", "en"),
+    ("É, é, com certeza, sim, sim, sem problema.",
+     "Sure, no problem.", "pt", "en"),
+    # PT -> EN: self-correction
+    ("A reunião, quer dizer, a chamada — a chamada é às três.",
+     "The call is at three.", "pt", "en"),
+    # PT -> EN: "né" / "tipo" tics
+    ("Então, né, eu queria, tipo, falar sobre, sabe, esse projeto novo.",
+     "I wanted to talk about this new project.", "pt", "en"),
 ]
 
 

@@ -220,6 +220,7 @@ async fn run_application(mut config: PipelineConfig) -> Result<()> {
                     .spawn(move || {
                         while let Ok(event) = event_rx.recv() {
                             let msg = SubtitleMessage {
+                                phrase_id: event.phrase_id,
                                 source_text: event.source_text,
                                 translated_text: event.translated_text,
                                 speaker: event.pipeline_name,

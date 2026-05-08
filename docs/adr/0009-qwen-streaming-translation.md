@@ -157,3 +157,59 @@ The previous CTranslate2 + NLLB stack is preserved in git history
 `crates/translation/src/lib.rs`, plus the install/requirements
 changes. `OpusMtTranslator` typedef means downstream callers don't
 change either way.
+
+## Amendment 2026-05-07 — Streaming reactivated post-V2
+
+When ADR 0013 cleaned up V1, `translate_stream` temporarily lost
+its only caller and `OpusMtTranslator::translate` (atomic) became
+the V2 default. Field testing then showed TTFA was the dominant
+"perceived delay" axis — translate-full-then-tts-full cost
+~900-2000 ms before the listener heard anything. ADR 0013's
+streaming-flush amendment puts `translate_stream` back into the
+hot path inside `SpeakerPipelineV2::flush_phrase`, dispatching TTS
+per clause fragment as it arrives. The mechanism described in this
+ADR is unchanged — bridge protocol, `split_commit_point` logic,
+`TranslationFragment` type, all stay. Only the *consumer* moved
+from V1's streaming-STT pipeline to V2's accumulator-driven phrase
+flush.
+
+## Amendment 2026-05-07 — Interpreter-style compression in the prompt
+
+Listening to V2 output revealed a quality ceiling that wasn't a
+model capability problem — Qwen 1.5B was *faithfully* doing what
+the original prompt asked, which was literal translation
+("Do not omit, summarize, or paraphrase. Every content word must
+be represented in the output."). Field examples like
+*"yeah yeah yeah, looking forward to it"* came out as
+*"sim sim sim, espero muito"* — 1:1 with the source, including the
+verbal tics and stutters. Real human interpreters drop those.
+
+`SYSTEM_PROMPT` and `FEWSHOT` in `scripts/translation_bridge.py`
+were rewritten to frame the model as a *professional simultaneous
+interpreter* (the TV-news kind that does live political speeches).
+The new rules explicitly authorise dropping fillers ("uh", "um",
+"you know", "tipo", "sabe", "né"), collapsing repetition
+("yeah yeah yeah" → "sim"), compressing disfluencies and self-
+corrections, and being concise without inventing content. Register
+matching is preserved (casual stays casual). Proper nouns / brand
+names / technical jargon in the target language stay verbatim — so
+"Huge Conversations" stops becoming "Conversas Grandes".
+
+Twelve new few-shot examples demonstrate the behaviour, taken from
+real transcripts the user shipped (Apple Vision Pro podcast,
+"Huge Conversations" announcement). At 1.5B parameters the verbal
+prompt alone is not enough — Qwen needs the pattern in-context.
+
+Side benefit: shorter outputs mean less work for downstream Kokoro
+TTS, so the streaming pipeline naturally gets faster too. Estimated
+compression ratio on filler-heavy spoken English: 1.3–1.7×.
+
+Risks (acknowledged):
+- Aggressive compression could drop nuance the speaker intended.
+  `temperature=0.0` plus the "preserve meaning" rule (#2) is the
+  guardrail; field-validate.
+- Behaviour is prompt-engineering, not a hard constraint. A
+  smaller model could ignore the rules in edge cases. If quality
+  regresses, revert this commit and Qwen returns to literal mode.
+- No automated test — interpreter quality is by definition
+  subjective. The validation loop is "user listens, reports back".

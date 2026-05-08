@@ -32,8 +32,20 @@ use tts::{PiperTts, VoiceProfile};
 use voice_convert::ToneColorConverter;
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
+
+/// Monotonically-increasing id for each phrase the pipeline ships
+/// to the subtitle overlay. The streaming translator emits multiple
+/// `SubtitleEvent`s per phrase (one per clause boundary) — they all
+/// share the same `phrase_id` so the UI can update a single line
+/// in place instead of stacking N copies of the growing text.
+static PHRASE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_phrase_id() -> u64 {
+    PHRASE_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// How long the accumulator may hold a not-yet-final phrase before
 /// forcing a flush. Bounds the worst-case wait when a speaker never
@@ -62,11 +74,50 @@ struct Accumulator {
     pending_reference_path: Option<String>,
 }
 
-fn ends_with_punctuation(text: &str) -> bool {
-    matches!(
-        text.trim().chars().last(),
-        Some('.' | '!' | '?' | ';' | '。' | '；'),
-    )
+/// Pull all complete sentences from the front of `text`, leaving any
+/// in-progress trailing fragment in the second return value. Used by
+/// the accumulator so a buffer like *"sentence one. sentence two. open"*
+/// flushes the first two sentences IMMEDIATELY instead of waiting for
+/// the trailing fragment to finally close — without this the listener
+/// can wait 6+ s for a single sentence's audio.
+///
+/// Boundary rule: ASCII sentence-ending punctuation (`.!?;`) followed
+/// by whitespace, or by end-of-string. Periods inside acronyms or
+/// numbers ("U.S.A", "3.14") are NOT boundaries because the next byte
+/// is alphanumeric, not whitespace. Safe on UTF-8 because we only
+/// index by single-byte ASCII positions.
+fn split_complete_sentences(text: &str) -> (String, String) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return (String::new(), String::new());
+    }
+    let bytes = trimmed.as_bytes();
+    let mut last_boundary: Option<usize> = None;
+    for i in 0..bytes.len() {
+        if !matches!(bytes[i], b'.' | b'!' | b'?' | b';') {
+            continue;
+        }
+        let next = i + 1;
+        let is_boundary = match bytes.get(next) {
+            None => true,
+            Some(b) if b.is_ascii_whitespace() => true,
+            // Run of consecutive punctuation ("?!", "..."): keep
+            // scanning, the LATER position wins.
+            Some(b) if matches!(*b, b'.' | b'!' | b'?' | b';') => false,
+            _ => false,
+        };
+        if is_boundary {
+            last_boundary = Some(next);
+        }
+    }
+    match last_boundary {
+        Some(idx) => {
+            let complete = trimmed[..idx].trim().to_string();
+            let rest = trimmed[idx..].trim_start().to_string();
+            (complete, rest)
+        }
+        None => (String::new(), trimmed.to_string()),
+    }
 }
 
 use crate::{is_echo, is_translation_degenerate, record_translation, EchoBuffer, VoiceProfileRegistry};
@@ -126,6 +177,11 @@ pub struct SpeakerPipelineV2 {
 
 #[derive(Debug, Clone)]
 pub struct SubtitleEvent {
+    /// All events emitted within a single flushed phrase share the
+    /// same `phrase_id` — the UI replaces (rather than stacks) the
+    /// existing line when it sees the same id. New phrases get a
+    /// fresh id and become a new line in the overlay.
+    pub phrase_id: u64,
     pub pipeline_name: String,
     pub source_text: String,
     pub translated_text: String,
@@ -486,9 +542,42 @@ fn process_segment(
             .pending_started_at
             .map(|t| now.duration_since(t).as_millis() > ACCUMULATOR_MAX_HOLD_MS)
             .unwrap_or(false);
-        let punct = ends_with_punctuation(&acc.pending_text);
         let long_enough = acc.pending_text.split_whitespace().count() >= ACCUMULATOR_MAX_WORDS;
-        let main = if aged_out || punct || long_enough {
+
+        // Try to peel off any complete sentences that have already
+        // accumulated, leaving the still-in-progress trailing
+        // fragment in `acc.pending_text`. This is the win that
+        // dropped TTFA dramatically on multi-sentence speech: e.g.
+        // a buffer like "Sentence one. Sentence two. fragment"
+        // flushes the first two sentences NOW instead of waiting
+        // until the final fragment finally closes (which in field
+        // logs took 6+ s).
+        let (complete, remaining) = split_complete_sentences(&acc.pending_text);
+
+        let main = if !complete.is_empty() {
+            let snapshot = (
+                complete,
+                acc.pending_speaker_id,
+                acc.pending_f0_hz,
+                acc.pending_reference_path.clone(),
+            );
+            acc.pending_text = remaining;
+            if acc.pending_text.is_empty() {
+                acc.pending_speaker_id = None;
+                acc.pending_started_at = None;
+                acc.pending_f0_hz = 0.0;
+                acc.pending_reference_path = None;
+            } else {
+                // Trailing fragment continues — keep speaker/F0/ref
+                // but reset the started_at clock so MAX_HOLD applies
+                // to the fragment alone, not to the original phrase.
+                acc.pending_started_at = Some(now);
+            }
+            Some(snapshot)
+        } else if aged_out || long_enough {
+            // No complete sentences but a hard cap fired — flush
+            // whatever we have so the listener doesn't wait
+            // forever on a comma-less monologue.
             let drained = std::mem::take(&mut acc.pending_text);
             let snapshot = (
                 drained,
@@ -551,6 +640,11 @@ fn process_segment(
     ));
 }
 
+/// Streaming-friendly minimum TTS duration before TCC is invoked.
+/// OpenVoice preprocessing fails on very short audio (< 500 ms),
+/// so we skip TCC for those fragments and play raw Kokoro instead.
+const TCC_MIN_DURATION_MS: u64 = 500;
+
 #[allow(clippy::too_many_arguments)]
 fn flush_phrase(
     pipeline_name: &str,
@@ -574,53 +668,24 @@ fn flush_phrase(
     }
 
     let segment = TextSegment::new(trimmed.to_string(), source_language);
-
-    let translate_start = Instant::now();
-    let translated = match translator.translate(&segment) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("[{}] V2 translation failed: {}", pipeline_name, e);
-            return;
-        }
+    let target_language = match source_language {
+        Language::English => Language::Portuguese,
+        Language::Portuguese => Language::English,
     };
-    let _ = metrics_tx.try_send(PipelineMetrics::new(
-        "translate".to_string(),
-        translate_start.elapsed(),
-    ));
 
-    let translated_text = translated.text.trim();
-    if translated_text.is_empty() {
-        return;
-    }
-    if is_translation_degenerate(trimmed, translated_text) {
-        tracing::info!(
-            "[{}] V2 degenerate translation dropped: \"{}\" → \"{}\"",
-            pipeline_name,
-            preview(trimmed, 40),
-            preview(translated_text, 40),
-        );
-        return;
-    }
+    // ─── Streaming translation + per-fragment TTS dispatch ────────────
+    // The translator emits one TranslationFragment per commit-eligible
+    // clause (comma, period, semicolon). We synthesise each clause as
+    // soon as it lands and push it into the playback mixer — so TTS
+    // for clause A starts playing while the translator is still
+    // generating clause B. This drops time-to-first-audio from
+    // ~translate_full + tts_full (~900-1500 ms) to ~first_token +
+    // first_clause_tts (~300-500 ms), which is the metric the user
+    // perceives as "delay".
+    let translate_start = Instant::now();
+    let mut full_translation = String::new();
+    let mut first_fragment_seen = false;
 
-    record_translation(echo_buffer, translated_text);
-
-    if let Some(tx) = subtitle_tx {
-        let _ = tx.send(SubtitleEvent {
-            pipeline_name: pipeline_name.to_string(),
-            source_text: trimmed.to_string(),
-            translated_text: translated_text.to_string(),
-            language: translated.language,
-            timestamp: Instant::now(),
-        });
-    }
-
-    tracing::info!(
-        "[{}] V2 → \"{}\"",
-        pipeline_name,
-        preview(translated_text, 80),
-    );
-
-    let tts_start = Instant::now();
     let voice_profile = match speaker_id {
         Some(id) => VoiceProfile {
             target_f0_hz,
@@ -629,52 +694,151 @@ fn flush_phrase(
         },
         None => VoiceProfile::default(),
     };
-    let tts_audio = match tts.synthesize(&translated, voice_profile) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!("[{}] V2 TTS failed: {}", pipeline_name, e);
+
+    // One id per flushed phrase. All streaming subtitle events
+    // emitted by this call share it so the overlay updates a
+    // single line in place instead of stacking N copies of the
+    // text growing fragment-by-fragment.
+    let phrase_id = next_phrase_id();
+
+    let stream_result = translator.translate_stream(&segment, |fragment| {
+        let frag_text = fragment.text.trim();
+        if frag_text.is_empty() && !fragment.is_final {
             return;
+        }
+
+        if !fragment.is_final {
+            if !full_translation.is_empty() && !full_translation.ends_with(' ') {
+                full_translation.push(' ');
+            }
+            full_translation.push_str(&fragment.text);
+            if !first_fragment_seen {
+                let _ = metrics_tx.try_send(PipelineMetrics::new(
+                    "translate_first_fragment".to_string(),
+                    translate_start.elapsed(),
+                ));
+                first_fragment_seen = true;
+            }
+        }
+
+        // Live subtitle update — UI reflects accumulated translation
+        // even before the full sentence finishes. Same phrase_id
+        // every fragment → overlay replaces the line in place.
+        if let Some(tx) = subtitle_tx {
+            let _ = tx.send(SubtitleEvent {
+                phrase_id,
+                pipeline_name: pipeline_name.to_string(),
+                source_text: trimmed.to_string(),
+                translated_text: full_translation.trim().to_string(),
+                language: target_language,
+                timestamp: Instant::now(),
+            });
+        }
+
+        // Synthesise + dispatch THIS fragment alone.
+        if !fragment.is_final && !frag_text.is_empty() {
+            let frag_segment =
+                TextSegment::new(frag_text.to_string(), target_language);
+            let tts_start = Instant::now();
+            match tts.synthesize(&frag_segment, voice_profile.clone()) {
+                Ok(audio) => {
+                    let _ = metrics_tx.try_send(PipelineMetrics::new(
+                        "tts".to_string(),
+                        tts_start.elapsed(),
+                    ));
+                    let final_audio = apply_tcc_if_eligible(
+                        pipeline_name,
+                        audio,
+                        speaker_id,
+                        reference_path.as_deref(),
+                        voice_convert,
+                        metrics_tx,
+                    );
+                    let _ = audio_output.send(final_audio);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[{}] V2 TTS fragment failed: {}",
+                        pipeline_name, e,
+                    );
+                }
+            }
+        }
+    });
+
+    if let Err(e) = stream_result {
+        tracing::warn!(
+            "[{}] V2 streaming translation failed: {}",
+            pipeline_name, e,
+        );
+        return;
+    }
+
+    let _ = metrics_tx.try_send(PipelineMetrics::new(
+        "translate".to_string(),
+        translate_start.elapsed(),
+    ));
+
+    let final_translation = full_translation.trim();
+    if final_translation.is_empty() {
+        return;
+    }
+
+    // Degenerate check runs AFTER the stream because we want the full
+    // translated text. By this point the audio already played, so
+    // dropping is too late — the check now only suppresses the echo
+    // record so the bad text doesn't pollute the buffer.
+    if is_translation_degenerate(trimmed, final_translation) {
+        tracing::info!(
+            "[{}] V2 degenerate translation (post-stream): \"{}\" → \"{}\"",
+            pipeline_name,
+            preview(trimmed, 40),
+            preview(final_translation, 40),
+        );
+        return;
+    }
+
+    record_translation(echo_buffer, final_translation);
+
+    tracing::info!(
+        "[{}] V2 → \"{}\"",
+        pipeline_name,
+        preview(final_translation, 80),
+    );
+}
+
+fn apply_tcc_if_eligible(
+    pipeline_name: &str,
+    tts_audio: AudioChunk,
+    speaker_id: Option<u32>,
+    reference_path: Option<&str>,
+    voice_convert: Option<&Arc<ToneColorConverter>>,
+    metrics_tx: &mpsc::Sender<PipelineMetrics>,
+) -> AudioChunk {
+    let tts_duration_ms =
+        (tts_audio.samples.len() as u64 * 1000) / tts_audio.sample_rate.max(1) as u64;
+    if tts_duration_ms < TCC_MIN_DURATION_MS {
+        return tts_audio;
+    }
+    let (vc, reference) = match (voice_convert, reference_path) {
+        (Some(vc), Some(reference)) => (vc, reference),
+        _ => return tts_audio,
+    };
+    let vc_start = Instant::now();
+    let speaker_for_tcc = speaker_id.unwrap_or(0);
+    let converted = match vc.convert(&tts_audio, reference, speaker_for_tcc) {
+        Ok(Some(c)) => Some(AudioChunk::new(c.samples, c.sample_rate, 1)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("[{}] V2 voice convert failed: {}", pipeline_name, e);
+            None
         }
     };
     let _ = metrics_tx.try_send(PipelineMetrics::new(
-        "tts".to_string(),
-        tts_start.elapsed(),
+        "voice_convert".to_string(),
+        vc_start.elapsed(),
     ));
-
-    const TCC_MIN_DURATION_MS: u64 = 500;
-    let tts_duration_ms =
-        (tts_audio.samples.len() as u64 * 1000) / tts_audio.sample_rate.max(1) as u64;
-    let speaker_for_tcc = speaker_id.unwrap_or(0);
-    let final_audio = match (voice_convert, reference_path.as_deref()) {
-        (Some(vc), Some(reference)) if tts_duration_ms >= TCC_MIN_DURATION_MS => {
-            let vc_start = Instant::now();
-            let converted = match vc.convert(&tts_audio, reference, speaker_for_tcc) {
-                Ok(Some(c)) => Some(AudioChunk::new(c.samples, c.sample_rate, 1)),
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::warn!("[{}] V2 voice convert failed: {}", pipeline_name, e);
-                    None
-                }
-            };
-            let _ = metrics_tx.try_send(PipelineMetrics::new(
-                "voice_convert".to_string(),
-                vc_start.elapsed(),
-            ));
-            converted.unwrap_or(tts_audio)
-        }
-        (Some(_), Some(_)) => {
-            tracing::debug!(
-                "[{}] V2 TCC skipped: phrase too short ({}ms < {}ms)",
-                pipeline_name,
-                tts_duration_ms,
-                TCC_MIN_DURATION_MS,
-            );
-            tts_audio
-        }
-        _ => tts_audio,
-    };
-
-    let _ = audio_output.send(final_audio);
+    converted.unwrap_or(tts_audio)
 }
 
 fn rms(samples: &[f32]) -> f32 {
@@ -701,34 +865,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ends_with_punctuation_recognises_standard_marks() {
-        assert!(ends_with_punctuation("Hello world."));
-        assert!(ends_with_punctuation("Are you sure?"));
-        assert!(ends_with_punctuation("Wait!"));
-        assert!(ends_with_punctuation("First item;"));
-    }
-
-    #[test]
-    fn ends_with_punctuation_handles_trailing_whitespace() {
-        assert!(ends_with_punctuation("Hello world.   "));
-        assert!(ends_with_punctuation("\nDone.\n"));
-    }
-
-    #[test]
-    fn ends_with_punctuation_returns_false_on_open_clauses() {
-        assert!(!ends_with_punctuation("the market has been"));
-        assert!(!ends_with_punctuation("we're getting started"));
-        assert!(!ends_with_punctuation(""));
-    }
-
-    #[test]
-    fn ends_with_punctuation_handles_portuguese_accents() {
-        // Trailing 'á' must NOT confuse byte-vs-char logic.
-        assert!(!ends_with_punctuation("você está"));
-        assert!(ends_with_punctuation("você está aqui."));
-    }
-
-    #[test]
     fn preview_clamps_by_chars_not_bytes() {
         // 'á' is 2 bytes; "fala você" is 9 chars / 10 bytes.
         let s = "fala você está aqui";
@@ -740,5 +876,65 @@ mod tests {
     #[test]
     fn preview_returns_full_string_when_shorter_than_limit() {
         assert_eq!(preview("oi", 80), "oi");
+    }
+
+    #[test]
+    fn split_extracts_single_complete_sentence() {
+        let (complete, rest) = split_complete_sentences("Hello world.");
+        assert_eq!(complete, "Hello world.");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn split_keeps_fragment_when_no_punctuation() {
+        let (complete, rest) = split_complete_sentences("Hello world");
+        assert_eq!(complete, "");
+        assert_eq!(rest, "Hello world");
+    }
+
+    #[test]
+    fn split_separates_complete_from_in_progress() {
+        // The bug from 2026-05-07 logs: "Sentence one. Sentence two. fragment"
+        // used to be held entirely until "fragment" got punctuation.
+        let (complete, rest) =
+            split_complete_sentences("First done. Second done. open clause");
+        assert_eq!(complete, "First done. Second done.");
+        assert_eq!(rest, "open clause");
+    }
+
+    #[test]
+    fn split_handles_multiple_complete_sentences_no_remainder() {
+        let (complete, rest) = split_complete_sentences("Yes. No. Maybe!");
+        assert_eq!(complete, "Yes. No. Maybe!");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn split_does_not_break_on_acronyms() {
+        // "U.S.A. is" — the periods inside U.S.A are not sentence
+        // boundaries (next byte is letter, not whitespace). Only the
+        // final period before " is" qualifies.
+        let (complete, rest) = split_complete_sentences("U.S.A. is great");
+        assert_eq!(complete, "U.S.A.");
+        assert_eq!(rest, "is great");
+    }
+
+    #[test]
+    fn split_handles_question_and_exclamation() {
+        let (complete, rest) =
+            split_complete_sentences("Are you sure? Yes! we are. starting now");
+        assert_eq!(complete, "Are you sure? Yes! we are.");
+        assert_eq!(rest, "starting now");
+    }
+
+    #[test]
+    fn split_handles_portuguese_accents() {
+        // The text after the period has multi-byte chars — the byte-
+        // based scan must not panic and must still find the boundary
+        // because the byte right after the period IS an ASCII space.
+        let (complete, rest) =
+            split_complete_sentences("Você está aqui. À tarde começa");
+        assert_eq!(complete, "Você está aqui.");
+        assert_eq!(rest, "À tarde começa");
     }
 }
