@@ -141,6 +141,17 @@ pub struct PipelineConfig {
     #[serde(default = "default_tts_engine")]
     pub tts_engine: String,
 
+    /// ADR 0015 — enable streaming STT inside the open phrase window.
+    /// Default false (V2 phrase-aligned only). When true, partial
+    /// Whisper passes run every ~400 ms while the phrase is open and
+    /// commit stable words (LA-2) into the accumulator before the
+    /// window closes. Drops TTFA from ~1.8 s to ~0.6-1.2 s in the
+    /// common case, at the cost of ~3-4× more Whisper inference per
+    /// phrase. Voice consistency for partial-flushed audio falls back
+    /// to the default voice (diariser only runs on the closed window).
+    #[serde(default)]
+    pub streaming_stt: bool,
+
     // NOTE: Earlier versions had `speaker_voice_reference_wav` and
     // `mic_voice_reference_wav` fields used by CosyVoice's zero-shot
     // cloning path. Those are gone now — voice differentiation comes
@@ -171,6 +182,7 @@ impl Default for PipelineConfig {
             phrase_min_window_ms: DEFAULT_PHRASE_MIN_WINDOW_MS,
             subtitle_overlay: false,
             tts_engine: DEFAULT_TTS_ENGINE.to_string(),
+            streaming_stt: false,
         }
     }
 }

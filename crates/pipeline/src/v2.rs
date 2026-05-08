@@ -24,7 +24,7 @@ use audio::phrase_segmenter::{PhraseSegmenter, PhraseSegmenterConfig};
 use audio::SileroVad;
 use diarization::OnlineDiarizer;
 use shared::{AudioChunk, Language, PipelineCommand, PipelineMetrics};
-use stt::WhisperStt;
+use stt::{StreamingSession, WhisperStt};
 use tokio::sync::mpsc;
 use tracing;
 use translation::OpusMtTranslator;
@@ -215,6 +215,11 @@ pub struct SpeakerPipelineV2 {
     /// Uses `std::sync::mpsc` because the send happens inside
     /// `spawn_blocking` (no async context).
     pub subtitle_tx: Option<std_mpsc::Sender<SubtitleEvent>>,
+    /// ADR 0015 — when true, partial Whisper passes run inside the
+    /// open phrase window and commit stable LA-2 prefixes into the
+    /// accumulator before the window closes. Default false to match
+    /// pre-streaming behaviour.
+    pub streaming_stt_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +258,7 @@ impl SpeakerPipelineV2 {
             fixed_voice_reference: None,
             config: V2Config::default(),
             subtitle_tx: None,
+            streaming_stt_enabled: false,
         }
     }
 
@@ -289,6 +295,16 @@ impl SpeakerPipelineV2 {
         self
     }
 
+    /// Enable ADR 0015 streaming STT. When set, partial Whisper passes
+    /// run periodically while the phrase window is open and commit
+    /// stable LA-2 prefixes into the accumulator before the window
+    /// closes. Trades ~3-4× more Whisper inference per phrase for a
+    /// big TTFA win.
+    pub fn with_streaming_stt(mut self, enabled: bool) -> Self {
+        self.streaming_stt_enabled = enabled;
+        self
+    }
+
     pub async fn run(
         self,
         mut audio_input: mpsc::UnboundedReceiver<AudioChunk>,
@@ -319,16 +335,30 @@ impl SpeakerPipelineV2 {
         // "frase cortada no meio" quality regression that came from
         // shrinking silence_tail to 280 ms for latency.
         let accumulator = Arc::new(Mutex::new(Accumulator::default()));
+        // ADR 0015 — optional streaming session. When present, partial
+        // Whisper passes run periodically while the phrase window is
+        // open and commit stable LA-2 prefixes into the accumulator
+        // before the window closes.
+        let streaming_session: Option<Arc<Mutex<StreamingSession>>> =
+            if self.streaming_stt_enabled {
+                Some(Arc::new(Mutex::new(StreamingSession::new(
+                    Arc::clone(&self.stt),
+                    self.source_language,
+                ))))
+            } else {
+                None
+            };
         let mut is_running = false;
 
         tracing::info!(
-            "[{}] V2 ready (max_window={:?}, silence_tail={:?}, min_window={:?}, diariser={}, vc={})",
+            "[{}] V2 ready (max_window={:?}, silence_tail={:?}, min_window={:?}, diariser={}, vc={}, streaming_stt={})",
             pipeline_name,
             self.config.max_window,
             self.config.silence_tail,
             self.config.min_window,
             self.diarizer.is_some(),
             self.voice_convert.is_some(),
+            streaming_session.is_some(),
         );
 
         loop {
@@ -346,6 +376,9 @@ impl SpeakerPipelineV2 {
                                 v.reset_state();
                             }
                             let _ = segmenter.flush();
+                            if let Some(ss) = streaming_session.as_ref() {
+                                ss.lock().expect("streaming session lock").reset();
+                            }
                         }
                         Some(PipelineCommand::Stop) => {
                             tracing::info!("[{}] V2 pipeline stopped", pipeline_name);
@@ -353,6 +386,9 @@ impl SpeakerPipelineV2 {
                             let _ = segmenter.flush();
                             if let Ok(mut acc) = accumulator.lock() {
                                 *acc = Accumulator::default();
+                            }
+                            if let Some(ss) = streaming_session.as_ref() {
+                                ss.lock().expect("streaming session lock").reset();
                             }
                         }
                         None => return,
@@ -394,19 +430,20 @@ impl SpeakerPipelineV2 {
                         let diarizer = self.diarizer.clone();
                         let voice_profiles = Arc::clone(&voice_profiles);
                         let echo_buffer = Arc::clone(&self.echo_buffer);
-                        let audio_output = audio_output.clone();
-                        let metrics_tx = metrics_tx.clone();
-                        let pipeline_name = pipeline_name.clone();
+                        let audio_output_clone = audio_output.clone();
+                        let metrics_tx_clone = metrics_tx.clone();
+                        let pipeline_name_clone = pipeline_name.clone();
                         let source_language = self.source_language;
                         let fixed_voice_reference = self.fixed_voice_reference.clone();
                         let subtitle_tx = self.subtitle_tx.clone();
                         let segment_samples = segment.samples;
                         let segment_sample_rate = segment.sample_rate;
-                        let accumulator = Arc::clone(&accumulator);
+                        let accumulator_clone = Arc::clone(&accumulator);
+                        let streaming_for_segment = streaming_session.clone();
 
                         tokio::task::spawn_blocking(move || {
                             process_segment(
-                                pipeline_name,
+                                pipeline_name_clone,
                                 segment_samples,
                                 segment_sample_rate,
                                 stt,
@@ -418,10 +455,60 @@ impl SpeakerPipelineV2 {
                                 echo_buffer,
                                 source_language,
                                 fixed_voice_reference,
-                                audio_output,
-                                metrics_tx,
+                                audio_output_clone,
+                                metrics_tx_clone,
                                 subtitle_tx,
-                                accumulator,
+                                accumulator_clone,
+                                streaming_for_segment,
+                            );
+                        });
+                    } else if let Some(ss) = streaming_session.as_ref() {
+                        // ADR 0015 — phrase still open. Schedule a
+                        // partial pass on the in-progress buffer if
+                        // there's enough audio. The session's internal
+                        // throttle (`PARTIAL_INTERVAL_MS`) and minimum
+                        // length gate (`MIN_PARTIAL_SECONDS`) make this
+                        // a no-op when called too frequently, so we can
+                        // dispatch on every chunk safely. The Mutex
+                        // around the session also serialises with the
+                        // close-time `finalize` call, so a chunk
+                        // arriving exactly as the window closes can't
+                        // race against the finalize.
+                        if !segmenter.is_phrase_open() {
+                            continue;
+                        }
+                        let open_buffer = segmenter.peek_open_buffer().to_vec();
+                        if open_buffer.is_empty() {
+                            continue;
+                        }
+                        let session = Arc::clone(ss);
+                        let translator = Arc::clone(&self.translator);
+                        let tts_engine = Arc::clone(&self.tts);
+                        let voice_convert = self.voice_convert.clone();
+                        let echo_buffer = Arc::clone(&self.echo_buffer);
+                        let audio_output_clone = audio_output.clone();
+                        let metrics_tx_clone = metrics_tx.clone();
+                        let pipeline_name_clone = pipeline_name.clone();
+                        let source_language = self.source_language;
+                        let fixed_voice_reference = self.fixed_voice_reference.clone();
+                        let subtitle_tx = self.subtitle_tx.clone();
+                        let accumulator_clone = Arc::clone(&accumulator);
+
+                        tokio::task::spawn_blocking(move || {
+                            process_streaming_partial(
+                                pipeline_name_clone,
+                                open_buffer,
+                                session,
+                                translator,
+                                tts_engine,
+                                voice_convert,
+                                echo_buffer,
+                                source_language,
+                                fixed_voice_reference,
+                                audio_output_clone,
+                                metrics_tx_clone,
+                                subtitle_tx,
+                                accumulator_clone,
                             );
                         });
                     }
@@ -449,6 +536,13 @@ fn process_segment(
     metrics_tx: mpsc::Sender<PipelineMetrics>,
     subtitle_tx: Option<std_mpsc::Sender<SubtitleEvent>>,
     accumulator: Arc<Mutex<Accumulator>>,
+    // ADR 0015 — when present, partial Whisper passes already
+    // committed some words during the open phrase. We call
+    // `finalize(final_text)` on close to compute the suffix that
+    // hadn't been emitted yet, and only push that suffix into the
+    // accumulator. None means streaming was disabled for this
+    // pipeline; the full transcribed text is pushed.
+    streaming_session: Option<Arc<Mutex<StreamingSession>>>,
 ) {
     let total_start = Instant::now();
 
@@ -485,7 +579,7 @@ fn process_segment(
 
     let chunk = AudioChunk::new(samples, sample_rate, 1);
 
-    // ─── STT ──────────────────────────────────────────────────────────
+    // ─── STT (final pass on the closed segment) ───────────────────────
     let stt_start = Instant::now();
     let transcribed = match stt.transcribe(&chunk, source_language) {
         Ok(t) => t,
@@ -499,7 +593,54 @@ fn process_segment(
         stt_start.elapsed(),
     ));
 
-    let source_text = transcribed.text.trim();
+    let full_text = transcribed.text.trim().to_string();
+    if full_text.is_empty() {
+        // Even on empty STT, give the streaming session a chance to
+        // reset its per-phrase state — otherwise the next phrase's
+        // first partial would compute LA against this phrase's
+        // history.
+        if let Some(ss) = streaming_session.as_ref() {
+            ss.lock().expect("streaming session lock").reset();
+        }
+        return;
+    }
+
+    // ─── Streaming reconciliation ─────────────────────────────────────
+    // When streaming was active, words were already pushed to the
+    // accumulator during the open window. The closed-segment
+    // transcribe is the authoritative read; finalize() gives us the
+    // suffix that wasn't yet committed (and a flag if the streaming
+    // commit diverged from what the final pass produces). We keep the
+    // streaming commit regardless — audio already played — and feed
+    // only the suffix downstream.
+    let source_text: String = match streaming_session.as_ref() {
+        Some(ss) => {
+            let finalised = ss.lock().expect("streaming session lock").finalize(&full_text);
+            if finalised.committed_diverged {
+                tracing::info!(
+                    "[{}] V2 streaming finalize: committed prefix diverged from final transcribe — keeping committed audio (suffix={} words)",
+                    pipeline_name,
+                    finalised.uncommitted_suffix.len(),
+                );
+            }
+            if finalised.uncommitted_suffix.is_empty() {
+                // Nothing left to push — streaming committed
+                // everything. Skip the rest, but still emit total.
+                tracing::debug!(
+                    "[{}] V2 streaming: all words already committed, no suffix to push",
+                    pipeline_name,
+                );
+                let _ = metrics_tx.try_send(PipelineMetrics::new(
+                    "total".to_string(),
+                    total_start.elapsed(),
+                ));
+                return;
+            }
+            finalised.uncommitted_suffix.join(" ")
+        }
+        None => full_text,
+    };
+    let source_text = source_text.trim();
     if source_text.is_empty() {
         return;
     }
@@ -519,13 +660,6 @@ fn process_segment(
         preview(source_text, 80),
     );
 
-    // ─── Update accumulator and decide what to flush ─────────────────
-    // The accumulator holds a sentence-in-progress across multiple
-    // closed phrase windows. We translate + TTS only when we hit a
-    // real sentence boundary (punctuation), the speaker changes, the
-    // text grows past a hard cap, or it has been held longer than
-    // ACCUMULATOR_MAX_HOLD_MS.
-    let now = Instant::now();
     let resolved_reference = fixed_voice_reference
         .clone()
         .or_else(|| speaker_id.and_then(|id| voice_profiles.reference_for(id)));
@@ -534,11 +668,134 @@ fn process_segment(
         None => 0.0,
     };
 
-    // Up to two flushes can come out of a single ingest:
-    //   1. an "early flush" when the speaker changed and we have a
-    //      pending phrase from the previous speaker;
-    //   2. a "main flush" when the (possibly extended) accumulator
-    //      now ends in punctuation, has aged out, or is long enough.
+    ingest_text_and_maybe_flush(
+        &pipeline_name,
+        source_text,
+        speaker_id,
+        f0_for_tts,
+        resolved_reference,
+        source_language,
+        &translator,
+        &tts,
+        voice_convert.as_ref(),
+        &echo_buffer,
+        &audio_output,
+        &metrics_tx,
+        subtitle_tx.as_ref(),
+        &accumulator,
+    );
+
+    let _ = metrics_tx.try_send(PipelineMetrics::new(
+        "total".to_string(),
+        total_start.elapsed(),
+    ));
+}
+
+/// ADR 0015 — process a single streaming partial pass while a phrase
+/// window is still open. Runs `StreamingSession::run_partial` on the
+/// open buffer; if LA-2 newly-committed any words, joins them and
+/// pushes through `ingest_text_and_maybe_flush`. The accumulator's
+/// existing flush rules (punctuation, soft-flush, force-flush) decide
+/// whether to actually translate + TTS now or keep buffering.
+///
+/// Skips the diariser and echo check that the closed-segment path
+/// runs — partials don't have a stable speaker_id yet (diariser runs
+/// per closed window in V2), and echo detection needs the full
+/// closed-segment audio. The voice profile falls back to whatever
+/// `fixed_voice_reference` provides (mic side has the user's profile;
+/// loopback side may be `None` and TTS uses the engine default).
+#[allow(clippy::too_many_arguments)]
+fn process_streaming_partial(
+    pipeline_name: String,
+    open_buffer: Vec<f32>,
+    streaming_session: Arc<Mutex<StreamingSession>>,
+    translator: Arc<OpusMtTranslator>,
+    tts: Arc<PiperTts>,
+    voice_convert: Option<Arc<ToneColorConverter>>,
+    echo_buffer: EchoBuffer,
+    source_language: Language,
+    fixed_voice_reference: Option<String>,
+    audio_output: mpsc::UnboundedSender<AudioChunk>,
+    metrics_tx: mpsc::Sender<PipelineMetrics>,
+    subtitle_tx: Option<std_mpsc::Sender<SubtitleEvent>>,
+    accumulator: Arc<Mutex<Accumulator>>,
+) {
+    let partial_start = Instant::now();
+    let new_words = {
+        let mut session = streaming_session.lock().expect("streaming session lock");
+        session.run_partial(&open_buffer)
+    };
+    let _ = metrics_tx.try_send(PipelineMetrics::new(
+        "streaming_partial".to_string(),
+        partial_start.elapsed(),
+    ));
+    if new_words.is_empty() {
+        return;
+    }
+
+    let source_text = new_words.join(" ");
+    let source_text = source_text.trim();
+    if source_text.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        "[{}] V2 streaming committed: \"{}\"",
+        pipeline_name,
+        preview(source_text, 80),
+    );
+
+    ingest_text_and_maybe_flush(
+        &pipeline_name,
+        source_text,
+        None,
+        0.0,
+        fixed_voice_reference,
+        source_language,
+        &translator,
+        &tts,
+        voice_convert.as_ref(),
+        &echo_buffer,
+        &audio_output,
+        &metrics_tx,
+        subtitle_tx.as_ref(),
+        &accumulator,
+    );
+}
+
+/// Push `source_text` into the per-pipeline accumulator and decide
+/// whether any portion of it should flush now (translate + TTS) or
+/// keep waiting. Shared by the closed-segment path
+/// (`process_segment`) and the streaming-partial path
+/// (`process_streaming_partial`). The accumulator's flush rules
+/// (punctuation, soft-flush, MAX_HOLD, MAX_WORDS, speaker change)
+/// are invariant across both callers.
+///
+/// Up to two flushes can fire from a single ingest:
+///   1. **Early flush** when the speaker changed and the previous
+///      speaker had pending text — that text releases first, with
+///      the previous speaker's voice profile.
+///   2. **Main flush** when the (possibly extended) accumulator now
+///      ends in punctuation, has aged past hard caps, or hit the
+///      soft-flush threshold.
+#[allow(clippy::too_many_arguments)]
+fn ingest_text_and_maybe_flush(
+    pipeline_name: &str,
+    source_text: &str,
+    speaker_id: Option<u32>,
+    f0_for_tts: f32,
+    resolved_reference: Option<String>,
+    source_language: Language,
+    translator: &OpusMtTranslator,
+    tts: &PiperTts,
+    voice_convert: Option<&Arc<ToneColorConverter>>,
+    echo_buffer: &EchoBuffer,
+    audio_output: &mpsc::UnboundedSender<AudioChunk>,
+    metrics_tx: &mpsc::Sender<PipelineMetrics>,
+    subtitle_tx: Option<&std_mpsc::Sender<SubtitleEvent>>,
+    accumulator: &Arc<Mutex<Accumulator>>,
+) {
+    let now = Instant::now();
     let (early_flush, main_flush) = {
         let mut acc = accumulator.lock().expect("accumulator poisoned");
         let speaker_changed = matches!(
@@ -587,14 +844,6 @@ fn process_segment(
         let pending_word_count = acc.pending_text.split_whitespace().count();
         let force_flush = should_force_flush(pending_word_count, pending_age_ms);
 
-        // Try to peel off any complete sentences that have already
-        // accumulated, leaving the still-in-progress trailing
-        // fragment in `acc.pending_text`. This is the win that
-        // dropped TTFA dramatically on multi-sentence speech: e.g.
-        // a buffer like "Sentence one. Sentence two. fragment"
-        // flushes the first two sentences NOW instead of waiting
-        // until the final fragment finally closes (which in field
-        // logs took 6+ s).
         let (complete, remaining) = split_complete_sentences(&acc.pending_text);
 
         let main = if !complete.is_empty() {
@@ -611,17 +860,10 @@ fn process_segment(
                 acc.pending_f0_hz = 0.0;
                 acc.pending_reference_path = None;
             } else {
-                // Trailing fragment continues — keep speaker/F0/ref
-                // but reset the started_at clock so MAX_HOLD applies
-                // to the fragment alone, not to the original phrase.
                 acc.pending_started_at = Some(now);
             }
             Some(snapshot)
         } else if force_flush {
-            // No complete sentences but a force-flush trigger fired
-            // (soft-flush at 6 words / 800 ms, MAX_WORDS, or
-            // MAX_HOLD). Drain the accumulator so the listener
-            // doesn't wait forever on a comma-less utterance.
             let drained = std::mem::take(&mut acc.pending_text);
             let snapshot = (
                 drained,
@@ -641,47 +883,49 @@ fn process_segment(
         (early, main)
     };
 
-    // The phrase wasn't closed — log STT progress and bail without
-    // translating. The text stays in the accumulator for the next
-    // segment to extend.
     if early_flush.is_none() && main_flush.is_none() {
         tracing::info!(
-            "[{}] V2 STT (held): \"{}\"",
+            "[{}] V2 held: \"{}\"",
             pipeline_name,
             preview(source_text, 80),
         );
-        let _ = metrics_tx.try_send(PipelineMetrics::new(
-            "total".to_string(),
-            total_start.elapsed(),
-        ));
         return;
     }
 
     if let Some((text, sid, f0, reference)) = early_flush {
         flush_phrase(
-            &pipeline_name, &text, sid, f0, reference,
+            pipeline_name,
+            &text,
+            sid,
+            f0,
+            reference,
             source_language,
-            &translator, &tts, voice_convert.as_ref(),
-            &echo_buffer,
-            &audio_output, &metrics_tx,
-            subtitle_tx.as_ref(),
+            translator,
+            tts,
+            voice_convert,
+            echo_buffer,
+            audio_output,
+            metrics_tx,
+            subtitle_tx,
         );
     }
     if let Some((text, sid, f0, reference)) = main_flush {
         flush_phrase(
-            &pipeline_name, &text, sid, f0, reference,
+            pipeline_name,
+            &text,
+            sid,
+            f0,
+            reference,
             source_language,
-            &translator, &tts, voice_convert.as_ref(),
-            &echo_buffer,
-            &audio_output, &metrics_tx,
-            subtitle_tx.as_ref(),
+            translator,
+            tts,
+            voice_convert,
+            echo_buffer,
+            audio_output,
+            metrics_tx,
+            subtitle_tx,
         );
     }
-
-    let _ = metrics_tx.try_send(PipelineMetrics::new(
-        "total".to_string(),
-        total_start.elapsed(),
-    ));
 }
 
 /// Streaming-friendly minimum TTS duration before TCC is invoked.

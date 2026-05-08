@@ -709,6 +709,7 @@ async fn start_pipelines(
         if let Some(tx) = subtitle_event_tx.as_ref() {
             pipeline = pipeline.with_subtitle_channel(tx.clone());
         }
+        pipeline = pipeline.with_streaming_stt(config.streaming_stt);
         tokio::spawn(async move {
             pipeline.run(audio_rx, out_tx, cmd_rx, metrics_tx).await;
         });
@@ -794,6 +795,7 @@ async fn start_pipelines(
     if let Some(tx) = subtitle_event_tx.as_ref() {
         mic_pipeline = mic_pipeline.with_subtitle_channel(tx.clone());
     }
+    mic_pipeline = mic_pipeline.with_streaming_stt(config.streaming_stt);
     tokio::spawn(async move {
         mic_pipeline.run(mic_audio_rx, mic_out_tx, mic_cmd_rx, mic_metrics_tx).await;
     });

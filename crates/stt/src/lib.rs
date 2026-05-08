@@ -7,9 +7,16 @@ use tracing;
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
-// streaming local-agreement (ADR 0004) was superseded by V2 in
-// ADR 0013 Phase 3.4 cleanup. WhisperStt::transcribe is now the only
-// entry point — V2 calls it once per closed phrase window.
+// V1 streaming local-agreement (ADR 0004) was superseded by V2 in
+// ADR 0013 Phase 3.4 cleanup. ADR 0015 reintroduces streaming under a
+// different shape: partial Whisper passes inside the V2 phrase window
+// with word-level Local Agreement-N. See `streaming` module below.
+pub mod streaming;
+pub use streaming::{
+    longest_stable_prefix, FinalisedPhrase, StreamingSession,
+    LOCAL_AGREEMENT_N, MIN_PARTIAL_SECONDS, PARTIAL_INTERVAL_MS,
+    WHISPER_SAMPLE_RATE,
+};
 
 #[derive(Debug, Error)]
 pub enum SttError {

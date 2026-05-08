@@ -91,6 +91,29 @@ impl PhraseSegmenter {
         self.min_window_samples
     }
 
+    /// Non-destructive view into the buffer currently being accumulated.
+    /// Used by `StreamingSession` (ADR 0015) to run partial Whisper
+    /// passes on the open phrase WITHOUT consuming the audio — the
+    /// segmenter retains ownership and continues to grow the buffer
+    /// until the natural close conditions fire.
+    ///
+    /// Returns an empty slice when no phrase is currently open (no
+    /// speech has started, or the previous phrase already closed).
+    pub fn peek_open_buffer(&self) -> &[f32] {
+        if !self.in_speech {
+            return &[];
+        }
+        &self.buffer
+    }
+
+    /// Whether a phrase window is currently open. The streaming session
+    /// uses this to decide whether to schedule a partial pass; calling
+    /// `peek_open_buffer` and checking emptiness is equivalent but this
+    /// avoids the slice allocation and reads better at the call site.
+    pub fn is_phrase_open(&self) -> bool {
+        self.in_speech && !self.buffer.is_empty()
+    }
+
     /// Feed one slice of audio plus its speech classification.
     /// Returns `Some(segment)` when this ingest closed a window.
     pub fn ingest(&mut self, samples: &[f32], is_speech: bool) -> Option<PhraseSegment> {
@@ -274,6 +297,47 @@ mod tests {
             .expect("post-reset close");
         assert_eq!(next.samples.len(), samples_for_ms(700));
         assert_eq!(next.speech_samples, samples_for_ms(500));
+    }
+
+    // ─── peek_open_buffer / is_phrase_open (ADR 0015 streaming hook) ────────
+
+    #[test]
+    fn peek_open_buffer_empty_before_speech() {
+        let seg = PhraseSegmenter::new(SR, quick_config());
+        assert!(seg.peek_open_buffer().is_empty());
+        assert!(!seg.is_phrase_open());
+    }
+
+    #[test]
+    fn peek_open_buffer_returns_accumulating_audio() {
+        let mut seg = PhraseSegmenter::new(SR, quick_config());
+        seg.ingest(&signal(samples_for_ms(300), 0.1), true);
+        assert!(seg.is_phrase_open());
+        assert_eq!(seg.peek_open_buffer().len(), samples_for_ms(300));
+    }
+
+    #[test]
+    fn peek_open_buffer_grows_across_chunks() {
+        let mut seg = PhraseSegmenter::new(SR, quick_config());
+        seg.ingest(&signal(samples_for_ms(200), 0.1), true);
+        let after_first = seg.peek_open_buffer().len();
+        seg.ingest(&signal(samples_for_ms(200), 0.1), true);
+        let after_second = seg.peek_open_buffer().len();
+        assert_eq!(after_first, samples_for_ms(200));
+        assert_eq!(after_second, samples_for_ms(400));
+    }
+
+    #[test]
+    fn peek_open_buffer_empty_after_close() {
+        let mut seg = PhraseSegmenter::new(SR, quick_config());
+        seg.ingest(&signal(samples_for_ms(400), 0.1), true);
+        let _ = seg
+            .ingest(&signal(samples_for_ms(200), 0.0), false)
+            .expect("phrase closes");
+        // After close, the streaming session should see an empty
+        // buffer until the next phrase begins.
+        assert!(seg.peek_open_buffer().is_empty());
+        assert!(!seg.is_phrase_open());
     }
 
     #[test]

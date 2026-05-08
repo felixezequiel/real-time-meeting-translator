@@ -262,19 +262,25 @@ def synthesize_kokoro(
     `language` here is the Rust-wire code; we translate to Kokoro's
     `lang` parameter which uses the `en-us` / `pt-br` long form.
 
-    `speed=1.20` because Portuguese translations are reliably 15-30%
-    longer (in spoken duration) than the English source. 1.15 was the
-    first attempt; the playback queue still grew over sustained
-    monologue (10+ s of continuous talking). 1.20 keeps queue depth
-    under the 6-second drop-at-ingress threshold even during long
-    explanatory passages and still sounds natural — not perceptibly
-    rushed for an interpreter-style translation.
+    `speed=1.30` because Portuguese translations are reliably 15-30%
+    longer (in spoken duration) than the English source. 1.15 / 1.20
+    were earlier attempts; field testing 2026-05-08 showed audio still
+    drifting several seconds behind real time during sustained
+    speech ("vejo a legenda mas só ouço vários segundos depois"),
+    because the streaming-translate pipeline naturally queues a TTS
+    fragment per clause and PT renders them slower than the speaker
+    produces source. 1.30 puts PT playback at roughly the same
+    wall-clock duration as the EN source — the queue stops growing
+    during monologue. Voice quality stays acceptable up to ~1.40 in
+    Kokoro; at 1.30 it sounds like a brisk interpreter, which is the
+    target register anyway. Walk back to 1.25 if listeners report it
+    sounds rushed.
     """
     lang = LANG_TO_KOKORO.get(language, "en-us")
     samples, sample_rate = kokoro.create(
         text,
         voice=voice,
-        speed=1.20,
+        speed=1.30,
         lang=lang,
     )
     samples = np.asarray(samples, dtype=np.float32)

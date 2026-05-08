@@ -1,6 +1,6 @@
 # ADR 0015 — Streaming STT inside the V2 phrase window (LocalAgreement-2)
 
-- **Status:** Proposed (drafted 2026-05-08; implementation pending)
+- **Status:** Accepted — Implementation landed 2026-05-08 (PRs 2-4 from the rollout below; PR 5 field-validate and PR 6 default-flip pending user testing).
 - **Date:** 2026-05-08
 - **Deciders:** felix
 - **Related:** ADR 0004 (superseded streaming STT), ADR 0013 (V2 hybrid pipeline), ADR 0009 (Qwen streaming translation), ADR 0008 (Silero VAD)
@@ -234,6 +234,57 @@ Set `streaming_stt = false` in `config.toml`. The V2 phrase-aligned
 path remains available throughout the rollout. After the default
 flip, rollback is reverting the default-flip PR; the implementation
 stays alive behind the flag.
+
+## Implementation notes (2026-05-08)
+
+### What landed
+
+- **`crates/stt/src/streaming.rs`** — `StreamingSession`, pure
+  `longest_stable_prefix(partials, n)` LA-N function (12 unit tests),
+  `FinalisedPhrase` struct for reconciliation, throttle constants.
+  `StreamingSession::run_partial(open_buffer)` returns newly-committed
+  words; `finalize(final_text)` returns the suffix not yet committed
+  plus a `committed_diverged` flag for diagnostics.
+- **`crates/audio/src/phrase_segmenter.rs`** — non-destructive
+  `peek_open_buffer()` and `is_phrase_open()` accessors. 4 new tests.
+- **`crates/pipeline/src/v2.rs`** — `streaming_stt_enabled` field +
+  `with_streaming_stt(bool)` builder. The audio-loop chunk handler now
+  has two branches: closed segment → `process_segment` (existing path,
+  now takes optional `Arc<Mutex<StreamingSession>>` and uses
+  `finalize` when present); open phrase + streaming enabled →
+  `process_streaming_partial` (new function). Shared accumulator-and-
+  flush logic extracted into `ingest_text_and_maybe_flush` so both
+  paths use identical commit rules.
+- **`crates/shared/src/config.rs`** — new `streaming_stt: bool`
+  config field, default `false`.
+- **`src/main.rs`** — Speaker and Mic pipelines both call
+  `.with_streaming_stt(config.streaming_stt)`.
+
+### Caveats from the first implementation
+
+- **Voice consistency on streaming flushes.** Diariser only runs on
+  closed windows in V2 (per ADR 0013), so words committed by partial
+  passes flush with `speaker_id = None`. Fallback voice plays until
+  the closed-segment finalize updates `voice_profiles`. Acceptable
+  for the latency win; revisit if listeners report jarring voice
+  mid-phrase.
+- **Echo check skipped on streaming partials.** The closed-segment
+  path still runs `is_echo`; partial-committed words don't. If
+  partial commits happen to be echo, the audio plays once before the
+  finalize+echo check could have caught it. Rare in practice
+  (echoes are usually full phrases, not partial fragments).
+- **Stale-partial races are safe but wasteful.** A `spawn_blocking`
+  partial task scheduled before a phrase close may actually run
+  after `finalize` reset the session. LA-2 needs 2 partials; the
+  stale one becomes the only partial in a fresh history and
+  contributes nothing. Cost: one wasted Whisper call. Cleanup
+  not warranted.
+
+### How to enable for field testing
+
+Set `streaming_stt = true` in `config.toml`. No other configuration
+changes; the flag is read at startup and applies to both Speaker
+and Mic pipelines.
 
 ## Open questions (resolve during step 2-4)
 
