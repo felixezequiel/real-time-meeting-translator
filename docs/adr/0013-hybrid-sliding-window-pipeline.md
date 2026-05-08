@@ -423,6 +423,57 @@ update-in-place semantics, including the cap on visible lines and
 the timestamp refresh on update so a streaming phrase doesn't fade
 out mid-flow.
 
+## Amendment 2026-05-08 — Latency-first accumulator (TTFA cut)
+
+Field testing with the V2 + streaming-translate stack revealed that
+the dominant TTFA contributor on **everyday spoken speech** was the
+accumulator's wait-for-punctuation rule, not the STT/translate/TTS
+chain. Whisper rarely emits commas mid-utterance, so a typical
+sentence sat in the accumulator until either a period arrived or
+`ACCUMULATOR_MAX_HOLD_MS = 3000` fired. The user reported end-to-end
+delay of 3-4 s on most phrases against a target of ≤ 3 s
+(ideally ≤ 2 s).
+
+Two changes, both in `crates/pipeline/src/v2.rs`:
+
+1. **`ACCUMULATOR_MAX_HOLD_MS`: 3000 → 1200 ms.** Halved-and-then-
+   some. The 3 s ceiling existed when the only force-flush was the
+   ceiling itself; with the new soft-flush below, the ceiling is
+   reached in pathological cases only (very short utterances that
+   never hit the 6-word soft trigger), so it can sit much lower.
+2. **New soft-flush rule.** `should_force_flush(word_count, age_ms)`
+   pure helper now releases the buffer when:
+   - `word_count ≥ 6` AND `age_ms ≥ 800 ms` — soft trigger, the
+     common case ("we should refactor this module" without a period
+     no longer waits any longer than necessary), OR
+   - `word_count ≥ 35` (`ACCUMULATOR_MAX_WORDS`) — comma-less
+     monologue, OR
+   - `age_ms > 1200 ms` (`ACCUMULATOR_MAX_HOLD_MS`) — hard ceiling.
+
+The decision is extracted into a pure function so its branches are
+unit-tested in isolation (`force_flush_*` tests in `v2.rs::tests`).
+Seven new tests cover: hold below thresholds, soft trigger, age
+ceiling, word ceiling, both thresholds met. The expected-end-to-end
+budget after this amendment:
+
+```
+silence_tail 280  + STT 250  + accum_max  1200  + translate 200  + TTS 250  ≈ 2180 ms (worst case)
+silence_tail 280  + STT 250  + accum_soft  800  + translate 200  + TTS 250  ≈ 1780 ms (common case)
+silence_tail 280  + STT 250  + accum         0  + translate 200  + TTS 250  ≈  980 ms (sentence-final hit)
+```
+
+Trade-off: clauses that rely on the next word for disambiguation
+("não vou —" without the rest) may flush before they're complete.
+The interpreter-style prompt (ADR 0009 amendments) handles the
+short-context case gracefully because it's already trained to drop
+filler and trim self-corrections; a half-clause becomes a clean
+half-thought rather than gibberish. Field-validate.
+
+This amendment does **not** rule out further TTFA work — ADR 0015
+captures the streaming-STT migration that brings the worst case
+under 1.2 s. The accumulator tuning is the cheap win that gets us
+to "<3 s consistent" without an architectural change.
+
 ## Configuration additions
 
 ```toml

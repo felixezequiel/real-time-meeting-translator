@@ -458,7 +458,15 @@ fn spawn_ingester(
                 // each chunk there is an arbitrary slice of an ongoing
                 // recording, and fading every slice chops the waveform
                 // ~3-5 times per second, audible as a loose-cable effect.
-                if boundary == ChunkBoundary::PhraseAligned {
+                //
+                // Mid-phrase fragments of a streaming TTS utterance
+                // (XTTS `inference_stream`) ALSO skip the envelope:
+                // they're consecutive slices of one synthesised
+                // utterance, so the same "loose cable" artefact would
+                // apply between adjacent fragments of the same word.
+                let envelope_eligible = boundary == ChunkBoundary::PhraseAligned
+                    && !chunk.is_streaming_chunk;
+                if envelope_eligible {
                     let fade_frames =
                         (chunk.sample_rate as u64 * CHUNK_FADE_MS / 1000) as usize;
                     apply_chunk_envelope(

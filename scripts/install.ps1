@@ -682,6 +682,46 @@ function Install-KokoroModel {
     }
 }
 
+function Install-XttsModel {
+    # XTTS-v2 zero-shot voice cloning — alternative TTS engine to
+    # Kokoro+TCC (ADR 0014). ~1.8 GB total (model + config + vocab +
+    # speakers cache). Only downloaded if `tts_engine = "xtts"` is
+    # ever set in config.toml; this step is idempotent and safe to
+    # run repeatedly.
+    Write-Step "XTTS-v2 Model (voice cloning TTS)"
+
+    $xttsDir = Join-Path $ModelsDir "xtts_v2"
+    if (-not (Test-Path $xttsDir)) {
+        New-Item -Path $xttsDir -ItemType Directory -Force | Out-Null
+    }
+
+    $base = "https://huggingface.co/coqui/XTTS-v2/resolve/main"
+    $files = @(
+        @{ name = "config.json";       url = "$base/config.json" }
+        @{ name = "vocab.json";        url = "$base/vocab.json" }
+        @{ name = "model.pth";         url = "$base/model.pth" }
+        @{ name = "speakers_xtts.pth"; url = "$base/speakers_xtts.pth" }
+        @{ name = "hash.md5";          url = "$base/hash.md5" }
+    )
+
+    foreach ($file in $files) {
+        $localPath = Join-Path $xttsDir $file.name
+        if (Test-Path $localPath) {
+            $size = [math]::Round((Get-Item $localPath).Length / 1MB, 1)
+            Write-Ok "$($file.name) already downloaded (${size} MB)"
+            continue
+        }
+        Write-Host "  Downloading $($file.name)..." -ForegroundColor Gray
+        try {
+            Invoke-WebRequest -Uri $file.url -OutFile $localPath -UseBasicParsing
+            $size = [math]::Round((Get-Item $localPath).Length / 1MB, 1)
+            Write-Ok "$($file.name) (${size} MB)"
+        } catch {
+            Write-Fail "Could not download $($file.name) : $_"
+        }
+    }
+}
+
 function Install-LlmModel {
     # Qwen 2.5 1.5B Instruct, Q4_K_M GGUF — local LLM for streaming
     # translation. ~1 GB on disk, ~1 GB VRAM. Replaces NLLB CT2.
@@ -1330,6 +1370,7 @@ Install-PythonDeps -PythonExe $pythonExe
 Install-WhisperModel
 Install-LlmModel
 Install-KokoroModel
+Install-XttsModel
 Install-DiarizationModel -PythonExe $pythonExe
 Install-SeparationModel -PythonExe $pythonExe
 Install-OpenVoice -PythonExe $pythonExe

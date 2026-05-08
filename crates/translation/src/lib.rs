@@ -58,7 +58,6 @@ pub struct TranslationFragment {
 pub struct LlmTranslator {
     bridge_script_path: PathBuf,
     process: Option<Mutex<BridgeProcess>>,
-    direction: TranslationDirection,
 }
 
 struct BridgeProcess {
@@ -72,25 +71,36 @@ struct BridgeProcess {
 pub type OpusMtTranslator = LlmTranslator;
 
 impl LlmTranslator {
-    pub fn new(bridge_script_path: PathBuf, direction: TranslationDirection) -> Self {
+    /// Construct the translator. The `_direction` parameter is kept
+    /// on the constructor for API stability (existing callers pass
+    /// it), but it is NO LONGER stored — translate / translate_stream
+    /// take the direction per call instead, so a single bridge
+    /// process serves both EN→PT and PT→EN. This collapse from two
+    /// instances to one was load-bearing on a 6 GB GPU: each Qwen
+    /// 1.5B Q4 instance held ~1 GB of VRAM, and combined with two
+    /// XTTS instances earlier the GPU saturated and produced
+    /// silent NaN-laced output (see ADR 0014 amendment 2026-05-08
+    /// for the parallel collapse on the TTS side).
+    pub fn new(bridge_script_path: PathBuf, _direction: TranslationDirection) -> Self {
         Self {
             bridge_script_path,
             process: None,
-            direction,
         }
     }
 
-    /// Atomic translation — buffers every fragment until the stream
-    /// finishes and returns the concatenated result. Kept for callers
-    /// that don't care about streaming (e.g. unit tests, debug tools).
+    /// Atomic translation. The target language is derived from
+    /// `segment.language` — translating from EN goes to PT and vice
+    /// versa. Buffers every fragment until the stream finishes and
+    /// returns the concatenated result.
     pub fn translate(&self, segment: &TextSegment) -> Result<TextSegment, TranslationError> {
+        let target = invert_language(&segment.language);
         let mut combined = String::new();
         self.translate_stream(segment, |fragment| {
             if !fragment.is_final {
                 combined.push_str(&fragment.text);
             }
         })?;
-        Ok(TextSegment::new(combined.trim().to_string(), self.direction.target))
+        Ok(TextSegment::new(combined.trim().to_string(), target))
     }
 
     /// Streaming translation. Calls `on_fragment` for every commit-eligible
@@ -98,6 +108,9 @@ impl LlmTranslator {
     /// call with `is_final=true` to mark the end. The closure runs on the
     /// caller's thread (no spawning), so synthesis can start immediately
     /// without an extra channel hop.
+    ///
+    /// Direction is derived from `segment.language` (source) inverted
+    /// for target — the translator is bidirectional and stateless.
     pub fn translate_stream<F>(
         &self,
         segment: &TextSegment,
@@ -115,10 +128,11 @@ impl LlmTranslator {
             TranslationError::RequestFailed(format!("Lock poisoned: {}", e))
         })?;
 
+        let target = invert_language(&segment.language);
         let request = TranslateRequest {
             text: segment.text.clone(),
-            source_lang: lang_code(&self.direction.source),
-            target_lang: lang_code(&self.direction.target),
+            source_lang: lang_code(&segment.language),
+            target_lang: lang_code(&target),
         };
 
         let request_json = serde_json::to_string(&request)
@@ -164,6 +178,17 @@ fn lang_code(language: &Language) -> String {
     match language {
         Language::English => "en".to_string(),
         Language::Portuguese => "pt".to_string(),
+    }
+}
+
+/// Return the OTHER language. Used to derive the target from the
+/// segment's source language inside `translate(...)` /
+/// `translate_stream(...)`. Two-language project — when we add a
+/// third we'll need an explicit target param instead.
+fn invert_language(source: &Language) -> Language {
+    match source {
+        Language::English => Language::Portuguese,
+        Language::Portuguese => Language::English,
     }
 }
 

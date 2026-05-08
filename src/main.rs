@@ -70,15 +70,18 @@ struct LoadedModels {
     stt_a: Arc<WhisperStt>,
     /// STT process B (auto-detects language — used by the mic pipeline)
     stt_b: Arc<WhisperStt>,
-    /// English → Portuguese translator (always this direction)
-    translator_en_pt: Arc<OpusMtTranslator>,
-    /// Portuguese → English translator (always this direction)
-    translator_pt_en: Arc<OpusMtTranslator>,
-    /// Portuguese voice TTS (always Portuguese output). CosyVoice 2 with
-    /// zero-shot cloning — receives a per-speaker reference WAV per call.
-    tts_portuguese: Arc<PiperTts>,
-    /// English voice TTS (always English output).
-    tts_english: Arc<PiperTts>,
+    /// Single Qwen translator shared by both pipelines. Direction
+    /// is picked from `TextSegment.language` per call (translator
+    /// inverts to derive the target). Was previously two instances
+    /// (one per direction); collapsed in ADR 0014 amendment after
+    /// 2× Qwen 1.5B Q4 + XTTS together saturated 6 GB GPU.
+    translator: Arc<OpusMtTranslator>,
+    /// Single TTS bridge shared by both pipelines. Output language is
+    /// picked from `TextSegment.language` per call — Kokoro's voice
+    /// router and XTTS-v2's reference-driven cloning both work that way.
+    /// Was previously two instances (one per language); collapsed in
+    /// ADR 0014 amendment after XTTS x 2 saturated 6 GB GPUs.
+    tts: Arc<PiperTts>,
     /// Online diariser shared by both pipelines. Each pipeline auto-enrols
     /// speakers from live audio and routes the cloned voice through TTS.
     diarizer: Option<Arc<OnlineDiarizer>>,
@@ -457,7 +460,25 @@ fn pump_win32_messages() {}
 async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> Result<LoadedModels> {
     let stt_script = scripts_dir.join("stt_bridge.py");
     let translation_script = scripts_dir.join("translation_bridge.py");
-    let tts_script = scripts_dir.join("tts_bridge.py");
+    // TTS engine selector (ADR 0014). The Rust client (`PiperTts`)
+    // is engine-agnostic — same wire protocol — so the choice is
+    // just which Python script we spawn:
+    //   * "kokoro" (default): Kokoro v1.0 ONNX + pyworld pitch shift
+    //     + OpenVoice TCC for timbre cloning. Validated baseline.
+    //   * "xtts": XTTS-v2 zero-shot voice cloning natively from a
+    //     reference WAV — single stage, no TCC.
+    let tts_script = match config.tts_engine.as_str() {
+        "xtts" => scripts_dir.join("xtts_bridge.py"),
+        "kokoro" | "" => scripts_dir.join("tts_bridge.py"),
+        other => {
+            tracing::warn!(
+                "Unknown tts_engine \"{}\" — falling back to kokoro",
+                other,
+            );
+            scripts_dir.join("tts_bridge.py")
+        }
+    };
+    tracing::info!("TTS engine: {}", config.tts_engine);
     let diarization_script = scripts_dir.join("diarization_bridge.py");
     let whisper_model: std::path::PathBuf = config.whisper_model.clone().into();
 
@@ -470,29 +491,30 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
     let mut stt_b = WhisperStt::new(stt_script, whisper_model, config.mic_source_language);
     stt_b.initialize().await?;
 
-    // ── Translators: always load BOTH directions ────────────────────────────
-    tracing::info!("Initializing EN → PT translator…");
-    let mut translator_en_pt = OpusMtTranslator::new(
-        translation_script.clone(),
+    // ── Translator: ONE shared instance, direction per call ────────────
+    // Same collapse rationale as TTS — Qwen 1.5B Q4 was eating ~1 GB
+    // of VRAM per instance and we had two of them. Bridge accepts
+    // source_lang / target_lang per request, so a single subprocess
+    // handles both directions. Mutex inside `OpusMtTranslator`
+    // serialises concurrent callers (Mic + Speaker translating at
+    // the same time queue, which in field traffic is rare).
+    tracing::info!("Initializing translator (Qwen, bidirectional)…");
+    let mut translator = OpusMtTranslator::new(
+        translation_script,
         TranslationDirection::new(Language::English, Language::Portuguese),
     );
-    translator_en_pt.initialize().await?;
+    translator.initialize().await?;
 
-    tracing::info!("Initializing PT → EN translator…");
-    let mut translator_pt_en = OpusMtTranslator::new(
-        translation_script,
-        TranslationDirection::new(Language::Portuguese, Language::English),
-    );
-    translator_pt_en.initialize().await?;
-
-    // ── TTS: always load BOTH voices (Piper + pyworld pitch shifter) ──────
-    tracing::info!("Initializing Portuguese TTS (Piper)…");
-    let mut tts_portuguese = PiperTts::new(tts_script.clone(), Language::Portuguese);
-    tts_portuguese.initialize().await?;
-
-    tracing::info!("Initializing English TTS (Piper)…");
-    let mut tts_english = PiperTts::new(tts_script, Language::English);
-    tts_english.initialize().await?;
+    // ── TTS: ONE shared instance, language picked per segment ──────────
+    // Both bridges (Kokoro and XTTS) accept the language per request,
+    // so we no longer need two PiperTts instances. The collapse from
+    // two → one was load-bearing when XTTS-v2 became the default
+    // engine: each instance held ~1.8 GB of VRAM, so two of them on a
+    // 6 GB GPU thrashed cuDNN autotune and produced NaN-laced silent
+    // output (ADR 0014 amendment 2026-05-08).
+    tracing::info!("Initializing TTS bridge ({}…)", config.tts_engine);
+    let mut tts = PiperTts::new(tts_script, Language::English);
+    tts.initialize().await?;
 
     // Online diarisation drives per-speaker pitch differentiation. Each
     // chunk gives us a stable speaker_id plus a pyworld F0 measurement;
@@ -509,11 +531,18 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
     // model download and ~50 ms / chunk runtime cost. When on, the
     // loopback stream is split into 2 channels and each fed through a
     // parallel pipeline.
-    // OpenVoice v2 tone-color converter (ADR 0011). The bridge can
-    // refuse to start when the OpenVoice repo or the TCC checkpoint
-    // hasn't been vendored yet — that's a soft failure that downgrades
-    // the pipeline to plain Kokoro output, never a hard crash.
-    let voice_convert = if config.enable_voice_conversion {
+    // OpenVoice v2 tone-color converter (ADR 0011) — only relevant
+    // when the TTS engine is Kokoro. With XTTS-v2 (ADR 0014) voice
+    // cloning happens natively inside the synthesis pass, so loading
+    // TCC would just consume GPU memory for a stage that's never
+    // called. We therefore skip the bridge entirely when
+    // `tts_engine = "xtts"`.
+    let voice_convert = if config.tts_engine == "xtts" {
+        tracing::info!(
+            "Voice conversion not loaded (tts_engine=xtts handles cloning natively)",
+        );
+        None
+    } else if config.enable_voice_conversion {
         let voice_convert_script = scripts_dir.join("voice_convert_bridge.py");
         tracing::info!("Initializing OpenVoice v2 tone-color converter…");
         let mut vc = ToneColorConverter::new(voice_convert_script);
@@ -547,10 +576,8 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
     Ok(LoadedModels {
         stt_a: Arc::new(stt_a),
         stt_b: Arc::new(stt_b),
-        translator_en_pt: Arc::new(translator_en_pt),
-        translator_pt_en: Arc::new(translator_pt_en),
-        tts_portuguese: Arc::new(tts_portuguese),
-        tts_english: Arc::new(tts_english),
+        translator: Arc::new(translator),
+        tts: Arc::new(tts),
         diarizer,
         separator,
         voice_convert,
@@ -965,19 +992,12 @@ fn try_create_silero_vad(branch: &str) -> Option<Arc<SileroVad>> {
 /// - English source → uses the EN→PT translator and Portuguese TTS voice.
 /// - Portuguese source → uses the PT→EN translator and English TTS voice.
 fn models_for_source(
-    source: Language,
+    _source: Language,
     models: &LoadedModels,
 ) -> (Arc<OpusMtTranslator>, Arc<PiperTts>) {
-    match source {
-        Language::English => (
-            Arc::clone(&models.translator_en_pt),
-            Arc::clone(&models.tts_portuguese),
-        ),
-        Language::Portuguese => (
-            Arc::clone(&models.translator_pt_en),
-            Arc::clone(&models.tts_english),
-        ),
-    }
+    // Both translator and TTS are now single instances; the source
+    // language is implicit in the segment passed to each call.
+    (Arc::clone(&models.translator), Arc::clone(&models.tts))
 }
 
 fn opposite_language(lang: Language) -> Language {

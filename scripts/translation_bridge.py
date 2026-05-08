@@ -144,7 +144,7 @@ Rules:
 2. **Preserve meaning, not words.** Drop filler words and verbal tics that carry no meaning ("uh", "um", "you know", "like", "I mean", "tipo", "sabe", "né", "é tipo"). The listener doesn't need them.
 3. **Collapse repetition.** "yeah yeah yeah" → "sim". "no, no, wait wait" → "espera". "I I I think" → "Acho que".
 4. **Compress disfluencies.** Restarts ("we should — we should do") and self-corrections ("the meeting, I mean, the call") become clean output that says the final intended thought.
-5. **Be concise.** A verbose 15-word source with filler can legitimately become a clean 8-word translation. Real interpreters do this constantly. Do not invent content, but do trim what adds no information.
+5. **Be concise — aggressively.** A verbose 15-word source with filler can legitimately become a clean 6-8 word translation. Real interpreters do this constantly. **When the source contains fillers, repetition, or self-corrections, aim for ≤ 70% of the source word count.** When the source is already clean and information-dense (read text, formal speech), translate at ~1:1. Do not invent content, but do trim what adds no information. Prefer the SHORTER of two equally faithful renderings.
 6. **Match the register.** Casual stays casual; formal stays formal. Don't elevate sloppy speech to polished prose, and don't dumb down formal speech.
 7. **Keep proper nouns and brand names verbatim** — names of people, companies, products, show titles ("Huge Conversations", "Apple Vision Pro", "Snapchat").
 8. **Keep technical jargon when already in the target language** (deploy, commit, pull request, headset, holograms).
@@ -240,6 +240,44 @@ FEWSHOT = [
     # PT -> EN: "né" / "tipo" tics
     ("Então, né, eu queria, tipo, falar sobre, sabe, esse projeto novo.",
      "I wanted to talk about this new project.", "pt", "en"),
+
+    # ─── Aggressive compression target (added 2026-05-08) ────────────────────
+    # Rule 5 asks for ≤ 70% of the source word count when the source has
+    # filler / repetition / self-corrections. These few-shots show an
+    # extreme version (≤ 25% in some cases) so the model has a clear
+    # anchor for "the more filler, the more aggressive the trim".
+    # Without these the 1.5B model keeps outputs around 90-100% of source
+    # length even with the verbal instruction.
+
+    # EN -> PT: 26 words → 5 (~19%)
+    ("So basically, what I'm trying to say is, you know, we should probably, like, take a step back and think about this more carefully.",
+     "Devemos repensar isso com calma.", "en", "pt"),
+    # EN -> PT: 28 words → 6 (~21%)
+    ("And and and so the the thing is, like, like I was saying, you know what I mean, we just we just gotta keep moving forward.",
+     "Temos que seguir em frente.", "en", "pt"),
+    # EN -> PT: 22 words → 7 (~32%) — "ramble + restart"
+    ("It's it's it's like — okay so — what I'm saying is the deadline, the deadline got pushed back to Friday.",
+     "O prazo foi adiado para sexta.", "en", "pt"),
+    # PT -> EN: 21 words → 6 (~29%)
+    ("Então, tipo, sabe, o que eu queria dizer é que, é que assim, a gente precisa, tipo, focar nisso aqui, sabe?",
+     "We need to focus on this.", "pt", "en"),
+    # PT -> EN: 17 words → 5 (~29%)
+    ("Não, não, espera, espera aí, deixa eu pensar, ah, eu acho que sim, pode ser.",
+     "Yeah, I think so.", "pt", "en"),
+
+    # ─── Counter-examples: clean source stays at ~1:1 ────────────────────────
+    # Without these, the model over-applies compression to dense formal
+    # speech where every word carries meaning. The interpreter rule is
+    # "trim filler", NOT "shorten everything".
+
+    # EN -> PT: clean technical, 1:1 expected
+    ("The deployment failed because the database migration introduced a non-null column without a default value.",
+     "O deploy falhou porque a migração do banco introduziu uma coluna não-nula sem valor padrão.",
+     "en", "pt"),
+    # PT -> EN: clean narrative, 1:1 expected
+    ("Em 1969, três astronautas norte-americanos partiram para a Lua a bordo da Apollo 11.",
+     "In 1969, three American astronauts left for the Moon aboard Apollo 11.",
+     "pt", "en"),
 ]
 
 

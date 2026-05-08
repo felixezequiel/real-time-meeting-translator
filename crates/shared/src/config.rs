@@ -18,6 +18,15 @@ fn default_enable_voice_conversion() -> bool {
     true
 }
 
+/// Default TTS engine. Kokoro is the validated baseline (ADR 0010);
+/// "xtts" switches to the new XTTS-v2 zero-shot voice cloning path
+/// (ADR 0014). Until XTTS validates in field, default stays kokoro.
+const DEFAULT_TTS_ENGINE: &str = "kokoro";
+
+fn default_tts_engine() -> String {
+    DEFAULT_TTS_ENGINE.to_string()
+}
+
 /// V2 phrase window upper bound (ADR 0013). Caps how long a single
 /// phrase can grow without flushing.
 const DEFAULT_PHRASE_MAX_WINDOW_MS: u64 = 5000;
@@ -125,6 +134,13 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub subtitle_overlay: bool,
 
+    /// TTS engine selector (ADR 0014). "kokoro" uses the legacy
+    /// Kokoro + OpenVoice TCC stack (ADRs 0010 + 0011); "xtts" uses
+    /// XTTS-v2 zero-shot voice cloning natively. Default kokoro
+    /// until XTTS validates in field.
+    #[serde(default = "default_tts_engine")]
+    pub tts_engine: String,
+
     // NOTE: Earlier versions had `speaker_voice_reference_wav` and
     // `mic_voice_reference_wav` fields used by CosyVoice's zero-shot
     // cloning path. Those are gone now — voice differentiation comes
@@ -154,6 +170,7 @@ impl Default for PipelineConfig {
             phrase_silence_tail_ms: DEFAULT_PHRASE_SILENCE_TAIL_MS,
             phrase_min_window_ms: DEFAULT_PHRASE_MIN_WINDOW_MS,
             subtitle_overlay: false,
+            tts_engine: DEFAULT_TTS_ENGINE.to_string(),
         }
     }
 }

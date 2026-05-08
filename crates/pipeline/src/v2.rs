@@ -50,12 +50,54 @@ fn next_phrase_id() -> u64 {
 /// How long the accumulator may hold a not-yet-final phrase before
 /// forcing a flush. Bounds the worst-case wait when a speaker never
 /// produces a clean punctuation boundary.
-const ACCUMULATOR_MAX_HOLD_MS: u128 = 3000;
+///
+/// Lowered from 3000 → 1200 ms on 2026-05-08 (ADR 0013 amendment
+/// "Latency-first accumulator"): the previous 3 s ceiling was the
+/// dominant TTFA contributor on punctuation-less Whisper output —
+/// typical case in spoken speech. 1200 ms keeps the worst-case
+/// end-to-end latency under ~2.2 s while the soft-flush rule below
+/// catches the *common* case much earlier.
+const ACCUMULATOR_MAX_HOLD_MS: u128 = 1200;
 
 /// Word count at which the accumulator force-flushes even without
 /// punctuation. Long monologues without commas would otherwise just
 /// keep growing.
 const ACCUMULATOR_MAX_WORDS: usize = 35;
+
+/// Soft-flush trigger: once the accumulator has at least this many
+/// words AND has been held for `ACCUMULATOR_SOFT_FLUSH_HOLD_MS`,
+/// release it even without punctuation. This is the lever that
+/// brought TTFA from "wait for the dot" to "wait for a phrase-shaped
+/// chunk" — Whisper rarely emits commas mid-utterance, so the old
+/// punctuation-only flush rule paid the full MAX_HOLD on most spoken
+/// input. Six words is roughly the size of a self-contained clause
+/// in conversational speech ("we should refactor this module"),
+/// large enough that the streaming translator and the interpreter-
+/// style prompt still produce coherent output.
+const ACCUMULATOR_SOFT_FLUSH_WORDS: usize = 6;
+const ACCUMULATOR_SOFT_FLUSH_HOLD_MS: u128 = 800;
+
+/// Pure flush decision used by `process_segment` and unit-tested in
+/// isolation. Returns `true` when the accumulator has a forced reason
+/// to release its content even when the buffer doesn't end on a
+/// sentence boundary. Three triggers, in increasing latency cost:
+///
+/// 1. **Soft flush** — `word_count ≥ ACCUMULATOR_SOFT_FLUSH_WORDS`
+///    AND `age_ms ≥ ACCUMULATOR_SOFT_FLUSH_HOLD_MS`. Catches the
+///    common case where the speaker said one full clause but Whisper
+///    didn't punctuate it.
+/// 2. **Long enough** — `word_count ≥ ACCUMULATOR_MAX_WORDS`.
+///    Comma-less monologue.
+/// 3. **Aged out** — `age_ms > ACCUMULATOR_MAX_HOLD_MS`. Hard ceiling
+///    on how long any phrase may sit pending.
+fn should_force_flush(word_count: usize, age_ms: u128) -> bool {
+    let aged_out = age_ms > ACCUMULATOR_MAX_HOLD_MS;
+    let long_enough = word_count >= ACCUMULATOR_MAX_WORDS;
+    let soft_flush =
+        word_count >= ACCUMULATOR_SOFT_FLUSH_WORDS
+            && age_ms >= ACCUMULATOR_SOFT_FLUSH_HOLD_MS;
+    aged_out || long_enough || soft_flush
+}
 
 /// Per-pipeline accumulator state. Shared between concurrent
 /// `process_segment` tasks via `Arc<Mutex<>>` so they serialise on
@@ -538,11 +580,12 @@ fn process_segment(
             acc.pending_reference_path = resolved_reference.clone();
         }
 
-        let aged_out = acc
+        let pending_age_ms = acc
             .pending_started_at
-            .map(|t| now.duration_since(t).as_millis() > ACCUMULATOR_MAX_HOLD_MS)
-            .unwrap_or(false);
-        let long_enough = acc.pending_text.split_whitespace().count() >= ACCUMULATOR_MAX_WORDS;
+            .map(|t| now.duration_since(t).as_millis())
+            .unwrap_or(0);
+        let pending_word_count = acc.pending_text.split_whitespace().count();
+        let force_flush = should_force_flush(pending_word_count, pending_age_ms);
 
         // Try to peel off any complete sentences that have already
         // accumulated, leaving the still-in-progress trailing
@@ -574,10 +617,11 @@ fn process_segment(
                 acc.pending_started_at = Some(now);
             }
             Some(snapshot)
-        } else if aged_out || long_enough {
-            // No complete sentences but a hard cap fired — flush
-            // whatever we have so the listener doesn't wait
-            // forever on a comma-less monologue.
+        } else if force_flush {
+            // No complete sentences but a force-flush trigger fired
+            // (soft-flush at 6 words / 800 ms, MAX_WORDS, or
+            // MAX_HOLD). Drain the accumulator so the listener
+            // doesn't wait forever on a comma-less utterance.
             let drained = std::mem::take(&mut acc.pending_text);
             let snapshot = (
                 drained,
@@ -686,13 +730,19 @@ fn flush_phrase(
     let mut full_translation = String::new();
     let mut first_fragment_seen = false;
 
-    let voice_profile = match speaker_id {
-        Some(id) => VoiceProfile {
-            target_f0_hz,
-            formant_shift: 1.0,
-            speaker_id: Some(id),
-        },
-        None => VoiceProfile::default(),
+    // VoiceProfile carries everything either engine might want:
+    //   - Kokoro reads target_f0_hz / formant_shift / speaker_id and
+    //     ignores reference_wav_path (its sticky-voice + pitch-shift
+    //     pipeline is fully self-contained — ADR 0010).
+    //   - XTTS-v2 reads reference_wav_path and ignores the rest
+    //     (zero-shot cloning conditioned on the reference audio —
+    //     ADR 0014).
+    // We populate every field; each engine picks what it needs.
+    let voice_profile = VoiceProfile {
+        target_f0_hz,
+        formant_shift: 1.0,
+        speaker_id,
+        reference_wav_path: reference_path.clone(),
     };
 
     // One id per flushed phrase. All streaming subtitle events
@@ -735,33 +785,67 @@ fn flush_phrase(
             });
         }
 
-        // Synthesise + dispatch THIS fragment alone.
+        // Synthesise + dispatch THIS fragment. The TTS bridge can
+        // emit several PCM chunks per fragment (XTTS streaming) — we
+        // forward each one to audio_output as it arrives so playback
+        // starts on the first chunk instead of waiting for the whole
+        // fragment to finish synthesising. Time-to-first-audio per
+        // fragment drops from ~`fragment_inference_ms` (~700-2000 ms
+        // on RTX 3050) to ~`first_chunk_ms` (~250-500 ms).
+        //
+        // Atomic bridges (Kokoro) emit exactly one chunk; the loop
+        // executes once and the per-chunk path is equivalent to the
+        // previous atomic dispatch.
         if !fragment.is_final && !frag_text.is_empty() {
             let frag_segment =
                 TextSegment::new(frag_text.to_string(), target_language);
             let tts_start = Instant::now();
-            match tts.synthesize(&frag_segment, voice_profile.clone()) {
-                Ok(audio) => {
-                    let _ = metrics_tx.try_send(PipelineMetrics::new(
-                        "tts".to_string(),
-                        tts_start.elapsed(),
-                    ));
-                    let final_audio = apply_tcc_if_eligible(
-                        pipeline_name,
-                        audio,
-                        speaker_id,
-                        reference_path.as_deref(),
-                        voice_convert,
-                        metrics_tx,
-                    );
+            let mut tts_first_chunk_logged = false;
+            let stream_result = tts.synthesize_stream(
+                &frag_segment,
+                voice_profile.clone(),
+                |chunk| {
+                    if !tts_first_chunk_logged {
+                        let _ = metrics_tx.try_send(PipelineMetrics::new(
+                            "tts_first_chunk".to_string(),
+                            tts_start.elapsed(),
+                        ));
+                        tts_first_chunk_logged = true;
+                    }
+                    // TCC needs a whole utterance to compute its
+                    // tone-color transfer; running it per mid-stream
+                    // chunk gives garbage at the edges. We only apply
+                    // it to chunks that carry the boundary marker
+                    // (atomic chunks — the LAST one of a streamed
+                    // fragment OR a single Kokoro chunk). Mid-stream
+                    // chunks (`is_streaming_chunk == true`) bypass
+                    // TCC and play raw — the bridge already cloned
+                    // the speaker's voice when XTTS is the engine,
+                    // so TCC is redundant there anyway (ADR 0014).
+                    let final_audio = if chunk.is_streaming_chunk {
+                        chunk
+                    } else {
+                        apply_tcc_if_eligible(
+                            pipeline_name,
+                            chunk,
+                            speaker_id,
+                            reference_path.as_deref(),
+                            voice_convert,
+                            metrics_tx,
+                        )
+                    };
                     let _ = audio_output.send(final_audio);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[{}] V2 TTS fragment failed: {}",
-                        pipeline_name, e,
-                    );
-                }
+                },
+            );
+            let _ = metrics_tx.try_send(PipelineMetrics::new(
+                "tts".to_string(),
+                tts_start.elapsed(),
+            ));
+            if let Err(e) = stream_result {
+                tracing::warn!(
+                    "[{}] V2 TTS fragment failed: {}",
+                    pipeline_name, e,
+                );
             }
         }
     });
@@ -925,6 +1009,61 @@ mod tests {
             split_complete_sentences("Are you sure? Yes! we are. starting now");
         assert_eq!(complete, "Are you sure? Yes! we are.");
         assert_eq!(rest, "starting now");
+    }
+
+    // ─── should_force_flush: latency-first accumulator (2026-05-08) ─────────
+
+    #[test]
+    fn force_flush_holds_short_quiet_buffer() {
+        // 3 words, 200 ms held — well below every trigger. Stay
+        // pending so the speaker can finish the clause.
+        assert!(!should_force_flush(3, 200));
+    }
+
+    #[test]
+    fn force_flush_releases_on_soft_trigger() {
+        // 6 words + 800 ms = soft-flush threshold met. This is the
+        // common case the rule was added for: Whisper produced a
+        // full clause without punctuation; we no longer wait the
+        // full MAX_HOLD ceiling for it.
+        assert!(should_force_flush(6, 800));
+    }
+
+    #[test]
+    fn force_flush_holds_when_age_below_soft_threshold() {
+        // 8 words but only 400 ms — age gate of soft-flush not yet
+        // satisfied. Still no aged_out or long_enough trigger
+        // either, so we hold.
+        assert!(!should_force_flush(8, 400));
+    }
+
+    #[test]
+    fn force_flush_holds_when_word_count_below_soft_threshold() {
+        // 5 words, 1000 ms — under SOFT_WORDS (6) so soft-flush
+        // doesn't fire; under MAX_HOLD (1200) so aged_out doesn't
+        // fire either. Wait for either more words or more time.
+        assert!(!should_force_flush(5, 1000));
+    }
+
+    #[test]
+    fn force_flush_releases_on_age_ceiling() {
+        // 4 words but held > MAX_HOLD. The hard ceiling fires even
+        // when the buffer is small — short utterances shouldn't be
+        // held forever just because they're brief.
+        assert!(should_force_flush(4, 1300));
+    }
+
+    #[test]
+    fn force_flush_releases_on_word_ceiling() {
+        // 35 words, 0 ms — comma-less monologue, blow the lid.
+        assert!(should_force_flush(ACCUMULATOR_MAX_WORDS, 0));
+    }
+
+    #[test]
+    fn force_flush_releases_when_both_thresholds_met() {
+        // 40 words AND 5000 ms — every trigger fires. Just verifies
+        // the disjunction doesn't suppress one when another applies.
+        assert!(should_force_flush(40, 5000));
     }
 
     #[test]

@@ -23,13 +23,16 @@ pub enum TtsError {
 /// Target voice characteristics for the next synthesis. Resolved per-call
 /// from the speaker's running F0 + formant profile maintained by the
 /// pipeline; default values mean "use the bridge's default voice".
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct VoiceProfile {
     /// Target F0 in Hz (mean of voiced frames in the speaker's recent
-    /// audio). Anything <= 0 disables pitch shifting.
+    /// audio). Anything <= 0 disables pitch shifting. Used by the
+    /// Kokoro engine; XTTS-v2 ignores this and infers prosody from
+    /// the reference WAV instead.
     pub target_f0_hz: f32,
     /// Spectral-envelope warp ratio. 1.0 = no formant shift; >1 enlarges
     /// the vocal tract → deeper voice; <1 narrows → thinner.
+    /// Kokoro-only, like target_f0_hz.
     pub formant_shift: f32,
     /// Diarised speaker id this synthesis is attributed to. The bridge
     /// uses it to keep voice routing stable across utterances of the
@@ -37,6 +40,12 @@ pub struct VoiceProfile {
     /// jitter chunk-to-chunk would alternate the same person's
     /// translations between male and female voices.
     pub speaker_id: Option<u32>,
+    /// Path to a reference WAV (5-10 s of the target speaker's voice)
+    /// used by zero-shot voice cloning engines (XTTS-v2 — ADR 0014).
+    /// Kokoro ignores this. Resolved by the pipeline from
+    /// `VoiceProfileRegistry::reference_for(speaker_id)` or the mic-
+    /// side `mic_voice_profile_path`.
+    pub reference_wav_path: Option<String>,
 }
 
 impl VoiceProfile {
@@ -60,17 +69,38 @@ struct TtsRequest {
     /// per id so the same speaker keeps the same voice across utterances.
     #[serde(skip_serializing_if = "Option::is_none")]
     speaker_id: Option<u32>,
+    /// Path to a reference WAV for zero-shot voice cloning engines
+    /// (XTTS-v2 — ADR 0014). Kokoro ignores this. Both bridges accept
+    /// the same JSON shape; engine-specific fields are ignored on the
+    /// other side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_wav_path: Option<String>,
 }
 
 fn f32_is_zero_or_negative(value: &f32) -> bool {
     *value <= 0.0
 }
 
-/// Header sent by the Python bridge before the raw int16 PCM bytes.
+/// Header sent by the Python bridge before the raw int16 PCM bytes
+/// for ONE frame. The bridge emits frames in a loop, terminated by a
+/// frame with `is_final=true`. Atomic bridges (Kokoro) emit exactly
+/// one frame whose body carries the full audio AND `is_final=true`.
+/// Streaming bridges (XTTS-v2) emit N body frames with `is_final=false`
+/// followed by a single empty terminator frame with `is_final=true`.
 #[derive(Deserialize)]
 struct TtsResponseHeader {
     sample_rate: u32,
     num_samples: u32,
+    /// `final` on the wire (Python keyword-safe, matches both bridges).
+    /// Defaults to true so a bridge that doesn't yet emit the field is
+    /// treated as legacy single-frame — keeps a half-upgraded checkout
+    /// working without a coordinated bump.
+    #[serde(rename = "final", default = "default_final")]
+    is_final: bool,
+}
+
+fn default_final() -> bool {
+    true
 }
 
 /// Local TTS client with optional pyworld pitch/formant shifting on top.
@@ -87,7 +117,6 @@ struct TtsResponseHeader {
 pub struct PiperTts {
     bridge_script_path: PathBuf,
     process: Option<Mutex<TtsBridgeProcess>>,
-    language: Language,
 }
 
 struct TtsBridgeProcess {
@@ -97,24 +126,42 @@ struct TtsBridgeProcess {
 }
 
 impl PiperTts {
-    pub fn new(bridge_script_path: PathBuf, language: Language) -> Self {
+    /// Construct a TTS bridge client. The `_language` parameter is
+    /// kept on the constructor for API stability (callers passed it
+    /// for years), but is no longer stored — the synthesise call now
+    /// derives language from `TextSegment.language` per request, so
+    /// one bridge instance handles both directions.
+    pub fn new(bridge_script_path: PathBuf, _language: Language) -> Self {
         Self {
             bridge_script_path,
             process: None,
-            language,
         }
     }
 
-    /// Synthesise `segment` at the configured language, optionally bending
-    /// the output pitch and formants towards `voice_profile`. When the
-    /// profile is the default (zero F0, formant=1.0) the bridge skips
-    /// analysis-synthesis and returns raw Piper output — same path as the
-    /// pre-shift TTS that worked at ~150 ms/call.
-    pub fn synthesize(
+    /// Streaming synthesis: invokes `on_chunk` for every audio fragment
+    /// the bridge emits, in order, until the bridge signals the
+    /// terminator frame (`is_final=true`).
+    ///
+    /// Each emitted `AudioChunk` is constructed with
+    /// `AudioChunk::streaming(...)` when the bridge says there are more
+    /// frames coming AND with `AudioChunk::new(...)` for the trailing
+    /// content frame (if any) — only the LAST content chunk gets the
+    /// non-streaming flag so the mixer can apply its phrase-boundary
+    /// fade-out there. Mid-phrase chunks skip the envelope entirely
+    /// (see `AudioChunk::is_streaming_chunk`).
+    ///
+    /// Atomic bridges (Kokoro) emit exactly one frame with
+    /// `is_final=true` carrying the full audio — `on_chunk` fires once
+    /// and the chunk is non-streaming (full envelope applies).
+    pub fn synthesize_stream<F>(
         &self,
         segment: &TextSegment,
         voice_profile: VoiceProfile,
-    ) -> Result<AudioChunk, TtsError> {
+        mut on_chunk: F,
+    ) -> Result<(), TtsError>
+    where
+        F: FnMut(AudioChunk),
+    {
         let process_mutex = self
             .process
             .as_ref()
@@ -124,9 +171,15 @@ impl PiperTts {
             TtsError::SynthesisFailed(format!("Lock poisoned: {}", e))
         })?;
 
+        // Language comes from the segment, not from the bridge instance.
+        // Both the Kokoro and XTTS bridges accept any language per call,
+        // so a single `PiperTts` can serve both translation directions —
+        // critical when XTTS is the engine because each instance burns
+        // ~1.8 GB of VRAM (ADR 0014 amendment 2026-05-08: two instances
+        // were saturating 6 GB GPUs and producing silent output).
         let request = TtsRequest {
             text: segment.text.clone(),
-            language: match self.language {
+            language: match segment.language {
                 Language::Portuguese => "pt".to_string(),
                 Language::English => "en".to_string(),
             },
@@ -137,6 +190,7 @@ impl PiperTts {
                 1.0
             },
             speaker_id: voice_profile.speaker_id,
+            reference_wav_path: voice_profile.reference_wav_path.clone(),
         };
 
         let request_json =
@@ -149,27 +203,97 @@ impl PiperTts {
             .flush()
             .map_err(|e| TtsError::SynthesisFailed(e.to_string()))?;
 
-        let mut header_line = String::new();
-        bridge
-            .stdout
-            .read_line(&mut header_line)
-            .map_err(|e| TtsError::SynthesisFailed(e.to_string()))?;
+        // Buffer the previous content frame so we can mark it as the
+        // final (atomic-style) one when the terminator arrives. This
+        // way the LAST chunk of a streamed phrase carries the
+        // boundary fade-out the mixer applies to atomic chunks, while
+        // every chunk before it stays mid-phrase (no envelope).
+        let mut pending: Option<AudioChunk> = None;
+        let mut total_samples: usize = 0;
+        let mut frames_seen: usize = 0;
+        // Set on the first frame and overwritten unconditionally on
+        // every subsequent frame; the initial 0 is never observed by
+        // the trace below because the loop runs at least once.
+        #[allow(unused_assignments)]
+        let mut last_sample_rate: u32 = 0;
 
-        let header: TtsResponseHeader = serde_json::from_str(header_line.trim())
-            .map_err(|e| TtsError::SynthesisFailed(format!("Invalid TTS header: {}", e)))?;
+        loop {
+            let mut header_line = String::new();
+            bridge
+                .stdout
+                .read_line(&mut header_line)
+                .map_err(|e| TtsError::SynthesisFailed(e.to_string()))?;
 
-        let samples = read_pcm_samples(&mut bridge.stdout, header.num_samples as usize)
-            .map_err(|e| TtsError::SynthesisFailed(format!("Failed to read PCM: {}", e)))?;
+            let header: TtsResponseHeader = serde_json::from_str(header_line.trim())
+                .map_err(|e| TtsError::SynthesisFailed(format!("Invalid TTS header: {}", e)))?;
+
+            let samples = read_pcm_samples(&mut bridge.stdout, header.num_samples as usize)
+                .map_err(|e| TtsError::SynthesisFailed(format!("Failed to read PCM: {}", e)))?;
+
+            last_sample_rate = header.sample_rate;
+            total_samples += samples.len();
+            frames_seen += 1;
+
+            if header.is_final {
+                // Terminator frame. If the terminator itself carries
+                // audio (Kokoro: full payload + final=true), treat it
+                // as both the last content frame AND the close —
+                // flush the pending mid-phrase chunk first (if any),
+                // then emit this one as the boundary-eligible last.
+                if let Some(prev) = pending.take() {
+                    on_chunk(prev);
+                }
+                if !samples.is_empty() {
+                    on_chunk(AudioChunk::new(samples, header.sample_rate, MONO_CHANNELS));
+                }
+                break;
+            }
+
+            // Non-final frame. The PREVIOUSLY-buffered chunk (if any)
+            // is now confirmed to be mid-phrase: emit it tagged as a
+            // streaming chunk so the mixer skips its per-chunk fade.
+            if let Some(prev) = pending.take() {
+                on_chunk(AudioChunk::streaming(
+                    prev.samples,
+                    prev.sample_rate,
+                    prev.channels,
+                ));
+            }
+            if !samples.is_empty() {
+                pending = Some(AudioChunk::new(samples, header.sample_rate, MONO_CHANNELS));
+            }
+        }
 
         tracing::debug!(
-            "TTS synthesised {} samples at {}Hz (target_f0={:.0}, formant={:.2})",
-            samples.len(),
-            header.sample_rate,
+            "TTS streamed {} samples in {} frames at {}Hz (target_f0={:.0}, formant={:.2})",
+            total_samples,
+            frames_seen,
+            last_sample_rate,
             voice_profile.target_f0_hz,
             voice_profile.formant_shift,
         );
 
-        Ok(AudioChunk::new(samples, header.sample_rate, MONO_CHANNELS))
+        Ok(())
+    }
+
+    /// Atomic synthesis. Wrapper around `synthesize_stream` that
+    /// concatenates every fragment into one `AudioChunk`. Kept for
+    /// callers (and tests) that don't care about per-chunk dispatch
+    /// — the streaming pipeline in `crates/pipeline/src/v2.rs` calls
+    /// `synthesize_stream` directly to dispatch each chunk to the
+    /// playback mixer as it lands.
+    pub fn synthesize(
+        &self,
+        segment: &TextSegment,
+        voice_profile: VoiceProfile,
+    ) -> Result<AudioChunk, TtsError> {
+        let mut combined: Vec<f32> = Vec::new();
+        let mut sample_rate: u32 = 0;
+        self.synthesize_stream(segment, voice_profile, |chunk| {
+            sample_rate = chunk.sample_rate;
+            combined.extend(chunk.samples);
+        })?;
+        Ok(AudioChunk::new(combined, sample_rate, MONO_CHANNELS))
     }
 }
 
@@ -258,7 +382,12 @@ mod tests {
 
     #[test]
     fn voice_profile_is_active_when_f0_positive() {
-        let profile = VoiceProfile { target_f0_hz: 180.0, formant_shift: 1.0, speaker_id: None };
+        let profile = VoiceProfile {
+            target_f0_hz: 180.0,
+            formant_shift: 1.0,
+            speaker_id: None,
+            reference_wav_path: None,
+        };
         assert!(profile.is_active());
         let default = VoiceProfile::default();
         assert!(!default.is_active());
@@ -272,6 +401,7 @@ mod tests {
             target_f0: 0.0,
             formant_shift: 1.0,
             speaker_id: None,
+            reference_wav_path: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("target_f0"));
@@ -286,6 +416,7 @@ mod tests {
             target_f0: 220.0,
             formant_shift: 0.95,
             speaker_id: Some(0),
+            reference_wav_path: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("target_f0"));
@@ -293,11 +424,57 @@ mod tests {
     }
 
     #[test]
+    fn tts_request_omits_reference_wav_when_absent() {
+        let request = TtsRequest {
+            text: "hi".to_string(),
+            language: "en".to_string(),
+            target_f0: 0.0,
+            formant_shift: 1.0,
+            speaker_id: None,
+            reference_wav_path: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("reference_wav_path"));
+    }
+
+    #[test]
+    fn tts_request_emits_reference_wav_when_set() {
+        let request = TtsRequest {
+            text: "hi".to_string(),
+            language: "en".to_string(),
+            target_f0: 0.0,
+            formant_shift: 1.0,
+            speaker_id: None,
+            reference_wav_path: Some("/tmp/voice/ref.wav".to_string()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("reference_wav_path"));
+        assert!(json.contains("ref.wav"));
+    }
+
+    #[test]
     fn tts_header_deserialises_correctly() {
-        let json = r#"{"sample_rate": 22050, "num_samples": 3}"#;
+        let json = r#"{"sample_rate": 22050, "num_samples": 3, "final": true}"#;
         let header: TtsResponseHeader = serde_json::from_str(json).unwrap();
         assert_eq!(header.sample_rate, 22050);
         assert_eq!(header.num_samples, 3);
+        assert!(header.is_final);
+    }
+
+    #[test]
+    fn tts_header_defaults_final_when_absent() {
+        // Backward compat with bridges that haven't been upgraded yet:
+        // missing `final` is treated as a single-frame atomic response.
+        let json = r#"{"sample_rate": 22050, "num_samples": 3}"#;
+        let header: TtsResponseHeader = serde_json::from_str(json).unwrap();
+        assert!(header.is_final);
+    }
+
+    #[test]
+    fn tts_header_parses_non_final_frame() {
+        let json = r#"{"sample_rate": 24000, "num_samples": 6000, "final": false}"#;
+        let header: TtsResponseHeader = serde_json::from_str(json).unwrap();
+        assert!(!header.is_final);
     }
 
     #[test]

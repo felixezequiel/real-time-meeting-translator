@@ -213,3 +213,95 @@ Risks (acknowledged):
   regresses, revert this commit and Qwen returns to literal mode.
 - No automated test — interpreter quality is by definition
   subjective. The validation loop is "user listens, reports back".
+
+## Amendment 2026-05-08 — Single-instance translator (collapse from two)
+
+Field testing with XTTS-v2 (ADR 0014) on a 6 GB GPU surfaced a
+broader VRAM-saturation pattern that this ADR's prior design
+contributed to: `load_models()` was creating TWO `OpusMtTranslator`
+instances, one per direction (EN→PT and PT→EN). With Qwen 1.5B Q4
+that's ~1 GB × 2 = 2 GB of VRAM held by translation alone, on top
+of Whisper × 2, diariser, and the new XTTS bridge. The 6 GB card
+went into CUDA paging, cuDNN autotune chose unstable algorithms,
+and one of the visible side effects was silent NaN-laced output
+from the TTS path (see ADR 0014 amendment for the full diagnosis).
+
+The translation bridge always accepted `source_lang` and
+`target_lang` per request — same as the TTS bridge. The two-
+instance arrangement was a Rust-side convenience: each
+`OpusMtTranslator` stored a `direction: TranslationDirection` on
+the struct and used it to fill in the JSON request. Cheap when
+the model was small (NLLB-CT2 ~700 MB), expensive once Qwen 1.5B
+joined the GPU at ~1 GB per instance, and VERY expensive once we
+needed to coexist with a 1.8 GB XTTS model.
+
+Fix mirrors the TTS one (ADR 0014 amendment "Collapse to a single
+TTS instance"):
+
+1. **Drop `direction` field from `LlmTranslator`.** Constructor
+   keeps `_direction: TranslationDirection` for API compatibility
+   (existing callers pass it) but ignores the value. New helper
+   `invert_language(source) → target` fills in the missing target
+   inside `translate_stream`.
+2. **`LoadedModels.translator: Arc<OpusMtTranslator>`** instead
+   of `translator_en_pt` + `translator_pt_en`. `models_for_source`
+   returns the same `Arc` regardless of source — the per-segment
+   `TextSegment.language` carries the direction information.
+3. **Single bridge subprocess** spawned at startup. The internal
+   `Mutex<BridgeProcess>` already serialises concurrent callers,
+   so Mic + Speaker translating in parallel just queue (rare in
+   practice — Mic translates only when the user speaks).
+
+VRAM saved: ~1 GB. Trade-off: when Mic and Speaker both translate
+simultaneously, the second waits for the first (typically 200-500
+ms of streaming). Acceptable in a single-user meeting context.
+
+The collapse pattern — "one Python bridge process per model
+class, language/direction per request" — is now the project's
+default convention for any new ML bridge. Explicitly NOT
+splitting per-direction unless a per-instance state genuinely
+diverges (Whisper-rs's WhisperState being the lone hold-out today
+because each STT pipeline genuinely consumes a different audio
+stream).
+
+## Amendment 2026-05-08 — Compression target in the prompt
+
+The 2026-05-07 amendment ("Interpreter-style compression") moved
+the prompt from literal translation to professional-interpreter
+behaviour (drop filler, collapse repetition, trim self-corrections).
+Field listening showed Qwen 1.5B did follow the *direction* but not
+the *intensity* — its outputs hovered at 90-100% of the source word
+count even when the source was 50% filler. The prompt asked the
+model to "be concise" without giving a target, and a 1.5B model
+without an explicit anchor reverts to its training-distribution
+default (which for translation tasks is roughly 1:1).
+
+Two prompt changes:
+
+1. **Rule 5 sharpened with a concrete target.** "When the source
+   contains fillers, repetition, or self-corrections, aim for
+   ≤ 70% of the source word count. When the source is already
+   clean and information-dense (read text, formal speech), translate
+   at ~1:1." The conditional is critical — without it, the model
+   compresses dense formal speech too, dropping content-words.
+2. **Five new few-shots demonstrate aggressive compression** (some
+   reaching 19-29% of source length on filler-heavy English/PT) plus
+   **two counter-examples** (clean technical English / formal
+   Portuguese narrative) anchored at ~1:1. The asymmetry is what
+   teaches the 1.5B model "compression is conditional on filler",
+   not "always translate short".
+
+Expected impact on the *latency* axis: indirect but real. Shorter
+output → shorter TTS audio → shorter playback queue when the
+speaker is on a monologue. The TTFA itself is unchanged (we still
+emit fragments at the same commit cadence), but the listener no
+longer falls progressively behind real time during a long answer.
+
+Risks (acknowledged):
+- The 70% number is a heuristic, not a hard contract. The model
+  may overshoot or undershoot on inputs that don't match the
+  few-shot pattern. Field-validate; if compression is too
+  aggressive on, say, narration, walk the figure to 80% or weaken
+  the rule's wording.
+- No automated test (same reasoning as the 2026-05-07 amendment —
+  interpreter quality is subjective).

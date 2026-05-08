@@ -8,6 +8,20 @@ pub struct AudioChunk {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub channels: u16,
+    /// True when this chunk is one of several mid-phrase fragments of a
+    /// streaming TTS utterance (XTTS-v2 `inference_stream`). The mixer
+    /// uses it to suppress the per-chunk fade-in/fade-out envelope: a
+    /// 12 ms fade applied at the boundary of a 250 ms mid-sentence
+    /// fragment chops the waveform between adjacent chunks of the SAME
+    /// word and is audible as clicks/gaps. Atomic chunks (Kokoro,
+    /// passthrough, mic capture) keep the default `false` and continue
+    /// to receive the smoothing envelope.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_streaming_chunk: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl AudioChunk {
@@ -16,6 +30,19 @@ impl AudioChunk {
             samples,
             sample_rate,
             channels,
+            is_streaming_chunk: false,
+        }
+    }
+
+    /// Constructor for mid-phrase fragments emitted by streaming TTS.
+    /// See `is_streaming_chunk` for why these need different mixer
+    /// treatment than atomic chunks.
+    pub fn streaming(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self {
+        Self {
+            samples,
+            sample_rate,
+            channels,
+            is_streaming_chunk: true,
         }
     }
 
@@ -99,5 +126,17 @@ mod tests {
     fn is_whisper_compatible_false_for_stereo() {
         let chunk = AudioChunk::new(vec![0.0; 32_000], 16_000, 2);
         assert!(!chunk.is_whisper_compatible());
+    }
+
+    #[test]
+    fn new_chunk_defaults_to_atomic_not_streaming() {
+        let chunk = AudioChunk::new(vec![0.1; 16], 16_000, 1);
+        assert!(!chunk.is_streaming_chunk);
+    }
+
+    #[test]
+    fn streaming_chunk_marks_is_streaming_chunk_true() {
+        let chunk = AudioChunk::streaming(vec![0.1; 16], 24_000, 1);
+        assert!(chunk.is_streaming_chunk);
     }
 }

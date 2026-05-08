@@ -45,3 +45,10 @@ pypinyin>=0.50
 cn2an>=0.5
 jieba>=0.42
 wavmark>=0.0.3
+
+# ── XTTS-v2 zero-shot voice cloning (alternative to Kokoro+TCC) ─────────────
+# Single-stage native voice cloning: takes a 6-second reference WAV and
+# synthesises in that exact voice. Replaces the Kokoro→OpenVoice TCC two-
+# stage pipeline when `tts_engine = "xtts"` in config.toml. coqui-tts is
+# the maintained fork of the archived Coqui TTS package. ADR 0014.
+coqui-tts>=0.24.1

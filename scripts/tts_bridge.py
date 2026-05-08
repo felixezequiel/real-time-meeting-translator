@@ -33,9 +33,14 @@ Protocol (binary-framed, unchanged from the Piper era):
      "formant_shift": 1.0           (optional ratio; 1.0 = no change)
     }\\n
 
-- Response (binary):
-    {"sample_rate": 24000, "num_samples": N}\\n
+- Response (binary, single-frame):
+    {"sample_rate": 24000, "num_samples": N, "final": true}\\n
     <N * 2 bytes int16 little-endian PCM>
+
+  Kokoro is atomic — every request emits exactly ONE frame with
+  `final=true`. The Rust client reads frames in a loop until it sees
+  `final=true`, so the same client code works for both Kokoro and
+  the multi-frame XTTS streaming bridge.
 
 Requires:
   pip install kokoro-onnx pyworld numpy
@@ -149,10 +154,19 @@ def write_json_line(obj: dict) -> None:
 
 
 def write_pcm_response(samples_np: np.ndarray, sample_rate: int) -> None:
+    """Emit Kokoro's single-frame response. `final=true` always — Kokoro
+    is atomic and produces one PCM blob per request. The Rust client
+    reads frames in a loop until `final=true`, so this single-frame
+    response satisfies the same protocol the streaming XTTS bridge uses.
+    """
     samples_np = np.clip(samples_np, -1.0, 1.0)
     int16 = (samples_np * 32767.0).astype(np.int16)
     pcm_bytes = int16.tobytes()
-    header = {"sample_rate": int(sample_rate), "num_samples": int(int16.size)}
+    header = {
+        "sample_rate": int(sample_rate),
+        "num_samples": int(int16.size),
+        "final": True,
+    }
     stdout_bin.write((json.dumps(header) + "\n").encode("utf-8"))
     stdout_bin.write(pcm_bytes)
     stdout_bin.flush()
