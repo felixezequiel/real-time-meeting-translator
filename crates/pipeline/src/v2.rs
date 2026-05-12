@@ -127,6 +127,18 @@ const PHRASE_DEDUP_WINDOW_MS: u128 = 4000;
 /// of 8 covers every reasonable case without growing unbounded.
 const PHRASE_DEDUP_RING_SIZE: usize = 8;
 
+/// How many recent diariser identifications we keep to stabilise the
+/// effective speaker_id by majority vote. ECAPA-TDNN occasionally
+/// returns a noisy id on a single chunk (similar voices, short clip);
+/// without smoothing, the Kokoro voice router and the per-speaker
+/// reference path flip every time that happens — the listener hears
+/// the same person "change voice" mid-paragraph. With K=5, a single
+/// bad call gets out-voted by four neighbours and the assigned voice
+/// stays stable; a genuine speaker change still wins after 3 of 5
+/// agreements (~9-15 s of speech in narration), which is the right
+/// trade-off between responsiveness and stability.
+const SPEAKER_HISTORY_K: usize = 5;
+
 /// Pure flush decision used by `process_segment` and unit-tested in
 /// isolation. Returns `true` when the accumulator has a forced reason
 /// to release its content even when the buffer doesn't end on a
@@ -140,6 +152,33 @@ const PHRASE_DEDUP_RING_SIZE: usize = 8;
 ///    Comma-less monologue.
 /// 3. **Aged out** — `age_ms > ACCUMULATOR_MAX_HOLD_MS`. Hard ceiling
 ///    on how long any phrase may sit pending.
+/// Pure majority-vote over the last `SPEAKER_HISTORY_K` diariser
+/// identifications. Pushes `new_id` into `history`, trims the ring,
+/// and returns the most frequent id. Ties are broken by recency
+/// (the most recently observed id among the tied wins) — that's
+/// what keeps the speaker locked instead of oscillating when a new
+/// id appears and the ring is split 50/50 between the old and the
+/// new.
+fn stable_speaker_id(new_id: u32, history: &mut VecDeque<u32>) -> u32 {
+    history.push_back(new_id);
+    while history.len() > SPEAKER_HISTORY_K {
+        history.pop_front();
+    }
+    let mut counts: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::new();
+    for &id in history.iter() {
+        *counts.entry(id).or_insert(0) += 1;
+    }
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    // Walk the ring back-to-front so the most recent id wins on ties.
+    for &id in history.iter().rev() {
+        if counts.get(&id).copied().unwrap_or(0) == max_count {
+            return id;
+        }
+    }
+    new_id
+}
+
 fn should_force_flush(word_count: usize, age_ms: u128) -> bool {
     let aged_out = age_ms > ACCUMULATOR_MAX_HOLD_MS;
     let long_enough = word_count >= ACCUMULATOR_MAX_WORDS;
@@ -185,6 +224,13 @@ struct Accumulator {
     /// front when full. Lookups use `PHRASE_DEDUP_WINDOW_MS` to ignore
     /// entries that are too old to overlap with new audio anyway.
     recent_synths: VecDeque<(String, Instant)>,
+    /// Ring of recent raw speaker ids returned by the diariser, in
+    /// closed-segment order. The pipeline routes by the MAJORITY of
+    /// this ring (`stable_speaker_id`) rather than by each diariser
+    /// call directly — a noisy ECAPA-TDNN identification on a single
+    /// chunk no longer flips the Kokoro voice / reference path. Ring
+    /// is bounded to `SPEAKER_HISTORY_K`.
+    recent_speaker_ids: VecDeque<u32>,
 }
 
 /// Pull all complete sentences from the front of `text`, leaving any
@@ -695,7 +741,14 @@ fn process_segment(
         diar_start.elapsed(),
     ));
 
-    let speaker_id = identification.as_ref().map(|s| s.speaker_id);
+    // Stabilise the diariser's per-chunk identification by majority
+    // vote over the last few closed segments. F0 history and audio
+    // enrolment still use the RAW id (we want the running F0 and the
+    // 6-second WAV reference to belong to the actual voice the
+    // diariser thought it heard, not to a smoothed alias), but the
+    // id we propagate to the rest of the pipeline (Kokoro voice
+    // routing, reference path lookup) is the stable one.
+    let raw_speaker_id = identification.as_ref().map(|s| s.speaker_id);
     if let Some(id) = identification.as_ref() {
         voice_profiles.record_f0(id.speaker_id, id.f0_hz);
         // Auto-enrolment: feed the segment audio into this speaker's
@@ -704,6 +757,19 @@ fn process_segment(
         // same speaker.
         voice_profiles.ingest_audio(id.speaker_id, &samples);
     }
+    let speaker_id = raw_speaker_id.map(|raw| {
+        let mut acc = accumulator.lock().expect("accumulator poisoned");
+        let stable = stable_speaker_id(raw, &mut acc.recent_speaker_ids);
+        if stable != raw {
+            tracing::debug!(
+                "[{}] V2 speaker id smoothed: diariser said {} → stable {}",
+                pipeline_name,
+                raw,
+                stable,
+            );
+        }
+        stable
+    });
 
     let chunk = AudioChunk::new(samples, sample_rate, 1);
 
@@ -1621,5 +1687,47 @@ mod tests {
             split_complete_sentences("Você está aqui. À tarde começa");
         assert_eq!(complete, "Você está aqui.");
         assert_eq!(rest, "À tarde começa");
+    }
+
+    // ─── stable_speaker_id: majority vote over recent diariser ids ─────
+
+    #[test]
+    fn stable_id_returns_input_with_empty_history() {
+        let mut h = VecDeque::new();
+        assert_eq!(stable_speaker_id(3, &mut h), 3);
+    }
+
+    #[test]
+    fn stable_id_holds_against_single_noisy_call() {
+        // Four calls returning 0, one noisy 5 in the middle.
+        // Majority is 0; the 5 should be out-voted.
+        let mut h = VecDeque::new();
+        stable_speaker_id(0, &mut h);
+        stable_speaker_id(0, &mut h);
+        let result = stable_speaker_id(5, &mut h); // noise
+        assert_eq!(result, 0);
+        let result = stable_speaker_id(0, &mut h);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn stable_id_switches_after_sustained_change() {
+        // After three consecutive calls with the new id, it has to
+        // win — a real speaker change should not be held back forever.
+        let mut h = VecDeque::new();
+        stable_speaker_id(0, &mut h);
+        stable_speaker_id(0, &mut h);
+        assert_eq!(stable_speaker_id(1, &mut h), 0); // still 0 (2 vs 1)
+        assert_eq!(stable_speaker_id(1, &mut h), 1); // 2 vs 2 → tie, recency wins
+        assert_eq!(stable_speaker_id(1, &mut h), 1); // 2 vs 3 → 1 wins
+    }
+
+    #[test]
+    fn stable_id_ring_is_bounded() {
+        let mut h = VecDeque::new();
+        for _ in 0..20 {
+            stable_speaker_id(7, &mut h);
+        }
+        assert!(h.len() <= SPEAKER_HISTORY_K);
     }
 }

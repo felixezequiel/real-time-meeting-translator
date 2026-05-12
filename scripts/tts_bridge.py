@@ -72,34 +72,34 @@ sys.stdin = __import__("io").TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
 #   bm_*  : British English, male        bf_*  : British English, female
 #   pm_*  : Portuguese (Brazil), male    pf_*  : Portuguese (Brazil), female
 #
-# All these voices ship with the kokoro-v1.0.onnx + voices-v1.0.bin
-# bundle. Voices not present at runtime are filtered by `setup_piper`
-# during boot.
+# Two-voice pool per language: ONE representative male + ONE
+# representative female. The bridge picks between them by F0 alone
+# (target_f0 < ~165 Hz → male voice; >= → female). Reduced from a
+# 3-6 voice pool on 2026-05-12 because the larger pool was causing
+# perceptible voice flips whenever the diariser re-assigned a
+# speaker_id (every "new" speaker grabbed a different Kokoro voice
+# from the pool, which the listener heard as the same person changing
+# voice). With only one voice per gender, speaker differentiation
+# falls entirely on the OpenVoice TCC layer (ADR 0011), which applies
+# the speaker's actual timbre once auto-enrolment captures a 6 s
+# reference WAV. Trade-off: speakers of the same gender sound
+# identical until enrolment completes (~6 s of speech); after that
+# TCC distinguishes them.
 KOKORO_VOICES_BY_LANG = {
     "en": [
-        "am_michael",   # male, baritone (~120 Hz)
-        "am_eric",      # male, mid (~135 Hz)
-        "am_adam",      # male, lighter (~150 Hz)
-        "af_bella",     # female, mid (~210 Hz)
-        "af_sarah",     # female, brighter (~225 Hz)
-        "af_nicole",    # female, lower (~190 Hz)
+        "am_michael",   # male, baritone (~120 Hz) — single male choice
+        "af_bella",     # female, mid (~210 Hz)    — single female choice
     ],
     "en-us": [
         "am_michael",
-        "am_eric",
-        "am_adam",
         "af_bella",
-        "af_sarah",
-        "af_nicole",
     ],
     "pt": [
-        "pm_alex",      # male (~135 Hz)
-        "pm_santa",     # male, alternate (~125 Hz if shipped)
-        "pf_dora",      # female (~205 Hz if shipped)
+        "pm_alex",      # male (~135 Hz)           — single male choice
+        "pf_dora",      # female (~205 Hz)         — single female choice
     ],
     "pt-br": [
         "pm_alex",
-        "pm_santa",
         "pf_dora",
     ],
 }
