@@ -17,8 +17,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from translation_bridge import (  # noqa: E402
     split_commit_point,
+    build_messages,
+    record_history,
+    reset_history,
     MAX_BUFFER_CHARS,
     MIN_CLAUSE_FRAGMENT_CHARS,
+    TRANSLATION_HISTORY_MAX,
 )
 
 
@@ -101,6 +105,78 @@ class LengthSafetyValveTests(unittest.TestCase):
 class EmptyBufferTests(unittest.TestCase):
     def test_empty_returns_minus_one(self):
         self.assertEqual(split_commit_point(""), -1)
+
+
+class TranslationHistoryTests(unittest.TestCase):
+    """ADR 0016 — Qwen sees the last K=2 phrase pairs as chat history."""
+
+    def setUp(self):
+        # Each test gets a clean ring per direction so order between
+        # tests does not couple them.
+        reset_history()
+
+    def _messages_for(self, text: str, source: str = "en", target: str = "pt") -> list[dict]:
+        return build_messages(text, source, target)
+
+    def _count_user_assistant_pairs(self, messages: list[dict]) -> int:
+        # Count consecutive user/assistant pairs after the leading
+        # system message. Used to compare against few-shot baseline.
+        pairs = 0
+        i = 1
+        while i + 1 < len(messages):
+            if messages[i]["role"] == "user" and messages[i + 1]["role"] == "assistant":
+                pairs += 1
+                i += 2
+            else:
+                break
+        return pairs
+
+    def test_history_empty_baseline(self):
+        # Without any recorded history, the prompt is just system +
+        # few-shots + the current user turn. No extra "assistant"
+        # entries injected.
+        baseline = self._messages_for("Hello.")
+        # Last message is the user turn.
+        self.assertEqual(baseline[-1], {"role": "user", "content": "Hello."})
+
+    def test_history_one_entry_injected_before_user_turn(self):
+        record_history("en", "pt", "Hello.", "Olá.")
+        with_one = self._messages_for("How are you?")
+        # The last three messages should be:
+        #   user: Hello.
+        #   assistant: Olá.
+        #   user: How are you?
+        self.assertEqual(with_one[-1], {"role": "user", "content": "How are you?"})
+        self.assertEqual(with_one[-2], {"role": "assistant", "content": "Olá."})
+        self.assertEqual(with_one[-3], {"role": "user", "content": "Hello."})
+
+    def test_history_ring_capped_at_max(self):
+        # Push K+1 entries; oldest must fall off.
+        record_history("en", "pt", "First.", "Primeiro.")
+        record_history("en", "pt", "Second.", "Segundo.")
+        record_history("en", "pt", "Third.", "Terceiro.")
+        msgs = self._messages_for("Fourth.")
+        # The injected history should hold only the last TRANSLATION_HISTORY_MAX
+        # pairs — i.e. "Second" and "Third", NOT "First".
+        contents = [m["content"] for m in msgs]
+        self.assertIn("Second.", contents)
+        self.assertIn("Third.", contents)
+        self.assertNotIn("First.", contents)
+        # Sanity: still ends in the new user turn.
+        self.assertEqual(msgs[-1], {"role": "user", "content": "Fourth."})
+
+    def test_history_isolated_per_direction(self):
+        # Pt→En history should not leak into En→Pt prompts.
+        record_history("pt", "en", "Olá.", "Hello.")
+        msgs_en_to_pt = self._messages_for("Goodbye.", source="en", target="pt")
+        contents = [m["content"] for m in msgs_en_to_pt]
+        self.assertNotIn("Olá.", contents)
+        self.assertNotIn("Hello.", contents)
+
+    def test_history_max_constant_is_at_least_two(self):
+        # Sanity guard against accidentally lowering the cap below the
+        # ADR's chosen value.
+        self.assertGreaterEqual(TRANSLATION_HISTORY_MAX, 2)
 
 
 if __name__ == "__main__":

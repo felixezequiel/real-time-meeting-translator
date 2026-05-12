@@ -97,6 +97,48 @@ MIN_CLAUSE_FRAGMENT_CHARS = 35
 # rambling speaker without punctuation pinned the queue indefinitely.
 MAX_BUFFER_CHARS = 80
 
+# ─── Translation context window (ADR 0016) ────────────────────────────────
+#
+# Qwen 1.5B-Q4 translates each phrase as a fresh chat — no memory of what
+# the speaker said before. That makes anaphora ("these glasses", "I think
+# they exist") drop the antecedent and numeric/named-entity translations
+# inconsistent across sentences ("Ten years" alternating between "Dez" and
+# "Doze"). We prepend the last `TRANSLATION_HISTORY_MAX` (source, target)
+# pairs as a user→assistant exchange before the current user turn. The
+# model already takes the few-shots in the same shape, so this is a
+# zero-architecture change.
+
+TRANSLATION_HISTORY_MAX = 2
+
+# Per-direction ring of `(source_text, target_text)` pairs. Module-level
+# state because the bridge serves one Qwen instance for the lifetime of
+# the subprocess and there's no per-request multitenancy. Key is
+# `(source_lang, target_lang)` so EN→PT and PT→EN don't share context.
+import collections
+_RECENT_HISTORY: dict[tuple[str, str], "collections.deque[tuple[str, str]]"] = {}
+
+
+def record_history(source_lang: str, target_lang: str, source_text: str, target_text: str) -> None:
+    """Append a successful translation to the ring for this direction.
+    Empty translations (degenerate cases, error fallbacks) are filtered
+    out by the caller — the ring should only see good examples to avoid
+    teaching the next prompt its own mistakes.
+    """
+    if not source_text.strip() or not target_text.strip():
+        return
+    key = (source_lang, target_lang)
+    ring = _RECENT_HISTORY.get(key)
+    if ring is None:
+        ring = collections.deque(maxlen=TRANSLATION_HISTORY_MAX)
+        _RECENT_HISTORY[key] = ring
+    ring.append((source_text.strip(), target_text.strip()))
+
+
+def reset_history() -> None:
+    """Drop every direction's history. Used by tests and by the
+    operator-facing protocol (future hook — not wired today)."""
+    _RECENT_HISTORY.clear()
+
 
 def split_commit_point(buffer: str) -> int:
     """Return the index *after which* `buffer` should be committed, or -1
@@ -323,8 +365,10 @@ FEWSHOT = [
 
 
 def build_messages(text: str, source_lang: str, target_lang: str) -> list[dict]:
-    """Compose the chat messages for one translation. Few-shot examples
-    matching the requested direction go first, then the user input."""
+    """Compose the chat messages for one translation. Order:
+    system → static few-shot pairs → recent-history pairs (ADR 0016) →
+    current user turn. History is per-direction so EN→PT prompts don't
+    inherit PT→EN context."""
     src_name = LANG_NAMES.get(source_lang, source_lang)
     tgt_name = LANG_NAMES.get(target_lang, target_lang)
     messages = [
@@ -336,6 +380,14 @@ def build_messages(text: str, source_lang: str, target_lang: str) -> list[dict]:
             continue
         messages.append({"role": "user", "content": src_text})
         messages.append({"role": "assistant", "content": tgt_text})
+    # Recent conversation history for THIS direction. The deque already
+    # caps itself to TRANSLATION_HISTORY_MAX so we just append whatever
+    # is currently there in chronological order.
+    history = _RECENT_HISTORY.get((source_lang, target_lang))
+    if history is not None:
+        for prev_src, prev_tgt in history:
+            messages.append({"role": "user", "content": prev_src})
+            messages.append({"role": "assistant", "content": prev_tgt})
     messages.append({"role": "user", "content": text})
     return messages
 
@@ -421,17 +473,23 @@ def load_llm():
 
 # ─── Streaming translation ──────────────────────────────────────────────────
 
-def translate_streaming(llm, text: str, source_lang: str, target_lang: str) -> None:
+def translate_streaming(llm, text: str, source_lang: str, target_lang: str) -> str:
     """Stream the translation, emitting one JSON-line per fragment as
-    soon as the buffer hits a commit point. Closes with `is_final: true`."""
+    soon as the buffer hits a commit point. Closes with `is_final: true`.
+
+    Returns the concatenated full output string (every emitted fragment
+    joined) so the caller can decide whether to record it in the
+    cross-phrase history ring (ADR 0016). Empty / error cases return
+    an empty string."""
     if not text.strip():
         write_line({"fragment": "", "is_final": True})
-        return
+        return ""
 
     messages = build_messages(text, source_lang, target_lang)
 
     buffer = ""
     emitted_any = False
+    full_output_parts: list[str] = []
 
     # `temperature=0` for deterministic output (translation, not creative
     # writing). `max_tokens=256` is plenty for a single utterance — if
@@ -454,6 +512,7 @@ def translate_streaming(llm, text: str, source_lang: str, target_lang: str) -> N
             fragment = buffer[:commit_point]
             buffer = buffer[commit_point:]
             write_line({"fragment": fragment, "is_final": False})
+            full_output_parts.append(fragment)
             emitted_any = True
             commit_point = split_commit_point(buffer)
 
@@ -461,6 +520,7 @@ def translate_streaming(llm, text: str, source_lang: str, target_lang: str) -> N
     # translation that didn't end on a commit point.
     if buffer:
         write_line({"fragment": buffer, "is_final": False})
+        full_output_parts.append(buffer)
         emitted_any = True
 
     # Always send a terminator so the Rust client knows the stream is
@@ -470,6 +530,8 @@ def translate_streaming(llm, text: str, source_lang: str, target_lang: str) -> N
         write_line({"fragment": "", "is_final": True})
     else:
         write_line({"fragment": "", "is_final": True})
+
+    return "".join(full_output_parts).strip()
 
 
 # ─── Main loop ──────────────────────────────────────────────────────────────
@@ -519,7 +581,11 @@ def main() -> None:
             text = request["text"]
             source_lang = request["source_lang"]
             target_lang = request["target_lang"]
-            translate_streaming(llm, text, source_lang, target_lang)
+            full_output = translate_streaming(llm, text, source_lang, target_lang)
+            # ADR 0016: feed the successful pair back into the per-direction
+            # history ring so the next translation sees it as context.
+            # `record_history` filters empty/whitespace cases internally.
+            record_history(source_lang, target_lang, text, full_output)
         except Exception as e:
             log(f"Translation error: {type(e).__name__}: {e}")
             import traceback
