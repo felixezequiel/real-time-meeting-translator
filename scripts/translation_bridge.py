@@ -205,6 +205,9 @@ Rules:
 10. **Sentence fragments** — translate the fragment as-is, do not invent words to complete it.
 11. **Empty or noise input** — output an empty string.
 12. NEVER add commentary, explanations, or conversational responses. Output is ONLY the translation.
+13. **ONLY translate the LAST user turn.** Previous user/assistant turns shown above are context from earlier in the same conversation — they exist so you understand pronouns, references and topics. NEVER copy text from those turns into the output. NEVER continue or extend an earlier sentence. NEVER mix languages — if the last user turn is fully in {source}, the entire output is in {target} with no fragment of {source} left untranslated.
+14. **Single-pass repetition removal.** If the speaker says "welcome welcome" or "no no no", emit ONE occurrence in the target ("Bem-vindo" / "Não"), not two. The same applies even when the history shows you previously translated a similar word — that's no reason to duplicate it now.
+15. **Speed beats elegance.** When a shorter rendering preserves the meaning, prefer it. A live audience is listening; they cannot re-read.
 """
 
 LANG_NAMES = {"en": "English", "pt": "Portuguese (Brazilian)"}
@@ -270,6 +273,13 @@ FEWSHOT = [
      "Claro, sem problemas.", "en", "pt"),
     ("Welcome, welcome to the first, the very first episode of our new series.",
      "Bem-vindo ao primeiro episódio da nossa nova série.", "en", "pt"),
+    # EN -> PT: in-phrase double-greeting collapses to one (regression
+    # captured 2026-05-12: model emitted "Bem-vindo, bem-vindo" because
+    # the conversation history already contained "Bem-vindo" — rule 14
+    # in the system prompt forbids that pattern; this few-shot anchors
+    # the correct behaviour).
+    ("Welcome, welcome you and they hand you a drink.",
+     "Te recebem e te dão uma bebida.", "en", "pt"),
     # EN -> PT: self-correction / restart
     ("I I I think we — we should — we should wait a bit longer.",
      "Acho que devemos esperar mais um pouco.", "en", "pt"),
