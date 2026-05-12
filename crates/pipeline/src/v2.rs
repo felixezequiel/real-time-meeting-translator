@@ -215,6 +215,18 @@ struct Accumulator {
     /// in the default voice even though the diariser had already
     /// identified the speaker on the previous closed segment.
     last_known_reference_path: Option<String>,
+    /// Sticky "last identified speaker" id and F0, kept across flushes
+    /// for the same reason as `last_known_reference_path`: streaming
+    /// partials never carry a speaker_id (diariser only runs on
+    /// closed segments). Without this, the Kokoro voice router got
+    /// `target_f0 = 0` and `speaker_id = None` on every partial-driven
+    /// flush, fell into the default-voice path, and the listener
+    /// heard the same person alternating between `pm_alex` (partial
+    /// flush) and `pf_dora` (closed-segment flush) sentence by
+    /// sentence. Captured 2026-05-12. Same sticky semantics as the
+    /// reference path field above.
+    last_known_speaker_id: Option<u32>,
+    last_known_f0_hz: f32,
     /// Ring of recently-synthesised translations with their dispatch
     /// timestamp. Used to suppress duplicates: the streaming-partial
     /// path and the closed-segment path can both commit the same
@@ -1011,10 +1023,16 @@ fn ingest_text_and_maybe_flush(
                 .pending_reference_path
                 .clone()
                 .or_else(|| acc.last_known_reference_path.clone());
+            let snapshot_speaker = acc.pending_speaker_id.or(acc.last_known_speaker_id);
+            let snapshot_f0 = if acc.pending_f0_hz > 0.0 {
+                acc.pending_f0_hz
+            } else {
+                acc.last_known_f0_hz
+            };
             let snapshot = (
                 drained,
-                acc.pending_speaker_id,
-                acc.pending_f0_hz,
+                snapshot_speaker,
+                snapshot_f0,
                 snapshot_reference,
             );
             acc.pending_speaker_id = None;
@@ -1038,6 +1056,10 @@ fn ingest_text_and_maybe_flush(
         }
         if f0_for_tts > 0.0 {
             acc.pending_f0_hz = f0_for_tts;
+            acc.last_known_f0_hz = f0_for_tts;
+        }
+        if let Some(id) = speaker_id {
+            acc.last_known_speaker_id = Some(id);
         }
         if resolved_reference.is_some() {
             acc.pending_reference_path = resolved_reference.clone();
@@ -1073,10 +1095,16 @@ fn ingest_text_and_maybe_flush(
                 .pending_reference_path
                 .clone()
                 .or_else(|| acc.last_known_reference_path.clone());
+            let snapshot_speaker = acc.pending_speaker_id.or(acc.last_known_speaker_id);
+            let snapshot_f0 = if acc.pending_f0_hz > 0.0 {
+                acc.pending_f0_hz
+            } else {
+                acc.last_known_f0_hz
+            };
             let snapshot = (
                 complete,
-                acc.pending_speaker_id,
-                acc.pending_f0_hz,
+                snapshot_speaker,
+                snapshot_f0,
                 snapshot_ref,
             );
             acc.pending_text = remaining;
@@ -1094,11 +1122,17 @@ fn ingest_text_and_maybe_flush(
                 .pending_reference_path
                 .clone()
                 .or_else(|| acc.last_known_reference_path.clone());
+            let snapshot_speaker = acc.pending_speaker_id.or(acc.last_known_speaker_id);
+            let snapshot_f0 = if acc.pending_f0_hz > 0.0 {
+                acc.pending_f0_hz
+            } else {
+                acc.last_known_f0_hz
+            };
             let drained = std::mem::take(&mut acc.pending_text);
             let snapshot = (
                 drained,
-                acc.pending_speaker_id,
-                acc.pending_f0_hz,
+                snapshot_speaker,
+                snapshot_f0,
                 snapshot_ref,
             );
             acc.pending_speaker_id = None;
