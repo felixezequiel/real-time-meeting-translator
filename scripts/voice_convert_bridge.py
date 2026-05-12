@@ -83,6 +83,22 @@ TCC_SAMPLE_RATE = 22_050
 MIN_REF_SECONDS = 3.0
 MAX_REF_SECONDS = 10.0
 
+# Minimum source-side audio length before we trust the SE extraction.
+# OpenVoice's internal VAD can produce a 0-frame embedding when given
+# short or silent audio; that empty SE then poisons every subsequent
+# conversion as `shape (0,) into (0,8)`. 8000 samples at the typical
+# Kokoro 24 kHz output ≈ 333 ms — enough for one stable spectrogram
+# slice without making the very first Kokoro call wait too long.
+MIN_SOURCE_SAMPLES_FOR_SE = 8000
+
+# `extract_se` on a real-audio WAV takes ~80-200 ms even on warm CUDA.
+# Anything under this threshold is a smell — the call short-circuited
+# (empty audio, malformed file) and the returned embedding is almost
+# certainly the all-zeros / 0-frame artifact that caused the
+# 2026-05-12 ValueError. We refuse to cache it and let the next call
+# try again with a fresh source.
+SUSPICIOUSLY_FAST_SE_MS = 10.0
+
 # Per-call caches (process lifetime).
 _REF_SE_CACHE: dict[str, "torch.Tensor"] = {}
 _SOURCE_SE: "torch.Tensor | None" = None
@@ -346,6 +362,24 @@ class TccBridge:
         t = time.monotonic()
         self._tcc.load_ckpt(ckpt_path)
         log(f"[init] load_ckpt: {(time.monotonic() - t) * 1000:.0f} ms")
+        # Disable watermarking entirely. `convert()` always calls
+        # `add_watermark(audio, message)`, and `add_watermark` then
+        # calls `utils.string_to_bits(message).reshape(-1)`. With
+        # `message=""` (which we pass to indicate "no watermark"),
+        # `string_to_bits` returns an array of shape `(0,)` and tries
+        # to assign it into a `(0, 8)` slot, which numpy refuses with
+        # `ValueError: could not broadcast input array from shape (0,)
+        # into shape (0,8)`. Captured 2026-05-12: every TCC call was
+        # raising this and the pipeline was silently playing raw
+        # Kokoro for the whole session. Monkey-patching `add_watermark`
+        # to identity sidesteps the bug — we never wanted the watermark
+        # anyway (the model itself is short-circuited by `stub_wavmark`
+        # above). Same fix would land upstream as a guard for empty
+        # `message`, but we're vendoring an unmaintained OpenVoice
+        # snapshot in third_party/ so patching here is faster than
+        # carrying a forked OpenVoice tree.
+        self._tcc.add_watermark = lambda audio, message: audio  # type: ignore[method-assign]
+        log("[init] watermarking disabled (add_watermark patched to identity)")
         log(f"[init] TCC ready (total: {(time.monotonic() - t_total) * 1000:.0f} ms)")
 
     def get_target_se(self, ref_wav_path: str) -> "torch.Tensor | None":
@@ -383,7 +417,7 @@ class TccBridge:
             log(traceback.format_exc())
             return None
 
-    def get_source_se(self, kokoro_wav_path: str) -> "torch.Tensor":
+    def get_source_se(self, kokoro_wav_path: str, num_samples: int) -> "torch.Tensor | None":
         """Return the source-side SE used as the 'from' embedding for
         every conversion. We compute it once from the first Kokoro
         sample we see (Kokoro voices share enough spectral statistics
@@ -391,15 +425,42 @@ class TccBridge:
 
         Same `extract_se` shortcut as `get_target_se` above — avoids
         the whisper_timestamped dependency entirely.
+
+        Returns None when the audio is too short for a reliable SE OR
+        when `extract_se` returns suspiciously fast (a corrupt 0-frame
+        embedding cached as global state poisoned every following
+        conversion for the rest of the session on 2026-05-12 — see
+        the `[vc] conversion failed: ValueError: could not broadcast
+        input array from shape (0,) into shape (0,8)` regression).
+        Callers degrade to playing raw Kokoro on None.
         """
         global _SOURCE_SE
         if _SOURCE_SE is not None:
             return _SOURCE_SE
+        if num_samples < MIN_SOURCE_SAMPLES_FOR_SE:
+            log(
+                f"[se] source pcm too short ({num_samples} samples) "
+                f"for reliable SE extraction — skipping cache"
+            )
+            return None
         t = time.monotonic()
-        se = self._tcc.extract_se(kokoro_wav_path)
+        try:
+            se = self._tcc.extract_se(kokoro_wav_path)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            log(f"[se] source SE extract crashed: {type(e).__name__}: {e}")
+            log(traceback.format_exc())
+            return None
+        elapsed_ms = (time.monotonic() - t) * 1000
+        if elapsed_ms < SUSPICIOUSLY_FAST_SE_MS:
+            log(
+                f"[se] source SE extract returned in {elapsed_ms:.0f} ms — "
+                f"likely a corrupt 0-frame embedding, NOT caching"
+            )
+            return None
         log(
             f"[se] extracted Kokoro source SE in "
-            f"{(time.monotonic() - t) * 1000:.0f} ms (cached for the session)"
+            f"{elapsed_ms:.0f} ms (cached for the session)"
         )
         _SOURCE_SE = se
         return se
@@ -432,7 +493,13 @@ class TccBridge:
                     f"{os.path.basename(ref_wav_path)} — playing raw TTS"
                 )
                 return source_pcm_f32, source_sr, False
-            source_se = self.get_source_se(src_path)
+            source_se = self.get_source_se(src_path, len(source_pcm_f32))
+            if source_se is None:
+                log(
+                    "[vc] FALLBACK: source SE unavailable "
+                    "(short audio or extraction failure) — playing raw TTS"
+                )
+                return source_pcm_f32, source_sr, False
 
             t = time.monotonic()
             out_audio = self._tcc.convert(
@@ -450,7 +517,17 @@ class TccBridge:
             )
             return np.asarray(out_audio, dtype=np.float32), TCC_SAMPLE_RATE, True
         except Exception as e:  # noqa: BLE001
+            import traceback
             log(f"[vc] conversion failed: {type(e).__name__}: {e}")
+            log(traceback.format_exc())
+            # Poisoned-cache hypothesis: if `_SOURCE_SE` was cached from
+            # a malformed first call, every subsequent conversion fails
+            # with the same shape error. Invalidating it here gives the
+            # next call a chance to re-extract from a (probably longer)
+            # source audio. Cheap: at worst we pay one extra ~150 ms SE
+            # extraction; at best we recover the conversion path.
+            global _SOURCE_SE
+            _SOURCE_SE = None
             return source_pcm_f32, source_sr, False
         finally:
             try:
