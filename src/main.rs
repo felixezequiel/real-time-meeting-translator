@@ -21,6 +21,7 @@ use ui::settings_window::SettingsInit;
 use ui::subtitle_overlay::SubtitleMessage;
 use ui::{TrayAction, TrayUi};
 use diarization::OnlineDiarizer;
+use sbd::SbdService;
 use separation::{PermutationTracker, Sepformer, DEFAULT_TRACKER_TAIL_SAMPLES};
 use voice_convert::ToneColorConverter;
 
@@ -95,6 +96,11 @@ struct LoadedModels {
     /// concurrent calls. Initialised only when
     /// `config.enable_voice_conversion` is true at startup.
     voice_convert: Option<Arc<ToneColorConverter>>,
+    /// Optional Sentence Boundary Detection bridge (spaCy). Shared by
+    /// every pipeline branch — the bridge's mutex serialises calls.
+    /// When `None`, the accumulator falls back to its regex-based
+    /// `split_complete_sentences` rule.
+    sbd: Option<Arc<SbdService>>,
 }
 
 // ─── Active audio pipelines (cheap — can be restarted on device change) ──────
@@ -573,6 +579,27 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
         None
     };
 
+    // SBD bridge (spaCy) — added 2026-05-12. Feeds the V2 accumulator
+    // a semantic-aware "is this text a complete sentence?" verdict
+    // instead of the regex-only `split_complete_sentences` fallback.
+    // Required for documentary-style narration where Whisper rarely
+    // emits punctuation: without it, the accumulator flushes mid-clause
+    // and the translator produces orphan fragments. Failure here is
+    // non-fatal — pipeline falls back to the regex rule.
+    let sbd_script = scripts_dir.join("sbd_bridge.py");
+    tracing::info!("Initializing SBD bridge (spaCy)…");
+    let mut sbd_service = SbdService::new(sbd_script);
+    let sbd = match sbd_service.initialize().await {
+        Ok(()) => Some(Arc::new(sbd_service)),
+        Err(e) => {
+            tracing::warn!(
+                "SBD bridge failed to start ({}). Pipeline will fall back to regex sentence splitting.",
+                e
+            );
+            None
+        }
+    };
+
     Ok(LoadedModels {
         stt_a: Arc::new(stt_a),
         stt_b: Arc::new(stt_b),
@@ -581,6 +608,7 @@ async fn load_models(config: &PipelineConfig, scripts_dir: &std::path::Path) -> 
         diarizer,
         separator,
         voice_convert,
+        sbd,
     })
 }
 
@@ -706,6 +734,9 @@ async fn start_pipelines(
         if let Some(vc) = models.voice_convert.as_ref() {
             pipeline = pipeline.with_voice_convert(Arc::clone(vc));
         }
+        if let Some(s) = models.sbd.as_ref() {
+            pipeline = pipeline.with_sbd(Arc::clone(s));
+        }
         if let Some(tx) = subtitle_event_tx.as_ref() {
             pipeline = pipeline.with_subtitle_channel(tx.clone());
         }
@@ -785,6 +816,9 @@ async fn start_pipelines(
     }
     if let Some(vc) = models.voice_convert.as_ref() {
         mic_pipeline = mic_pipeline.with_voice_convert(Arc::clone(vc));
+    }
+    if let Some(s) = models.sbd.as_ref() {
+        mic_pipeline = mic_pipeline.with_sbd(Arc::clone(s));
     }
     if let Some(profile_path) = config.mic_voice_profile_path.as_deref() {
         if has_voice_profile {

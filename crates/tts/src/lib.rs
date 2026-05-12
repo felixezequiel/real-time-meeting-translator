@@ -4,12 +4,32 @@ use shared::{AudioChunk, Language, PipelineStage, StageError, TextSegment};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Mutex;
+use std::time::Duration;
 use thiserror::Error;
 use tracing;
 
 const MONO_CHANNELS: u16 = 1;
 const BYTES_PER_INT16_SAMPLE: usize = 2;
+
+/// Maximum time to wait for the next frame from the Python TTS bridge
+/// before declaring the request a hang. When XTTS-v2 deadlocks (seen
+/// 2026-05-11 on auto-enrolled references), the read blocks forever
+/// and every downstream phrase piles up behind it. Returning Err here
+/// releases the inflight slot in the pipeline so the next phrase can
+/// try with a fresh request. 15 s covers the legitimate worst case
+/// (90+ char Portuguese phrase at RTF ~2 on RTX 3050 = ~12 s synth)
+/// with comfortable headroom.
+const TTS_FRAME_TIMEOUT_MS: u64 = 15_000;
+
+/// Bounded channel capacity for the bridge reader → caller hand-off.
+/// At XTTS's ~250 ms PCM chunk cadence, 32 slots ≈ 8 s of buffered
+/// audio before the reader thread blocks on send. Larger values waste
+/// memory; smaller values starve the consumer when a long phrase is
+/// being synthesised while a previous phrase is still playing out
+/// through the mixer.
+const TTS_BRIDGE_CHANNEL_CAPACITY: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum TtsError {
@@ -119,10 +139,87 @@ pub struct PiperTts {
     process: Option<Mutex<TtsBridgeProcess>>,
 }
 
+/// Event the background reader thread emits for every frame (or
+/// terminal condition) it observes on the bridge's stdout. The
+/// previous design read stdout directly in `synthesize_stream`,
+/// which deadlocked the whole pipeline whenever the XTTS subprocess
+/// hung (no way to bound the wait). With this enum a reader thread
+/// owns the BufReader and pushes events into a channel that the
+/// caller drains with a timeout — the caller can give up on the
+/// current request without leaking a thread or losing protocol
+/// sync, because the next request drains stale events before
+/// writing its own.
+enum TtsBridgeEvent {
+    Frame(TtsResponseHeader, Vec<f32>),
+    /// Anything that broke the protocol: invalid JSON, truncated PCM,
+    /// IO error on the pipe. The string is a human-readable detail
+    /// for logs.
+    Error(String),
+    /// Bridge stdout closed cleanly — subprocess exited or was killed.
+    Eof,
+}
+
 struct TtsBridgeProcess {
     child: Child,
     stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    /// Bounded channel fed by the background reader thread. Bounded
+    /// to limit memory if the consumer falls behind; the reader
+    /// blocks on send when full, which naturally back-pressures the
+    /// pipe — XTTS produces ~250 ms PCM chunks, so 32 slots covers
+    /// ~8 s of buffered audio before the producer stalls.
+    frame_rx: std_mpsc::Receiver<TtsBridgeEvent>,
+}
+
+/// Background reader thread body. Owns the BufReader for the bridge's
+/// stdout and pushes one `TtsBridgeEvent` per frame (or one terminal
+/// event on EOF/error) into the channel. Exits silently when the
+/// receiver is dropped — that happens when the `PiperTts` is shut
+/// down and the `TtsBridgeProcess` is dropped along with its `Receiver`.
+fn bridge_reader_loop(
+    mut reader: BufReader<std::process::ChildStdout>,
+    tx: std_mpsc::SyncSender<TtsBridgeEvent>,
+) {
+    loop {
+        let mut header_line = String::new();
+        match reader.read_line(&mut header_line) {
+            Ok(0) => {
+                let _ = tx.send(TtsBridgeEvent::Eof);
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(TtsBridgeEvent::Error(format!("read_line: {}", e)));
+                return;
+            }
+            Ok(_) => {}
+        }
+
+        let header: TtsResponseHeader = match serde_json::from_str(header_line.trim()) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = tx.send(TtsBridgeEvent::Error(format!(
+                    "Invalid TTS header: {}",
+                    e
+                )));
+                return;
+            }
+        };
+
+        let samples = match read_pcm_samples(&mut reader, header.num_samples as usize) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(TtsBridgeEvent::Error(format!("Failed to read PCM: {}", e)));
+                return;
+            }
+        };
+
+        // SyncSender::send blocks if the channel is full, which is the
+        // back-pressure path we want: a slow consumer naturally throttles
+        // the bridge instead of letting frames pile up in memory.
+        if tx.send(TtsBridgeEvent::Frame(header, samples)).is_err() {
+            // Receiver dropped — pipeline shutting down. Exit cleanly.
+            return;
+        }
+    }
 }
 
 impl PiperTts {
@@ -196,6 +293,23 @@ impl PiperTts {
         let request_json =
             serde_json::to_string(&request).map_err(|e| TtsError::SynthesisFailed(e.to_string()))?;
 
+        // Drain any frames left in the channel from a previous request
+        // that timed out on the Rust side while the bridge kept
+        // producing. Without this, the next request would consume the
+        // stale frames as its own response and the streams would
+        // desynchronise — XTTS would still be on phrase N's audio
+        // while the Rust side thinks it's reading phrase N+1.
+        let mut drained = 0_usize;
+        while bridge.frame_rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        if drained > 0 {
+            tracing::warn!(
+                "Drained {} stale TTS frame(s) before new request — previous synth likely timed out",
+                drained
+            );
+        }
+
         writeln!(bridge.stdin, "{}", request_json)
             .map_err(|e| TtsError::SynthesisFailed(e.to_string()))?;
         bridge
@@ -216,19 +330,34 @@ impl PiperTts {
         // the trace below because the loop runs at least once.
         #[allow(unused_assignments)]
         let mut last_sample_rate: u32 = 0;
+        let frame_timeout = Duration::from_millis(TTS_FRAME_TIMEOUT_MS);
 
         loop {
-            let mut header_line = String::new();
-            bridge
-                .stdout
-                .read_line(&mut header_line)
-                .map_err(|e| TtsError::SynthesisFailed(e.to_string()))?;
+            // Bounded wait for the next frame. If the bridge hangs
+            // (auto-enrolled WAV bug, CUDA OOM, modeled edge case)
+            // this is what stops the whole pipeline from following
+            // it into the deadlock.
+            let event = bridge.frame_rx.recv_timeout(frame_timeout).map_err(|e| match e {
+                std_mpsc::RecvTimeoutError::Timeout => TtsError::SynthesisFailed(format!(
+                    "TTS frame timeout after {}ms (bridge appears hung)",
+                    TTS_FRAME_TIMEOUT_MS
+                )),
+                std_mpsc::RecvTimeoutError::Disconnected => TtsError::SynthesisFailed(
+                    "TTS bridge reader thread disconnected (subprocess died?)".to_string(),
+                ),
+            })?;
 
-            let header: TtsResponseHeader = serde_json::from_str(header_line.trim())
-                .map_err(|e| TtsError::SynthesisFailed(format!("Invalid TTS header: {}", e)))?;
-
-            let samples = read_pcm_samples(&mut bridge.stdout, header.num_samples as usize)
-                .map_err(|e| TtsError::SynthesisFailed(format!("Failed to read PCM: {}", e)))?;
+            let (header, samples) = match event {
+                TtsBridgeEvent::Frame(h, s) => (h, s),
+                TtsBridgeEvent::Eof => {
+                    return Err(TtsError::SynthesisFailed(
+                        "TTS bridge stdout closed mid-request".to_string(),
+                    ));
+                }
+                TtsBridgeEvent::Error(detail) => {
+                    return Err(TtsError::SynthesisFailed(detail));
+                }
+            };
 
             last_sample_rate = header.sample_rate;
             total_samples += samples.len();
@@ -353,10 +482,26 @@ impl PipelineStage for PiperTts {
             )));
         }
 
+        // Hand the BufReader off to a background thread that pushes
+        // frames into a bounded channel. `synthesize_stream` reads
+        // from the receiver with a timeout so a hung XTTS subprocess
+        // can't block the whole pipeline — see TTS_FRAME_TIMEOUT_MS.
+        // 32 slots covers ~8 s of buffered audio at XTTS's ~250 ms
+        // chunk cadence before the reader thread blocks on send,
+        // applying natural back-pressure.
+        let (frame_tx, frame_rx) =
+            std_mpsc::sync_channel::<TtsBridgeEvent>(TTS_BRIDGE_CHANNEL_CAPACITY);
+        std::thread::Builder::new()
+            .name("tts-bridge-reader".to_string())
+            .spawn(move || bridge_reader_loop(reader, frame_tx))
+            .map_err(|e| {
+                StageError::NotInitialized(format!("Failed to spawn TTS reader thread: {}", e))
+            })?;
+
         self.process = Some(Mutex::new(TtsBridgeProcess {
             child,
             stdin,
-            stdout: reader,
+            frame_rx,
         }));
 
         tracing::info!("Piper TTS bridge ready");

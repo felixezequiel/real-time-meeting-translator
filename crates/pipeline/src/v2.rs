@@ -23,6 +23,7 @@
 use audio::phrase_segmenter::{PhraseSegmenter, PhraseSegmenterConfig};
 use audio::SileroVad;
 use diarization::OnlineDiarizer;
+use sbd::SbdService;
 use shared::{AudioChunk, Language, PipelineCommand, PipelineMetrics};
 use stt::{StreamingSession, WhisperStt};
 use tokio::sync::mpsc;
@@ -31,8 +32,9 @@ use translation::OpusMtTranslator;
 use tts::{PiperTts, VoiceProfile};
 use voice_convert::ToneColorConverter;
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
@@ -52,12 +54,17 @@ fn next_phrase_id() -> u64 {
 /// produces a clean punctuation boundary.
 ///
 /// Lowered from 3000 → 1200 ms on 2026-05-08 (ADR 0013 amendment
-/// "Latency-first accumulator"): the previous 3 s ceiling was the
-/// dominant TTFA contributor on punctuation-less Whisper output —
-/// typical case in spoken speech. 1200 ms keeps the worst-case
-/// end-to-end latency under ~2.2 s while the soft-flush rule below
-/// catches the *common* case much earlier.
-const ACCUMULATOR_MAX_HOLD_MS: u128 = 1200;
+/// "Latency-first accumulator").
+///
+/// Raised from 1200 → 2000 ms on 2026-05-11 (Phase 0 follow-up). The
+/// 1200 ms ceiling was cutting documentary narration mid-clause:
+/// `"and two and a half times the height of the"` (1843 ms old)
+/// flushed alone, and `"Statue of Liberty"` arrived as an orphan
+/// phrase that the translator couldn't connect back. 2000 ms covers
+/// the typical "noun phrase + subordinate clause" arc in English
+/// without giving back the soft-flush gains on short conversational
+/// speech (those still flush at the 800 ms soft trigger).
+const ACCUMULATOR_MAX_HOLD_MS: u128 = 2000;
 
 /// Word count at which the accumulator force-flushes even without
 /// punctuation. Long monologues without commas would otherwise just
@@ -70,12 +77,55 @@ const ACCUMULATOR_MAX_WORDS: usize = 35;
 /// brought TTFA from "wait for the dot" to "wait for a phrase-shaped
 /// chunk" — Whisper rarely emits commas mid-utterance, so the old
 /// punctuation-only flush rule paid the full MAX_HOLD on most spoken
-/// input. Six words is roughly the size of a self-contained clause
-/// in conversational speech ("we should refactor this module"),
-/// large enough that the streaming translator and the interpreter-
-/// style prompt still produce coherent output.
-const ACCUMULATOR_SOFT_FLUSH_WORDS: usize = 6;
+/// input.
+///
+/// Raised from 6 → 10 on 2026-05-11 (Phase 0 / XTTS backlog fix). At
+/// 6 the accumulator would flush mid-clause on documentary narration
+/// — e.g. "and two and a half times the height of the Statue of
+/// Liberty" got cut at "...the height" and "Statue of Liberty"
+/// arrived as a separate phrase, defeating context. 10 covers the
+/// typical English subordinate clause without losing the soft-flush
+/// benefit on conversational speech (still well under the 1200 ms
+/// hard MAX_HOLD that catches monologues).
+const ACCUMULATOR_SOFT_FLUSH_WORDS: usize = 10;
 const ACCUMULATOR_SOFT_FLUSH_HOLD_MS: u128 = 800;
+
+/// Maximum number of phrases allowed in-flight at the TTS engine. When
+/// `tts.synthesize_stream` already has this many concurrent calls
+/// (counting both ongoing inference and audio still queued for the
+/// mixer to consume), the next phrase enters the wait loop instead
+/// of joining an unbounded XTTS queue.
+const MAX_TTS_INFLIGHT: usize = 2;
+
+/// Maximum time a phrase will busy-wait for a TTS slot before being
+/// dropped. The previous design dropped on the first conflict, which
+/// killed short phrases that would have synthesised in 1-2 s simply
+/// because a long phrase ahead held a slot. The wait turns "drop"
+/// into "queue with a fairness ceiling" — content survives moderate
+/// XTTS spikes; only truly sustained overload (> ~5 s of solid
+/// backlog) loses anything.
+const TTS_QUEUE_TIMEOUT_MS: u64 = 5000;
+
+/// Poll cadence while a phrase is waiting for a TTS slot. 200 ms is a
+/// trade-off: shorter wakes up faster when a slot opens (lower added
+/// latency) but spends more thread time spinning. Two checks per
+/// second is plenty given XTTS phrase durations are 1-15 s.
+const TTS_QUEUE_POLL_MS: u64 = 200;
+
+/// Duplicate-suppression window. When the same final translation has
+/// just been sent to the TTS within this window, skip the second
+/// invocation. Catches the common case where streaming-partial and
+/// closed-segment paths both commit the same phrase a few hundred ms
+/// apart ("Huge Conversations." synthesised twice in 2026-05-11
+/// capture). Set wider than typical phrase playback time so that the
+/// dedup also covers the case where the duplicate would interrupt
+/// the still-playing original.
+const PHRASE_DEDUP_WINDOW_MS: u128 = 4000;
+
+/// How many recent phrases we remember for dedup. Documentary-style
+/// narration alternates 3-5 distinct phrases in a 4 s window — a ring
+/// of 8 covers every reasonable case without growing unbounded.
+const PHRASE_DEDUP_RING_SIZE: usize = 8;
 
 /// Pure flush decision used by `process_segment` and unit-tested in
 /// isolation. Returns `true` when the accumulator has a forced reason
@@ -110,10 +160,31 @@ struct Accumulator {
     /// Diariser-supplied F0 of the most recent contributor — passed
     /// to TTS at flush time so the voice picker has a target.
     pending_f0_hz: f32,
-    /// Cached reference WAV path for TCC: for the mic side this is
-    /// the user's profile, for the speaker side it's whatever the
-    /// last identified speaker has enrolled (or none).
+    /// Cached reference WAV path for TCC / XTTS in the CURRENT phrase.
+    /// Cleared on flush along with the rest of the per-phrase state.
     pending_reference_path: Option<String>,
+    /// Sticky "last identified speaker" reference, kept across flushes
+    /// so that streaming-partial flushes — which never carry a
+    /// `speaker_id` (diariser only runs on closed segments) — can
+    /// still pick the right voice instead of falling back to the
+    /// generic `user.wav` fallback. Updated whenever a closed-segment
+    /// flush brings in a non-None resolved reference; never cleared
+    /// unless the pipeline is restarted (`Stop` → `Accumulator::default`).
+    /// Captured on 2026-05-11: in continuous narration most flushes
+    /// fire from streaming partials before the next closed segment
+    /// lands, and without this sticky field every other phrase played
+    /// in the default voice even though the diariser had already
+    /// identified the speaker on the previous closed segment.
+    last_known_reference_path: Option<String>,
+    /// Ring of recently-synthesised translations with their dispatch
+    /// timestamp. Used to suppress duplicates: the streaming-partial
+    /// path and the closed-segment path can both commit the same
+    /// phrase a few hundred ms apart (e.g. "Huge Conversations."
+    /// shipped twice in 2026-05-11 capture). Bounded to
+    /// `PHRASE_DEDUP_RING_SIZE` entries; older entries fall off the
+    /// front when full. Lookups use `PHRASE_DEDUP_WINDOW_MS` to ignore
+    /// entries that are too old to overlap with new audio anyway.
+    recent_synths: VecDeque<(String, Instant)>,
 }
 
 /// Pull all complete sentences from the front of `text`, leaving any
@@ -162,6 +233,36 @@ fn split_complete_sentences(text: &str) -> (String, String) {
     }
 }
 
+/// Decide where to cut the accumulator buffer between "ready to flush"
+/// and "still pending". When the SBD service is available, it consults
+/// spaCy's dependency parser (via `scripts/sbd_bridge.py`) for a
+/// semantic-aware decision: a span only counts as complete if it has
+/// terminal punctuation AND a finite verb with a subject (or an
+/// imperative). When SBD fails or isn't configured, falls back to the
+/// regex `split_complete_sentences` rule so the pipeline keeps running.
+///
+/// Why both layers: SBD is a Python subprocess and can hang, time out,
+/// or be intentionally disabled. The regex fallback is local, in-memory,
+/// and never blocks — it's a worse decision but a guaranteed one.
+fn decide_complete_split(
+    text: &str,
+    language: Language,
+    sbd: Option<&SbdService>,
+) -> (String, String) {
+    if let Some(service) = sbd {
+        match service.split(text, language) {
+            Ok(result) => return (result.complete, result.rest),
+            Err(e) => {
+                tracing::warn!(
+                    "SBD split failed ({}), falling back to regex split_complete_sentences",
+                    e
+                );
+            }
+        }
+    }
+    split_complete_sentences(text)
+}
+
 use crate::{is_echo, is_translation_degenerate, record_translation, EchoBuffer, VoiceProfileRegistry};
 
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
@@ -208,6 +309,12 @@ pub struct SpeakerPipelineV2 {
     pub vad: Option<Arc<SileroVad>>,
     pub diarizer: Option<Arc<OnlineDiarizer>>,
     pub voice_convert: Option<Arc<ToneColorConverter>>,
+    /// Semantic sentence boundary detector. `Some` when the SBD bridge
+    /// initialised cleanly at startup; `None` when SBD was disabled
+    /// or its Python subprocess refused to start. The accumulator's
+    /// flush decision falls back to regex `split_complete_sentences`
+    /// in the None case — same external behaviour as pre-SBD builds.
+    pub sbd: Option<Arc<SbdService>>,
     pub fixed_voice_reference: Option<String>,
     pub config: V2Config,
     /// Optional channel for subtitle text events. When present, every
@@ -255,6 +362,7 @@ impl SpeakerPipelineV2 {
             vad: None,
             diarizer: None,
             voice_convert: None,
+            sbd: None,
             fixed_voice_reference: None,
             config: V2Config::default(),
             subtitle_tx: None,
@@ -269,6 +377,11 @@ impl SpeakerPipelineV2 {
 
     pub fn with_diarizer(mut self, diarizer: Arc<OnlineDiarizer>) -> Self {
         self.diarizer = Some(diarizer);
+        self
+    }
+
+    pub fn with_sbd(mut self, sbd: Arc<SbdService>) -> Self {
+        self.sbd = Some(sbd);
         self
     }
 
@@ -335,6 +448,11 @@ impl SpeakerPipelineV2 {
         // "frase cortada no meio" quality regression that came from
         // shrinking silence_tail to 280 ms for latency.
         let accumulator = Arc::new(Mutex::new(Accumulator::default()));
+        // Phase 0 backlog cap (2026-05-11): every flush increments this
+        // before invoking TTS and decrements after. When the counter is
+        // already at MAX_TTS_INFLIGHT the new flush is dropped instead
+        // of joining an unbounded XTTS queue.
+        let tts_inflight = Arc::new(AtomicUsize::new(0));
         // ADR 0015 — optional streaming session. When present, partial
         // Whisper passes run periodically while the phrase window is
         // open and commit stable LA-2 prefixes into the accumulator
@@ -440,6 +558,8 @@ impl SpeakerPipelineV2 {
                         let segment_sample_rate = segment.sample_rate;
                         let accumulator_clone = Arc::clone(&accumulator);
                         let streaming_for_segment = streaming_session.clone();
+                        let tts_inflight_clone = Arc::clone(&tts_inflight);
+                        let sbd_clone = self.sbd.clone();
 
                         tokio::task::spawn_blocking(move || {
                             process_segment(
@@ -460,6 +580,8 @@ impl SpeakerPipelineV2 {
                                 subtitle_tx,
                                 accumulator_clone,
                                 streaming_for_segment,
+                                tts_inflight_clone,
+                                sbd_clone,
                             );
                         });
                     } else if let Some(ss) = streaming_session.as_ref() {
@@ -493,6 +615,8 @@ impl SpeakerPipelineV2 {
                         let fixed_voice_reference = self.fixed_voice_reference.clone();
                         let subtitle_tx = self.subtitle_tx.clone();
                         let accumulator_clone = Arc::clone(&accumulator);
+                        let tts_inflight_clone = Arc::clone(&tts_inflight);
+                        let sbd_clone = self.sbd.clone();
 
                         tokio::task::spawn_blocking(move || {
                             process_streaming_partial(
@@ -509,6 +633,8 @@ impl SpeakerPipelineV2 {
                                 metrics_tx_clone,
                                 subtitle_tx,
                                 accumulator_clone,
+                                tts_inflight_clone,
+                                sbd_clone,
                             );
                         });
                     }
@@ -543,6 +669,8 @@ fn process_segment(
     // accumulator. None means streaming was disabled for this
     // pipeline; the full transcribed text is pushed.
     streaming_session: Option<Arc<Mutex<StreamingSession>>>,
+    tts_inflight: Arc<AtomicUsize>,
+    sbd: Option<Arc<SbdService>>,
 ) {
     let total_start = Instant::now();
 
@@ -683,6 +811,8 @@ fn process_segment(
         &metrics_tx,
         subtitle_tx.as_ref(),
         &accumulator,
+        &tts_inflight,
+        sbd.as_deref(),
     );
 
     let _ = metrics_tx.try_send(PipelineMetrics::new(
@@ -719,6 +849,8 @@ fn process_streaming_partial(
     metrics_tx: mpsc::Sender<PipelineMetrics>,
     subtitle_tx: Option<std_mpsc::Sender<SubtitleEvent>>,
     accumulator: Arc<Mutex<Accumulator>>,
+    tts_inflight: Arc<AtomicUsize>,
+    sbd: Option<Arc<SbdService>>,
 ) {
     let partial_start = Instant::now();
     let new_words = {
@@ -760,6 +892,8 @@ fn process_streaming_partial(
         &metrics_tx,
         subtitle_tx.as_ref(),
         &accumulator,
+        &tts_inflight,
+        sbd.as_deref(),
     );
 }
 
@@ -794,6 +928,8 @@ fn ingest_text_and_maybe_flush(
     metrics_tx: &mpsc::Sender<PipelineMetrics>,
     subtitle_tx: Option<&std_mpsc::Sender<SubtitleEvent>>,
     accumulator: &Arc<Mutex<Accumulator>>,
+    tts_inflight: &Arc<AtomicUsize>,
+    sbd: Option<&SbdService>,
 ) {
     let now = Instant::now();
     let (early_flush, main_flush) = {
@@ -805,11 +941,15 @@ fn ingest_text_and_maybe_flush(
 
         let early = if speaker_changed && !acc.pending_text.is_empty() {
             let drained = std::mem::take(&mut acc.pending_text);
+            let snapshot_reference = acc
+                .pending_reference_path
+                .clone()
+                .or_else(|| acc.last_known_reference_path.clone());
             let snapshot = (
                 drained,
                 acc.pending_speaker_id,
                 acc.pending_f0_hz,
-                acc.pending_reference_path.clone(),
+                snapshot_reference,
             );
             acc.pending_speaker_id = None;
             acc.pending_started_at = None;
@@ -835,6 +975,7 @@ fn ingest_text_and_maybe_flush(
         }
         if resolved_reference.is_some() {
             acc.pending_reference_path = resolved_reference.clone();
+            acc.last_known_reference_path = resolved_reference.clone();
         }
 
         let pending_age_ms = acc
@@ -844,14 +985,33 @@ fn ingest_text_and_maybe_flush(
         let pending_word_count = acc.pending_text.split_whitespace().count();
         let force_flush = should_force_flush(pending_word_count, pending_age_ms);
 
-        let (complete, remaining) = split_complete_sentences(&acc.pending_text);
+        // Ask the SBD service (or fall back to the regex rule) whether
+        // the current accumulator content has reached a semantic
+        // boundary. Holds the lock briefly across the subprocess
+        // round-trip — typically <50 ms with spaCy's small models;
+        // every other producer (streaming partials, closed segments)
+        // serialises on this same mutex anyway, so we don't lose
+        // parallelism by waiting here.
+        let (complete, remaining) =
+            decide_complete_split(&acc.pending_text, source_language, sbd);
 
+        // The snapshot reference picks the per-phrase reference if set,
+        // otherwise falls back to the last-known reference from prior
+        // closed segments. This is what makes streaming-partial
+        // flushes — which never carry a speaker_id — speak in the
+        // right voice instead of the generic fallback. Inlined twice
+        // (instead of a closure) so the immutable borrow of `acc`
+        // ends before the per-branch mutable updates below.
         let main = if !complete.is_empty() {
+            let snapshot_ref = acc
+                .pending_reference_path
+                .clone()
+                .or_else(|| acc.last_known_reference_path.clone());
             let snapshot = (
                 complete,
                 acc.pending_speaker_id,
                 acc.pending_f0_hz,
-                acc.pending_reference_path.clone(),
+                snapshot_ref,
             );
             acc.pending_text = remaining;
             if acc.pending_text.is_empty() {
@@ -864,12 +1024,16 @@ fn ingest_text_and_maybe_flush(
             }
             Some(snapshot)
         } else if force_flush {
+            let snapshot_ref = acc
+                .pending_reference_path
+                .clone()
+                .or_else(|| acc.last_known_reference_path.clone());
             let drained = std::mem::take(&mut acc.pending_text);
             let snapshot = (
                 drained,
                 acc.pending_speaker_id,
                 acc.pending_f0_hz,
-                acc.pending_reference_path.clone(),
+                snapshot_ref,
             );
             acc.pending_speaker_id = None;
             acc.pending_started_at = None;
@@ -907,6 +1071,8 @@ fn ingest_text_and_maybe_flush(
             audio_output,
             metrics_tx,
             subtitle_tx,
+            tts_inflight,
+            accumulator,
         );
     }
     if let Some((text, sid, f0, reference)) = main_flush {
@@ -924,6 +1090,8 @@ fn ingest_text_and_maybe_flush(
             audio_output,
             metrics_tx,
             subtitle_tx,
+            tts_inflight,
+            accumulator,
         );
     }
 }
@@ -932,6 +1100,19 @@ fn ingest_text_and_maybe_flush(
 /// OpenVoice preprocessing fails on very short audio (< 500 ms),
 /// so we skip TCC for those fragments and play raw Kokoro instead.
 const TCC_MIN_DURATION_MS: u64 = 500;
+
+/// Number of XTTS streaming chunks to accumulate before releasing the
+/// first chunk to the mixer. XTTS-v2 emits ~250 ms PCM frames at RTF
+/// ~1.5-1.9 on RTX 3050 — slower than the player consumes. Without a
+/// pre-buffer, the mixer plays the first chunk in ~700 ms but the
+/// second chunk lands ~1.5 s later, leaving a silence gap mid-phrase
+/// that listeners described as "audio falhando no meio da fala".
+/// Three chunks ≈ 750 ms of safety cushion: enough that consecutive
+/// chunks arrive while the player is still draining the buffered
+/// audio, eliminating the underrun without converting back to atomic
+/// (which would push TTFA from ~1 s to the full phrase synthesis time
+/// of 3-6 s).
+const TTS_PRE_BUFFER_CHUNKS: usize = 3;
 
 #[allow(clippy::too_many_arguments)]
 fn flush_phrase(
@@ -948,6 +1129,8 @@ fn flush_phrase(
     audio_output: &mpsc::UnboundedSender<AudioChunk>,
     metrics_tx: &mpsc::Sender<PipelineMetrics>,
     subtitle_tx: Option<&std_mpsc::Sender<SubtitleEvent>>,
+    tts_inflight: &Arc<AtomicUsize>,
+    accumulator: &Arc<Mutex<Accumulator>>,
 ) {
     use shared::TextSegment;
     let trimmed = source_text.trim();
@@ -995,6 +1178,19 @@ fn flush_phrase(
     // text growing fragment-by-fragment.
     let phrase_id = next_phrase_id();
 
+    // ─── Phase 0 (2026-05-11): TTS receives the whole translation ─────
+    // Previous behaviour: each clause-bound fragment from Qwen went
+    // straight into XTTS as a separate inference call. With XTTS-v2 at
+    // RTF ~1-2 on RTX 3050, N fragments per phrase → N sequential
+    // inference calls → backlog that grew unbounded (51 s end-to-end
+    // latency captured 2026-05-11). Now we keep the streaming
+    // translation (Qwen still token-streams, subtitle still updates
+    // live), but TTS is invoked ONCE per phrase with the assembled
+    // translation. Cost: ~1 s of TTFA we gave up by waiting for the
+    // last token. Benefit: XTTS sees a complete sentence with proper
+    // prosodic arc, fragments < 15 chars (the regime where XTTS
+    // mis-vocalises punctuation / emits silence) disappear, and the
+    // queue depth caps at 1 inflight per phrase instead of N.
     let stream_result = translator.translate_stream(&segment, |fragment| {
         let frag_text = fragment.text.trim();
         if frag_text.is_empty() && !fragment.is_final {
@@ -1017,7 +1213,9 @@ fn flush_phrase(
 
         // Live subtitle update — UI reflects accumulated translation
         // even before the full sentence finishes. Same phrase_id
-        // every fragment → overlay replaces the line in place.
+        // every fragment → overlay replaces the line in place. This
+        // is the only consumer of the streaming fragments now; TTS
+        // waits for the complete phrase below.
         if let Some(tx) = subtitle_tx {
             let _ = tx.send(SubtitleEvent {
                 phrase_id,
@@ -1027,70 +1225,6 @@ fn flush_phrase(
                 language: target_language,
                 timestamp: Instant::now(),
             });
-        }
-
-        // Synthesise + dispatch THIS fragment. The TTS bridge can
-        // emit several PCM chunks per fragment (XTTS streaming) — we
-        // forward each one to audio_output as it arrives so playback
-        // starts on the first chunk instead of waiting for the whole
-        // fragment to finish synthesising. Time-to-first-audio per
-        // fragment drops from ~`fragment_inference_ms` (~700-2000 ms
-        // on RTX 3050) to ~`first_chunk_ms` (~250-500 ms).
-        //
-        // Atomic bridges (Kokoro) emit exactly one chunk; the loop
-        // executes once and the per-chunk path is equivalent to the
-        // previous atomic dispatch.
-        if !fragment.is_final && !frag_text.is_empty() {
-            let frag_segment =
-                TextSegment::new(frag_text.to_string(), target_language);
-            let tts_start = Instant::now();
-            let mut tts_first_chunk_logged = false;
-            let stream_result = tts.synthesize_stream(
-                &frag_segment,
-                voice_profile.clone(),
-                |chunk| {
-                    if !tts_first_chunk_logged {
-                        let _ = metrics_tx.try_send(PipelineMetrics::new(
-                            "tts_first_chunk".to_string(),
-                            tts_start.elapsed(),
-                        ));
-                        tts_first_chunk_logged = true;
-                    }
-                    // TCC needs a whole utterance to compute its
-                    // tone-color transfer; running it per mid-stream
-                    // chunk gives garbage at the edges. We only apply
-                    // it to chunks that carry the boundary marker
-                    // (atomic chunks — the LAST one of a streamed
-                    // fragment OR a single Kokoro chunk). Mid-stream
-                    // chunks (`is_streaming_chunk == true`) bypass
-                    // TCC and play raw — the bridge already cloned
-                    // the speaker's voice when XTTS is the engine,
-                    // so TCC is redundant there anyway (ADR 0014).
-                    let final_audio = if chunk.is_streaming_chunk {
-                        chunk
-                    } else {
-                        apply_tcc_if_eligible(
-                            pipeline_name,
-                            chunk,
-                            speaker_id,
-                            reference_path.as_deref(),
-                            voice_convert,
-                            metrics_tx,
-                        )
-                    };
-                    let _ = audio_output.send(final_audio);
-                },
-            );
-            let _ = metrics_tx.try_send(PipelineMetrics::new(
-                "tts".to_string(),
-                tts_start.elapsed(),
-            ));
-            if let Err(e) = stream_result {
-                tracing::warn!(
-                    "[{}] V2 TTS fragment failed: {}",
-                    pipeline_name, e,
-                );
-            }
         }
     });
 
@@ -1112,18 +1246,167 @@ fn flush_phrase(
         return;
     }
 
-    // Degenerate check runs AFTER the stream because we want the full
-    // translated text. By this point the audio already played, so
-    // dropping is too late — the check now only suppresses the echo
-    // record so the bad text doesn't pollute the buffer.
+    // Degenerate check runs BEFORE TTS now that the audio hasn't been
+    // dispatched yet. Dropping degenerate translations early saves the
+    // XTTS inference and prevents bogus echo records.
     if is_translation_degenerate(trimmed, final_translation) {
         tracing::info!(
-            "[{}] V2 degenerate translation (post-stream): \"{}\" → \"{}\"",
+            "[{}] V2 degenerate translation: \"{}\" → \"{}\"",
             pipeline_name,
             preview(trimmed, 40),
             preview(final_translation, 40),
         );
         return;
+    }
+
+    // Phase 0 dedup (2026-05-11): the streaming-partial path and the
+    // closed-segment path can commit the same final phrase a few
+    // hundred ms apart. Without dedup the listener heard "Huge
+    // Conversations." twice back-to-back. Compare against the recent
+    // ring before reserving a TTS slot.
+    {
+        let mut acc = accumulator.lock().expect("accumulator poisoned");
+        let now = Instant::now();
+        let window = Duration::from_millis(PHRASE_DEDUP_WINDOW_MS as u64);
+        let is_duplicate = acc
+            .recent_synths
+            .iter()
+            .any(|(text, ts)| text == final_translation && now.duration_since(*ts) <= window);
+        if is_duplicate {
+            tracing::info!(
+                "[{}] V2 duplicate phrase suppressed: \"{}\"",
+                pipeline_name,
+                preview(final_translation, 60),
+            );
+            return;
+        }
+        // Drop entries past the dedup window while we hold the lock —
+        // keeps the ring's working set small.
+        while let Some((_, ts)) = acc.recent_synths.front() {
+            if now.duration_since(*ts) > window {
+                acc.recent_synths.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Phase 0 backlog cap with queue timeout (2026-05-11): try to grab
+    // a TTS slot, falling back to a bounded busy-wait loop so short
+    // phrases don't get dropped just because a long phrase is still
+    // synthesising. `fetch_add` returns the count BEFORE this slot was
+    // added, so a returned value ≥ MAX_TTS_INFLIGHT means we crossed
+    // the cap. Using fetch_add (not load + add) closes the race where
+    // two threads both observe `n < MAX` and both add, exceeding the
+    // cap. After the wait deadline the phrase is dropped — bounded
+    // wait converts "drop on first conflict" into "queue with a
+    // fairness ceiling" without unbounded backlog growth.
+    let wait_deadline = Instant::now() + Duration::from_millis(TTS_QUEUE_TIMEOUT_MS);
+    loop {
+        let previous_inflight = tts_inflight.fetch_add(1, Ordering::SeqCst);
+        if previous_inflight < MAX_TTS_INFLIGHT {
+            break;
+        }
+        tts_inflight.fetch_sub(1, Ordering::SeqCst);
+        if Instant::now() >= wait_deadline {
+            tracing::warn!(
+                "[{}] V2 TTS queue timeout after {}ms, dropping phrase: \"{}\"",
+                pipeline_name,
+                TTS_QUEUE_TIMEOUT_MS,
+                preview(final_translation, 60),
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(TTS_QUEUE_POLL_MS));
+    }
+
+    // Atomic TTS: one inference per phrase. XTTS still emits chunks
+    // internally (~250 ms PCM frames), but we hold the first
+    // `TTS_PRE_BUFFER_CHUNKS` before releasing them as a batch — see
+    // the const docs for the underrun fix this addresses.
+    let tts_segment = TextSegment::new(final_translation.to_string(), target_language);
+    let tts_start = Instant::now();
+    let mut tts_first_chunk_logged = false;
+    let mut pre_buffer: Vec<AudioChunk> = Vec::with_capacity(TTS_PRE_BUFFER_CHUNKS);
+    let mut pre_buffer_released = false;
+    let tts_result = tts.synthesize_stream(
+        &tts_segment,
+        voice_profile.clone(),
+        |chunk| {
+            if !tts_first_chunk_logged {
+                let _ = metrics_tx.try_send(PipelineMetrics::new(
+                    "tts_first_chunk".to_string(),
+                    tts_start.elapsed(),
+                ));
+                tts_first_chunk_logged = true;
+            }
+            // TCC needs a whole utterance to compute its tone-color
+            // transfer; running it per mid-stream chunk gives garbage
+            // at the edges. We only apply it to chunks that carry the
+            // boundary marker (atomic chunks — the LAST one of a
+            // streamed fragment OR a single Kokoro chunk). Mid-stream
+            // chunks (`is_streaming_chunk == true`) bypass TCC and
+            // play raw — the bridge already cloned the speaker's
+            // voice when XTTS is the engine, so TCC is redundant
+            // there anyway (ADR 0014).
+            let final_audio = if chunk.is_streaming_chunk {
+                chunk
+            } else {
+                apply_tcc_if_eligible(
+                    pipeline_name,
+                    chunk,
+                    speaker_id,
+                    reference_path.as_deref(),
+                    voice_convert,
+                    metrics_tx,
+                )
+            };
+            // Hold the opening chunks until the pre-buffer threshold is
+            // met; once released, every subsequent chunk goes straight
+            // through. `pre_buffer_released` short-circuits the Vec
+            // operations for the rest of the phrase.
+            if pre_buffer_released {
+                let _ = audio_output.send(final_audio);
+                return;
+            }
+            pre_buffer.push(final_audio);
+            if pre_buffer.len() >= TTS_PRE_BUFFER_CHUNKS {
+                for buffered in pre_buffer.drain(..) {
+                    let _ = audio_output.send(buffered);
+                }
+                pre_buffer_released = true;
+            }
+        },
+    );
+    // Drain any chunks left in the pre-buffer (phrase ended with fewer
+    // than TTS_PRE_BUFFER_CHUNKS chunks total).
+    for buffered in pre_buffer.drain(..) {
+        let _ = audio_output.send(buffered);
+    }
+    let _ = metrics_tx.try_send(PipelineMetrics::new(
+        "tts".to_string(),
+        tts_start.elapsed(),
+    ));
+    // Release the TTS slot whether the synthesis succeeded or failed.
+    // A panic in tts.synthesize_stream would skip this; if XTTS panics
+    // become a real failure mode we can wrap the call in a guard
+    // struct that decrements on Drop. Until then we trust the bridge
+    // to return Err instead of panicking.
+    tts_inflight.fetch_sub(1, Ordering::SeqCst);
+    if let Err(e) = tts_result {
+        tracing::warn!("[{}] V2 TTS failed: {}", pipeline_name, e);
+        return;
+    }
+
+    // Record the successful dispatch for the dedup ring. Only on success
+    // — a failed synth shouldn't suppress a retry of the same phrase
+    // (e.g. if XTTS hit a transient error).
+    {
+        let mut acc = accumulator.lock().expect("accumulator poisoned");
+        if acc.recent_synths.len() >= PHRASE_DEDUP_RING_SIZE {
+            acc.recent_synths.pop_front();
+        }
+        acc.recent_synths.push_back((final_translation.to_string(), Instant::now()));
     }
 
     record_translation(echo_buffer, final_translation);
@@ -1266,24 +1549,33 @@ mod tests {
 
     #[test]
     fn force_flush_releases_on_soft_trigger() {
-        // 6 words + 800 ms = soft-flush threshold met. This is the
-        // common case the rule was added for: Whisper produced a
-        // full clause without punctuation; we no longer wait the
-        // full MAX_HOLD ceiling for it.
-        assert!(should_force_flush(6, 800));
+        // 10 words + 800 ms = soft-flush threshold met. The threshold
+        // was raised from 6 → 10 on 2026-05-11 because shorter cuts
+        // fragmented subordinate clauses ("of the Statue of Liberty"
+        // arrived as a separate phrase). 10 words is enough that
+        // typical English subordinate clauses ship as one unit.
+        assert!(should_force_flush(10, 800));
+    }
+
+    #[test]
+    fn force_flush_holds_subordinate_clause_below_new_threshold() {
+        // 6 words + 1000 ms — this used to trip soft-flush at the
+        // 6-word threshold and fragment narration mid-clause. Now
+        // below the 10-word floor, we keep accumulating.
+        assert!(!should_force_flush(6, 1000));
     }
 
     #[test]
     fn force_flush_holds_when_age_below_soft_threshold() {
-        // 8 words but only 400 ms — age gate of soft-flush not yet
+        // 12 words but only 400 ms — age gate of soft-flush not yet
         // satisfied. Still no aged_out or long_enough trigger
         // either, so we hold.
-        assert!(!should_force_flush(8, 400));
+        assert!(!should_force_flush(12, 400));
     }
 
     #[test]
     fn force_flush_holds_when_word_count_below_soft_threshold() {
-        // 5 words, 1000 ms — under SOFT_WORDS (6) so soft-flush
+        // 5 words, 1000 ms — under SOFT_WORDS (10) so soft-flush
         // doesn't fire; under MAX_HOLD (1200) so aged_out doesn't
         // fire either. Wait for either more words or more time.
         assert!(!should_force_flush(5, 1000));
@@ -1291,10 +1583,20 @@ mod tests {
 
     #[test]
     fn force_flush_releases_on_age_ceiling() {
-        // 4 words but held > MAX_HOLD. The hard ceiling fires even
-        // when the buffer is small — short utterances shouldn't be
+        // 4 words but held > MAX_HOLD (2000 ms). The hard ceiling fires
+        // even when the buffer is small — short utterances shouldn't be
         // held forever just because they're brief.
-        assert!(should_force_flush(4, 1300));
+        assert!(should_force_flush(4, 2100));
+    }
+
+    #[test]
+    fn force_flush_holds_subordinate_clause_under_new_max_hold() {
+        // Regression for the 2026-05-11 "Statue of Liberty" cut: a
+        // partial clause held 1843 ms with 9 words used to trip the
+        // old 1200 ms aged_out trigger and ship without the trailing
+        // noun phrase. Under the new 2000 ms ceiling and 10-word soft
+        // threshold, the accumulator keeps waiting.
+        assert!(!should_force_flush(9, 1843));
     }
 
     #[test]

@@ -8,6 +8,7 @@ members = [
     "crates/diarization",
     "crates/separation",
     "crates/voice_convert",
+    "crates/sbd",
     "crates/pipeline",
     "crates/ui",
 ]
@@ -42,6 +43,7 @@ stt = { path = "crates/stt" }
 translation = { path = "crates/translation" }
 tts = { path = "crates/tts" }
 diarization = { path = "crates/diarization" }
+sbd = { path = "crates/sbd" }
 separation = { path = "crates/separation" }
 voice_convert = { path = "crates/voice_convert" }
 tokio = { workspace = true }

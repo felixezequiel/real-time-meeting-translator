@@ -404,6 +404,16 @@ class XttsBridge:
             # atomic-switch trigger).
             stream_chunk_size=20,
             temperature=0.65,
+            # `speed` is XTTS-v2's prosody-rate knob (multiplier on the
+            # internal duration prediction). 1.0 produces ~15 chars/s
+            # in pt-BR — noticeably slower than native conversational
+            # cadence (18-25 chars/s). 1.25 brings it back to natural
+            # speed and as a side-effect shortens the synthesised
+            # audio by ~20 %, which directly reduces the mixer-queue
+            # depth that drives our backlog. Tunable: 1.20 (gentler)
+            # to 1.35 (sounds rushed) work; >1.4 starts distorting
+            # vowels. Matches Kokoro's 1.30 default set on 2026-05-10.
+            speed=1.25,
             enable_text_splitting=False,  # the V2 accumulator already split
         )
 

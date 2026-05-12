@@ -61,10 +61,17 @@ pub const LOCAL_AGREEMENT_N: usize = 2;
 /// Minimum interval between successive Whisper partial calls. The V2
 /// PhraseSegmenter ingests every ~280 ms; we don't want to re-decode
 /// on every chunk because per-call Whisper time is in the same ballpark
-/// (~150-300 ms). 400 ms gives Whisper time to finish one partial
-/// before we ask for the next, and keeps the cumulative compute under
-/// roughly 2× real-time on small-q5_1 / RTX 3050.
-pub const PARTIAL_INTERVAL_MS: u64 = 400;
+/// (~150-300 ms).
+///
+/// Raised from 400 → 600 ms on 2026-05-11 (Fase 0 resource alloc): on
+/// RTX 3050 the GPU is shared between Whisper partials, Qwen
+/// translation, and XTTS synthesis. Continuous narration captures
+/// showed XTTS RTF degrading from ~1.5 to >7 when all three competed
+/// for CUDA at the same cadence. Reducing partial frequency by 50 %
+/// frees ~150-300 ms of GPU per cycle for XTTS, which is on the
+/// critical path of perceived latency. Subtitle responsiveness pays
+/// a 200 ms penalty in exchange — invisible to users but measurable.
+pub const PARTIAL_INTERVAL_MS: u64 = 600;
 
 /// Minimum buffer length before the first partial pass. Below this
 /// Whisper hallucinates aggressively (no temporal context). Tied to the

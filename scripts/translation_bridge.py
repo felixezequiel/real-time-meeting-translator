@@ -103,7 +103,13 @@ def split_commit_point(buffer: str) -> int:
     if it should keep accumulating. Three commit triggers:
 
       1. Sentence-final punctuation (`. ! ? …`) at the tail → commit
-         everything. This is a natural prosodic boundary.
+         everything. This is a natural prosodic boundary, EXCEPT when
+         `.` is preceded by a digit — that is a pt-BR thousands
+         separator ("14.000") or a decimal point ("3.14"), never a
+         sentence end. Committing there caused XTTS to synthesise
+         the number as two robotic fragments ("14." / "000 toneladas.")
+         with audible stutter between them (regression captured on
+         2026-05-11). We wait for the next token to disambiguate.
       2. Clause punctuation (`, ; :`) at the tail AND buffer ≥
          `MIN_CLAUSE_FRAGMENT_CHARS` → commit. Below the floor we keep
          going so single-word clauses don't fragment ("Bem,").
@@ -115,9 +121,14 @@ def split_commit_point(buffer: str) -> int:
 
     last_char = buffer[-1]
 
-    # Strong: sentence-final punctuation always commits.
+    # Strong: sentence-final punctuation usually commits. The one
+    # exception is `.` immediately after a digit — see docstring.
+    # `!` and `?` and `…` are never used as numeric separators, so they
+    # always commit.
     if last_char in SENTENCE_FINAL_PUNCTUATION:
-        return len(buffer)
+        digit_dot = last_char == "." and len(buffer) >= 2 and buffer[-2].isdigit()
+        if not digit_dot:
+            return len(buffer)
 
     # Weak: clause punctuation, but only if we have enough context for
     # the fragment to read as a clause rather than a fragment.
@@ -277,6 +288,36 @@ FEWSHOT = [
     # PT -> EN: clean narrative, 1:1 expected
     ("Em 1969, três astronautas norte-americanos partiram para a Lua a bordo da Apollo 11.",
      "In 1969, three American astronauts left for the Moon aboard Apollo 11.",
+     "pt", "en"),
+
+    # ─── Anglo-Saxon units of measure (added 2026-05-11) ─────────────────────
+    # Without explicit grounding, Qwen 1.5B-Q4 hallucinates units: a
+    # 2026-05-11 documentary capture rendered "120 miles" as
+    # "120 milímetros" (millimeters) — phonetically adjacent in pt-BR
+    # but semantically nonsense for a distance from a city. These
+    # few-shots anchor the common measurement vocabulary so the
+    # translator picks the correct cognate.
+
+    # EN -> PT: distance
+    ("The platform was 120 miles northeast of Scotland.",
+     "A plataforma ficava 120 milhas a nordeste da Escócia.",
+     "en", "pt"),
+    # EN -> PT: mass (the user's capture also exercises this)
+    ("The rig weighed in at 14,000 tons.",
+     "A plataforma pesava 14.000 toneladas.",
+     "en", "pt"),
+    # EN -> PT: height in feet
+    ("The tower rises 1,200 feet above the ground.",
+     "A torre se ergue 1.200 pés acima do solo.",
+     "en", "pt"),
+    # EN -> PT: temperature in Fahrenheit stays as Fahrenheit (do not
+    # convert to Celsius — interpreters preserve the speaker's number)
+    ("The reactor reached 900 degrees Fahrenheit.",
+     "O reator atingiu 900 graus Fahrenheit.",
+     "en", "pt"),
+    # PT -> EN: reverse direction so both pipelines benefit
+    ("A ponte tem 800 metros de comprimento.",
+     "The bridge is 800 meters long.",
      "pt", "en"),
 ]
 

@@ -52,3 +52,13 @@ wavmark>=0.0.3
 # stage pipeline when `tts_engine = "xtts"` in config.toml. coqui-tts is
 # the maintained fork of the archived Coqui TTS package. ADR 0014.
 coqui-tts>=0.24.1
+
+# ── Sentence Boundary Detection (spaCy) ──────────────────────────────────────
+# Replaces the regex-only sentence splitter (split_complete_sentences) with
+# a semantic-aware boundary detector. Frases sem pontuação ou com pontuação
+# ambígua (separador de milhar pt-BR, abreviações) eram quebradas erradas;
+# spaCy entende dependências sintáticas para decidir "frase tem sujeito +
+# verbo + sentido". Roda em CPU, ~5-20 ms por chamada com modelo já
+# carregado. Two models: pt_core_news_sm (~12 MB) e en_core_web_sm (~12 MB)
+# — instalar separadamente com `python -m spacy download <model>`.
+spacy>=3.7
